@@ -15,7 +15,7 @@ on:
       metroid_early:
         description: Minimal Nothing Phone (3) loader/console kernel (SWEET config, patches 0001-0013 + Metroid)
         type: boolean
-        default: false
+        default: true
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -55,7 +55,7 @@ jobs:
           if [[ "$METROID_EARLY" == true ]]; then
             [[ "$MACHINE_CONFIG" == SWEET && "$MACOS_VERSION" == 13.5 ]] || exit 1
             # Early bootstrap only: no later Sweet peripheral/userland patches.
-            cp xnu/patches/000*.patch xnu/patches/001[0-8]-*.patch dxb/patches/
+            cp xnu/patches/000[1-9]-*.patch xnu/patches/001?-*.patch xnu/patches/0020-*.patch dxb/patches/
             cp xnu/metroid/*.patch dxb/patches/
           else
             cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
