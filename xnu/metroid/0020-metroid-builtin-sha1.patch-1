@@ -1,0 +1,56 @@
+diff --git a/libkern/crypto/corecrypto_sha1.c b/libkern/crypto/corecrypto_sha1.c
+--- a/libkern/crypto/corecrypto_sha1.c
++++ b/libkern/crypto/corecrypto_sha1.c
+@@ -3,6 +3,20 @@
+ #include <kern/debug.h>
+ #include <corecrypto/ccdigest.h>
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <corecrypto/ccsha1.h>
++#define SHA1_DI()                    ccsha1_di()
++#define SHA1_DIGEST_INIT(di, ctx)    ccdigest_init(di, ctx)
++#define SHA1_DIGEST_UPDATE(di, ctx, len, data) ccdigest_update(di, ctx, len, data)
++#else
++#define SHA1_DI()                    (g_crypto_funcs->ccsha1_di)
++#define SHA1_DIGEST_INIT(di, ctx)    g_crypto_funcs->ccdigest_init_fn(di, ctx)
++#define SHA1_DIGEST_UPDATE(di, ctx, len, data) g_crypto_funcs->ccdigest_update_fn(di, ctx, len, data)
++#endif
++
+ 
+ static uint64_t
+ getCount(SHA1_CTX *ctx)
+@@ -40,10 +54,10 @@ DiToSHA1(const struct ccdigest_info *di, struct ccdigest_ctx *di_ctx, SHA1_CTX *sha1_ctx)
+ void
+ SHA1Init(SHA1_CTX *ctx)
+ {
+-	const struct ccdigest_info *di = g_crypto_funcs->ccsha1_di;
++	const struct ccdigest_info *di = SHA1_DI();
+ 	ccdigest_di_decl(di, di_ctx);
+ 
+-	g_crypto_funcs->ccdigest_init_fn(di, di_ctx);
++	SHA1_DIGEST_INIT(di, di_ctx);
+ 
+ 	DiToSHA1(di, di_ctx, ctx);
+ }
+@@ -51,10 +65,10 @@ SHA1Init(SHA1_CTX *ctx)
+ void
+ SHA1Update(SHA1_CTX *ctx, const void *data, size_t len)
+ {
+-	const struct ccdigest_info *di = g_crypto_funcs->ccsha1_di;
++	const struct ccdigest_info *di = SHA1_DI();
+ 	ccdigest_di_decl(di, di_ctx);
+ 
+ 	SHA1ToDi(di, ctx, di_ctx);
+-	g_crypto_funcs->ccdigest_update_fn(di, di_ctx, len, data);
++	SHA1_DIGEST_UPDATE(di, di_ctx, len, data);
+ 	DiToSHA1(di, di_ctx, ctx);
+ }
+@@ -63,7 +77,7 @@ SHA1Update(SHA1_CTX *ctx, const void *data, size_t len)
+ void
+ SHA1Final(void *digest, SHA1_CTX *ctx)
+ {
+-	const struct ccdigest_info *di = g_crypto_funcs->ccsha1_di;
++	const struct ccdigest_info *di = SHA1_DI();
+ 	ccdigest_di_decl(di, di_ctx);
+ 
+ 	SHA1ToDi(di, ctx, di_ctx);
