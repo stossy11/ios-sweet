@@ -27,7 +27,7 @@ diff --git a/osfmk/arm64/metroid_console.c b/osfmk/arm64/metroid_console.c
  static int surface_decode(struct surface *s, uint32_t address, uint32_t size,
                     uint32_t xy, uint32_t stride, uint32_t format,
                     uint32_t unpack, uint32_t opmode, uint32_t secure,
-@@ -72,63 +86,99 @@
+@@ -72,8 +86,15 @@
              if (!surface_decode(&s, rd(pipe+0x14), rd(pipe), rd(pipe+8),
                  rd(pipe+0x24), rd(pipe+0x30), rd(pipe+0x34), rd(pipe+0x38),
                  rd(pipe+0x70), rd(pipe+0x170))) continue;
@@ -40,17 +40,29 @@ diff --git a/osfmk/arm64/metroid_console.c b/osfmk/arm64/metroid_console.c
 +                    surfaces[i].stride == s.stride && surfaces[i].width == s.width)
 +                    duplicate = 1;
 +            if (!duplicate) surfaces[count++] = s;
-+            unsigned available = (s.width - 32) / 16;
++            unsigned available = (1260 - 32) / 16;
 +            if (available < cols) cols = available;
              controllers |= 1u << c;
          }
      }
+@@ -87,7 +108,7 @@
+             for (uint32_t y = 0; y < s.height; y++) {
+                 volatile uint32_t *line = fb + (uint64_t)y * pitch;
+                 for (uint32_t x = 0; x < s.width; x++) {
+-                    line[x] = s.black;
++                    line[s.x + x] = s.black;
+                 }
+             }
+         }
+@@ -95,56 +116,99 @@
+ 
      return count != 0;
  }
 -static void refresh(void)
-+void metroid_console_refresh(void)
- {
+-{
 -    __asm__ volatile("dsb sy" ::: "memory");
++void metroid_console_refresh(void)
++{
 +    barrier();
      for (unsigned c = 0; c < 4; c++)
          if (controllers & (1u << c))
@@ -74,7 +86,7 @@ diff --git a/osfmk/arm64/metroid_console.c b/osfmk/arm64/metroid_console.c
 +    const unsigned line_row = row, length = col, line_cols = cols;
 +    const unsigned n = count;
 +    const uint64_t bias = fb_bias;
-+    
++
 +    for (unsigned p = 0; p < n; p++) {
 +        const struct surface surface = surfaces[p];
 +        volatile uint32_t *fb = fb_pointer(surface.address + bias);
@@ -82,15 +94,16 @@ diff --git a/osfmk/arm64/metroid_console.c b/osfmk/arm64/metroid_console.c
 +        for (unsigned gy = 0; gy < 16; gy++) {
 +            for (unsigned sy = 0; sy < 2; sy++) {
 +                uint64_t row_base_offset = (uint64_t)(160 + line_row * 32 + gy * 2 + sy) * pitch;
-+                
++
 +                for (unsigned column = 0; column < line_cols; column++) {
-+                    int screen_x = 16 + column * 16;
++                    unsigned screen_x = 16 + column * 16;
 +
 +                    /* Split-pipe horizontal boundary clipping */
-+                    if (screen_x < surface.x || screen_x + 16 > surface.x + surface.width) {
++                    if (screen_x + 16 <= surface.x || screen_x >= surface.x + surface.width) {
 +                        continue;
 +                    }
-+                    unsigned local_x = screen_x - surface.x;
++                    /* surface.address is the shared buffer base; x is absolute. */
++                    unsigned local_x = screen_x;
 +                    volatile uint32_t *dst = fb + row_base_offset + local_x;
 +
 +                    unsigned c = column < length ? (unsigned char)pending[column] : ' ';
@@ -106,8 +119,11 @@ diff --git a/osfmk/arm64/metroid_console.c b/osfmk/arm64/metroid_console.c
 +                        unsigned ink = bits & (0x80u >> gx);
 +#endif
 +                        uint32_t pixel = ink ? 0xffffffffu : surface.black;
-+                        *dst++ = pixel;
-+                        *dst++ = pixel;
++                        for (unsigned sx = 0; sx < 2; sx++) {
++                            unsigned x = screen_x + gx * 2 + sx;
++                            if (x >= surface.x && x < surface.x + surface.width)
++                                dst[gx * 2 + sx] = pixel;
++                        }
 +                    }
 +                }
 +            }

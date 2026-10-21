@@ -50,13 +50,16 @@ diff --git a/osfmk/arm64/metroid_console.c b/osfmk/arm64/metroid_console.c
      for (unsigned c = 0; c < 4; c++) {
          uintptr_t ctl = mdp + 0x16000 + c * 0x1000;
          uint32_t intf = rd(ctl + 0xf4);
-@@ -95,32 +98,49 @@
+@@ -95,7 +98,6 @@
              if (!duplicate) surfaces[count++] = s;
-             unsigned available = (s.width - 32) / 16;
+             unsigned available = (1260 - 32) / 16;
              if (available < cols) cols = available;
 -            controllers |= 1u << c;
          }
      }
+ 
+@@ -116,30 +118,47 @@
+ 
      return count != 0;
  }
 -void metroid_console_refresh(void)
@@ -118,8 +121,11 @@ diff --git a/osfmk/arm64/metroid_console.c b/osfmk/arm64/metroid_console.c
 +    const unsigned line_row = row, length = used, line_cols = cols;
      const unsigned n = count;
      const uint64_t bias = fb_bias;
+-
      for (unsigned p = 0; p < n; p++) {
-@@ -152,19 +172,33 @@
+         const struct surface surface = surfaces[p];
+         volatile uint32_t *fb = fb_pointer(surface.address + bias);
+@@ -182,19 +201,33 @@
              }
          }
      }

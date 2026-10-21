@@ -13,7 +13,7 @@ on:
         description: xnu MACHINE_CONFIG
         default: SWEET
       metroid_early:
-        description: Minimal Nothing Phone (3) loader/console kernel (SWEET config, patches 0001-0013 + Metroid)
+        description: "Nothing Phone (3): portable SWEET support plus Metroid hardware overlays"
         type: boolean
         default: true
       keep_going:
@@ -30,7 +30,7 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
-  METROID_EARLY: ${{ inputs.metroid_early && 'true' || 'true' }}
+  METROID_EARLY: ${{ (github.event_name != 'workflow_dispatch' || inputs.metroid_early) && 'true' || 'false' }}
 
 jobs:
   build:
@@ -49,10 +49,7 @@ jobs:
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
           if [[ "$METROID_EARLY" == true ]]; then
             [[ "$MACHINE_CONFIG" == SWEET && "$MACOS_VERSION" == 13.5 ]] || exit 1
-            # Early bootstrap only: no later Sweet peripheral/userland patches.
-            cp xnu/patches/000[1-9]-*.patch xnu/patches/001?-*.patch xnu/patches/0020-*.patch xnu/patches/0023-*.patch xnu/patches/0027-*.patch xnu/patches/0032-*.patch xnu/patches/0033-*.patch dxb/patches/
-            cp xnu/patches/001?-*.sh xnu/patches/0020-*.sh dxb/patches/
-            cp xnu/metroid/*.patch dxb/patches/
+            python3 tools/stage-metroid-patches.py dxb/patches
           else
             cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
           fi

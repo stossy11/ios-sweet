@@ -57,7 +57,7 @@ diff --git a/osfmk/arm64/metroid_console.c b/osfmk/arm64/metroid_console.c
 new file mode 100644
 --- /dev/null
 +++ b/osfmk/arm64/metroid_console.c
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,150 @@
 +#define METROID_XNU 1
 +/* Command-mode console using the firmware's validated, active linear pipes.
 + * Never changes display routing, buffer addresses, clocks, DSC or power.
