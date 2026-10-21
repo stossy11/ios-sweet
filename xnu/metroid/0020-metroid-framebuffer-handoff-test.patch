@@ -1,0 +1,58 @@
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -11,6 +11,7 @@
+ #include <arm64/sweet_early.h>
+ #if defined(SWEET)
+ extern int switch_to_video_console(void);
++extern void vc_metroid_handoff_test(void);
+ #endif
+ #include <pexpert/boot.h>
+ #include <pexpert/device_tree.h>
+@@ -547,6 +548,7 @@
+ #if defined(SWEET)
+ 	(void)switch_to_video_console();
+ 	sweet_early_framebuffer_console();
++	vc_metroid_handoff_test();
+ #endif
+ }
+ 
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -2788,6 +2788,35 @@
+ 	}
+ }
+ 
++#if defined(SWEET)
++/* Called only by the Metroid overlay after PE_create_console hands off output.
++ * Use the video console's resolved mapping, not the early-console alias.
++ * This tests framebuffer writes independently of text-console enablement.
++ */
++void vc_metroid_handoff_test(void);
++void
++vc_metroid_handoff_test(void)
++{
++	if (!vinfo.v_baseaddr || vinfo.v_depth != 32 || !vinfo.v_width ||
++	    vinfo.v_height < 8 || (vinfo.v_baseaddr & 3) ||
++	    (vinfo.v_rowbytes & 3) || vinfo.v_width > vinfo.v_rowbytes / 4) {
++		return;
++	}
++
++	/* Eight red scanlines across the middle, away from early boot text. */
++	unsigned int top = (vinfo.v_height - 8) / 2;
++	for (unsigned int y = top; y < top + 8; y++) {
++		volatile uint32_t *row = (volatile uint32_t *)(vinfo.v_baseaddr +
++		    (uint64_t)y * vinfo.v_rowbytes);
++		for (unsigned int x = 0; x < vinfo.v_width; x++) {
++			row[x] = 0xffff0000U; /* Firmware's 32-bit B,G,R,A layout. */
++		}
++	}
++	/* Complete the stores; retain firmware scanout without a CTL_START. */
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++#endif
++
+ void
+ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
+ {
