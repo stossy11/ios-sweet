@@ -19,12 +19,7 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
-  push:
-    branches: [main]
-    paths:
-      - "xnu/patches/**"
-      - ".github/workflows/xnu.yml"
-
+  
 concurrency:
   group: xnu-${{ github.ref }}
   cancel-in-progress: true
@@ -35,7 +30,7 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
-  METROID_EARLY: ${{ inputs.metroid_early && 'true' || 'false' }}
+  METROID_EARLY: ${{ inputs.metroid_early && 'true' || 'true' }}
 
 jobs:
   build:
@@ -55,7 +50,7 @@ jobs:
           if [[ "$METROID_EARLY" == true ]]; then
             [[ "$MACHINE_CONFIG" == SWEET && "$MACOS_VERSION" == 13.5 ]] || exit 1
             # Early bootstrap only: no later Sweet peripheral/userland patches.
-            cp xnu/patches/000[1-9]-*.patch xnu/patches/001?-*.patch xnu/patches/0020-*.patch xnu/patches/0032-*.patch xnu/patches/0033-*.patch dxb/patches/
+            cp xnu/patches/000[1-9]-*.patch xnu/patches/001?-*.patch xnu/patches/0020-*.patch xnu/patches/0023-*.patch xnu/patches/0032-*.patch xnu/patches/0033-*.patch dxb/patches/
             cp xnu/patches/001?-*.sh xnu/patches/0020-*.sh dxb/patches/
             cp xnu/metroid/*.patch dxb/patches/
           else
