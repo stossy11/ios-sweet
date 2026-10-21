@@ -137,6 +137,22 @@ new file mode 100644
 +            controllers |= 1u << c;
 +        }
 +    }
++
++    if (count > 0) {
++        uint64_t bias = fb_bias;
++        for (unsigned i = 0; i < count; i++) {
++            const struct surface s = surfaces[i];
++            volatile uint32_t *fb = fb_pointer(s.address + bias);
++            uint32_t pitch = s.stride / 4;
++            for (uint32_t y = 0; y < s.height; y++) {
++                volatile uint32_t *line = fb + (uint64_t)y * pitch;
++                for (uint32_t x = 0; x < s.width; x++) {
++                    line[x] = s.black;
++                }
++            }
++        }
++    }
++
 +    return count != 0;
 +}
 +static void refresh(void)

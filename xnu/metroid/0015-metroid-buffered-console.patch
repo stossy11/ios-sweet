@@ -74,15 +74,25 @@ diff --git a/osfmk/arm64/metroid_console.c b/osfmk/arm64/metroid_console.c
 +    const unsigned line_row = row, length = col, line_cols = cols;
 +    const unsigned n = count;
 +    const uint64_t bias = fb_bias;
++    
 +    for (unsigned p = 0; p < n; p++) {
 +        const struct surface surface = surfaces[p];
 +        volatile uint32_t *fb = fb_pointer(surface.address + bias);
 +        const unsigned pitch = surface.stride / 4;
 +        for (unsigned gy = 0; gy < 16; gy++) {
 +            for (unsigned sy = 0; sy < 2; sy++) {
-+                volatile uint32_t *dst = fb +
-+                    (uint64_t)(160 + line_row * 32 + gy * 2 + sy) * pitch + surface.x + 16;
++                uint64_t row_base_offset = (uint64_t)(160 + line_row * 32 + gy * 2 + sy) * pitch;
++                
 +                for (unsigned column = 0; column < line_cols; column++) {
++                    int screen_x = 16 + column * 16;
++
++                    /* Split-pipe horizontal boundary clipping */
++                    if (screen_x < surface.x || screen_x + 16 > surface.x + surface.width) {
++                        continue;
++                    }
++                    unsigned local_x = screen_x - surface.x;
++                    volatile uint32_t *dst = fb + row_base_offset + local_x;
++
 +                    unsigned c = column < length ? (unsigned char)pending[column] : ' ';
 +#ifdef METROID_XNU
 +                    unsigned bits = iso_font[c * 16 + gy];
