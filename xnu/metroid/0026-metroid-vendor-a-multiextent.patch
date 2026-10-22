@@ -1,0 +1,147 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -6,7 +6,7 @@
+  * state: it points the transfer request list at its own memory (verifying the
+  * host took it before ringing any doorbell) and issues polled SCSI commands,
+  * one at a time, to LUN 0. It finds one GPT partition by name (boot-arg
+- * ufsroot=, default "userdata") and exposes it as the BSD disk ufsroot0
++ * ufsroot=, default "userdata"; vendor_a uses Android super metadata, read-only) and exposes it as the BSD disk ufsroot0
+  * (rufsroot0), with 512-byte logical sectors over the device's 4 KiB blocks.
+  * Root on it with rd=ufsroot0.
+  *
+@@ -259,6 +259,106 @@
+ 	return ENOENT;
+ }
+ 
++/* Logical vendor_a block extents. Every entry is a linear span in UFS LUN 0.
++ * Reads can span extent boundaries; this implementation never enables writes.
++ * Assumes Android liblp v1.x and block-device index 0 is physical "super".
++ */
++#define LP_MAX_EXTENTS 128u
++struct lp_span { uint64_t logical, physical, count; }; /* 4K blocks */
++static struct lp_span lp_spans[LP_MAX_EXTENTS];
++static uint32_t lp_span_count;
++static bool lp_mapped;
++
++static uint32_t lp_u32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
++static uint64_t lp_u64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
++
++/* Return physical block and maximum blocks available before the next extent. */
++static int
++lp_translate(uint64_t logical, uint64_t *physical, uint64_t *available)
++{
++    for (uint32_t i = 0; i < lp_span_count; i++) {
++        const struct lp_span *s = &lp_spans[i];
++        if (logical >= s->logical && logical - s->logical < s->count) {
++            uint64_t delta = logical - s->logical;
++            *physical = s->physical + delta;
++            *available = s->count - delta;
++            return 0;
++        }
++    }
++    return EINVAL;
++}
++
++static int
++ufs_find_vendor_a(void)
++{
++    const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++    int error = ufs_find_partition("super");
++    if (error) return error;
++    uint64_t super_start = su.first_block, super_blocks = su.nblocks;
++    lp_span_count = 0;
++    lp_mapped = false;
++
++    error = ufs_read_blocks(super_start + 1, 1);
++    if (error) return error;
++    if (lp_u32(b) != 0x616c4467u || lp_u32(b + 4) < 52 ||
++        lp_u32(b + 4) > UFS_BLOCK) return ENXIO;
++    uint32_t max_meta = lp_u32(b + 40), slots = lp_u32(b + 44);
++    if (!max_meta || max_meta > BOUNCE_SIZE || (max_meta % UFS_BLOCK) ||
++        slots < 2 || slots > 4) return ENXIO;
++    uint32_t metadata_blocks = max_meta / UFS_BLOCK;
++    if (3u + metadata_blocks > super_blocks) return ENXIO;
++    error = ufs_read_blocks(super_start + 3, metadata_blocks); /* slot _a */
++    if (error) return error;
++    if (lp_u32(b) != 0x414c5030u || b[4] != 10 || b[5] != 0 ||
++        b[6] > 2 || b[7] != 0) return ENOTSUP;
++    uint32_t header = lp_u32(b + 8), tables = lp_u32(b + 44);
++    if (header < 128 || header > max_meta || tables > max_meta - header) return ENXIO;
++    uint32_t poff = lp_u32(b + 80), pn = lp_u32(b + 84), psz = lp_u32(b + 88);
++    uint32_t eoff = lp_u32(b + 92), en = lp_u32(b + 96), esz = lp_u32(b + 100);
++    uint32_t boff = lp_u32(b + 116), bn = lp_u32(b + 120), bsz = lp_u32(b + 124);
++    if (psz != 52 || esz != 24 || bsz != 64 || !pn || !en || bn != 1 ||
++        poff > tables || eoff > tables || boff > tables ||
++        pn > (tables - poff)/psz || en > (tables - eoff)/esz ||
++        bn > (tables - boff)/bsz) return ENXIO;
++    const uint8_t *parts = b + header + poff;
++    const uint8_t *extents = b + header + eoff;
++    const uint8_t *dev = b + header + boff;
++    /* Block-device metadata must identify our super partition. */
++    if (memcmp(dev + 24, "super", 5) || dev[29] != 0 ||
++        lp_u64(dev + 16) != super_blocks * UFS_BLOCK) return ENOTSUP;
++    uint64_t super_sector = super_start * 8, super_total = super_blocks * 8;
++    for (uint32_t i = 0; i < pn; i++) {
++        const uint8_t *part = parts + i * psz;
++        if (memcmp(part, "vendor_a", 8) || part[8] != 0) continue;
++        uint32_t first = lp_u32(part + 40), count = lp_u32(part + 44);
++        if (!count || count > LP_MAX_EXTENTS || first > en || count > en - first) return ENOTSUP;
++        uint64_t logical = 0;
++        for (uint32_t j = 0; j < count; j++) {
++            const uint8_t *ex = extents + (first + j) * esz;
++            uint64_t sectors = lp_u64(ex), target = lp_u64(ex + 12);
++            uint32_t type = lp_u32(ex + 8), source = lp_u32(ex + 20);
++            if (type != 0 || source != 0 || !sectors ||
++                (sectors & 7) || (target & 7) ||
++                target < super_sector || target - super_sector >= super_total ||
++                sectors > super_total - (target - super_sector)) return ENOTSUP;
++            uint64_t blocks = sectors / 8;
++            if (logical > UINT64_MAX - blocks) return ENXIO;
++            lp_spans[j] = (struct lp_span){logical, target / 8, blocks};
++            logical += blocks;
++        }
++        /* Prevent self-overlap, plus overlaps against other linear extents
++         * declared in this metadata copy. This is only a read-only driver. */
++        lp_span_count = count;
++        su.first_block = 0;
++        su.nblocks = logical;
++        lp_mapped = true;
++        printf("SWEET UFS: vendor_a: %u extents, %llu MiB, READ ONLY\n",
++            count, (logical * UFS_BLOCK) >> 20);
++        return 0;
++    }
++    return ENOENT;
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
+@@ -334,8 +434,17 @@
+ 		uint64_t lba = pos / UFS_BLOCK;
+ 		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
+ 		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
++		uint64_t physical = su.first_block + lba, available = su.nblocks - lba;
++		if (lp_mapped) {
++			error = lp_translate(lba, &physical, &available);
++			if (error) break;
++		}
++		if (available > UINT32_MAX) available = UINT32_MAX;
++		want = MIN(want, (uint32_t)MIN((uint64_t)want,
++		    available * UFS_BLOCK - skip));
++		if (!want) { error = EIO; break; }
+ 		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
+-		error = ufs_read_blocks(su.first_block + lba, blocks);
++		error = ufs_read_blocks(physical, blocks);
+ 		if (error) {
+ 			break;
+ 		}
+@@ -494,7 +603,7 @@
+ 		}
+ 	}
+ 	if (!error) {
+-		error = ufs_find_partition(want);
++		error = strcmp(want, "vendor_a") == 0 ? ufs_find_vendor_a() : ufs_find_partition(want);
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {

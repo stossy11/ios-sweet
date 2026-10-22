@@ -1,4 +1,3 @@
-# Explicit portable/common patch selection; hardware drivers excluded.
 0001-new-clang-drop-removed-auto-var-init-flag.patch
 0002-new-clang-backport-UIO_STACKBUF.patch
 0003-sweet-framebuffer-serial-console.patch
@@ -26,6 +25,7 @@
 0025-sweet-builtin-amfi-no-entitlements.patch
 0026-sweet-builtin-hfs.patch
 0027-sweet-bearssl-md5.patch
+0028-sweet-ufs-root-device.patch
 0029-sweet-unsealed-root-volume.patch
 0032-sweet-bearssl-sha1.patch
 0033-sweet-bearssl-sha384-sha512.patch
@@ -50,6 +50,8 @@
 0058-sweet-hid-event-services.patch
 0059-sweet-iphone-identity.patch
 0064-sweet-priv-work-interval.patch
+0065-sweet-smp-psci.patch
 0066-sweet-crash-fault-region.patch
 0068-sweet-surface-lookup-cached.patch
 0070-sweet-pid-hibernate.patch
+0078-sweet-smp-8-cores.patch
