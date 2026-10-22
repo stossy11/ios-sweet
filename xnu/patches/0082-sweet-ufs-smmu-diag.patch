@@ -1,7 +1,8 @@
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index da1ac45..3691fa4 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -68,6 +68,38 @@
+@@ -68,6 +68,58 @@ extern int get_preemption_level(void);
  #define HCS_DP          (1u << 0)
  #define HCS_UTRLRDY     (1u << 1)
  
@@ -13,7 +14,17 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 + * DMA address when the SMMU context for that stream is a bypass, so the
 + * state of the block is part of the bring-up story and is dumped here.
 + *
-+ * Register offsets follow the SMMUv3 layout (ARM DDI 0487A): the device
++ * Only the registers of the first page are read by default.  A read of a
++ * register that this implementation does not have raises a synchronous
++ * external abort, and the kernel cannot recover from that: the boot ends
++ * with "Unclassified kernel abort (fault_code=0x10)", which is ESR_EL1
++ * DFSC 0x10 (external abort) and not a translation fault.  The offsets
++ * that are not proven to exist are therefore behind the boot argument
++ * "sweetsmmu"; the loader probe (metroid-loader) enumerates the
++ * implemented offsets at EL1, where an abort is recoverable, and tells us
++ * what may be read from here.
++ *
++ * The register offsets follow the SMMUv3 layout (ARM DDI 0487A): the device
 + * tree programs 0x800 (SMR) and 0xc00 (S2CR) exactly like the
 + * architecture defines, which corroborates the map.
 + */
@@ -37,10 +48,20 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +/* Stream id of the UFS master (device tree: iommus = <&apps_smmu 0x60 0x00>). */
 +#define SMMU_UFS_SID    0x60
 +
++/*
++ * How much of the SMMU is read.  The boot argument "sweetsmmu" is a bit
++ * mask; the default (0) reads only the registers that are proven to exist
++ * on this device, the other bits add the registers that the loader probe
++ * has found to be implemented.
++ */
++#define SMMU_DIAG_TBL   0x1   /* STRTAB, CDBAR */
++#define SMMU_DIAG_FAULT 0x2   /* FSR, FAR, GSR */
++#define SMMU_DIAG_SMR   0x4   /* stream match register of the UFS stream */
++
  #define UFS_BLOCK       4096u
  #define BOUNCE_SIZE     (1u << 20)
  #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
-@@ -99,6 +131,7 @@
+@@ -99,6 +151,7 @@ struct ucd {
  
  static struct {
  	vm_offset_t regs;
@@ -48,8 +69,8 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
  	uint64_t dma_pa;
  	uint8_t lun;
-@@ -123,13 +156,102 @@
- 	return *(volatile uint32_t *)(su.regs + off);
+@@ -129,6 +182,139 @@ ufs_wr(uint32_t off, uint32_t v)
+ 	*(volatile uint32_t *)(su.regs + off) = v;
  }
  
 +/*
@@ -93,16 +114,23 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +	}
 +	return true;
 +}
- static inline void
- ufs_wr(uint32_t off, uint32_t v)
- {
- 	*(volatile uint32_t *)(su.regs + off) = v;
- }
- 
-+static inline uint32_t
++
++/* How much of the SMMU is read; boot-arg sweetsmmu. */
++static uint32_t sweet_smmu_diag = 0;
++
++/*
++ * Read one SMMU register.  The offset is printed before the access: a bus
++ * error on a register that does not exist is fatal in the kernel, and the
++ * last offset printed is then the one that killed the boot.
++ */
++static uint32_t
 +smmu_rd(uint32_t off)
 +{
-+	return su.smmu ? *(volatile uint32_t *)(su.smmu + off) : 0xffffffffU;
++	if (!su.smmu) {
++		return 0xffffffffU;
++	}
++	printf("METROID SMMU: read 0x%04x\n", off);
++	return *(volatile uint32_t *)(su.smmu + off);
 +}
 +
 +/*
@@ -111,30 +139,52 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 + * enabled), the stream match register of the UFS stream (does a context
 + * exist for it) and the fault registers (did a translation fault happen).
 + */
- static void
++static void
 +sweet_ufs_smmu_dump(const char *tag)
 +{
 +	if (!su.smmu) {
 +		printf("METROID SMMU[%s]: not mapped\n", tag);
 +		return;
 +	}
++	uint32_t idr0 = smmu_rd(SMMU_IDR0);
 +	uint32_t cr0 = smmu_rd(SMMU_CR0);
++	uint32_t cr0ack = smmu_rd(SMMU_CR0ACK);
++	uint32_t gbpa = smmu_rd(SMMU_GBPA);
++	uint32_t gerror = smmu_rd(SMMU_GERROR);
++	uint32_t gerrorn = smmu_rd(SMMU_GERRORN);
 +	printf("METROID SMMU[%s]: IDR0=%08x CR0=%08x CR0ACK=%08x GBPA=%08x "
-+	    "GERROR=%08x GERRORN=%08x translate=%s\n", tag, smmu_rd(SMMU_IDR0), cr0,
-+	    smmu_rd(SMMU_CR0ACK), smmu_rd(SMMU_GBPA), smmu_rd(SMMU_GERROR),
-+	    smmu_rd(SMMU_GERRORN),
++	    "GERROR=%08x GERRORN=%08x translate=%s\n", tag, idr0, cr0, cr0ack,
++	    gbpa, gerror, gerrorn,
 +	    (cr0 & (SMMU_CR0_S0EN | SMMU_CR0_NS0EN)) ? "on" : "off");
-+	printf("METROID SMMU[%s]: STRTAB=%08x:%08x CDBAR=%08x FSR=%08x FAR=%08x "
-+	    "GSR=%08x SMR=%08x/%08x\n", tag, smmu_rd(SMMU_STRTAB + 4),
-+	    smmu_rd(SMMU_STRTAB), smmu_rd(SMMU_CDBAR), smmu_rd(SMMU_FSR),
-+	    smmu_rd(SMMU_FAR), smmu_rd(SMMU_GSR),
-+	    smmu_rd(SMMU_SMR + 4 * SMMU_UFS_SID),
-+	    smmu_rd(SMMU_SMR + 8 * SMMU_UFS_SID));
++	if (sweet_smmu_diag & SMMU_DIAG_TBL) {
++		uint32_t strtab = smmu_rd(SMMU_STRTAB);
++		uint32_t strtabh = smmu_rd(SMMU_STRTAB + 4);
++		uint32_t cdbar = smmu_rd(SMMU_CDBAR);
++		printf("METROID SMMU[%s]: STRTAB=%08x:%08x CDBAR=%08x\n", tag,
++		    strtabh, strtab, cdbar);
++	}
++	if (sweet_smmu_diag & SMMU_DIAG_FAULT) {
++		uint32_t fsr = smmu_rd(SMMU_FSR);
++		uint32_t far = smmu_rd(SMMU_FAR);
++		uint32_t gsr = smmu_rd(SMMU_GSR);
++		printf("METROID SMMU[%s]: FSR=%08x FAR=%08x GSR=%08x\n", tag, fsr,
++		    far, gsr);
++	}
++	if (sweet_smmu_diag & SMMU_DIAG_SMR) {
++		/* SMR[n] is 8 bytes wide: the valid bit is in the low word, the
++		 * stream id in the high word. */
++		uint32_t smr_lo = smmu_rd(SMMU_SMR + 8 * SMMU_UFS_SID);
++		uint32_t smr_hi = smmu_rd(SMMU_SMR + 8 * SMMU_UFS_SID + 4);
++		printf("METROID SMMU[%s]: SMR[%u]=%08x:%08x\n", tag,
++		    (unsigned)SMMU_UFS_SID, smr_hi, smr_lo);
++	}
 +}
 +
 +/*
-+ * Fault registers only: called when a command times out, to tell an SMMU
-+ * translation fault apart from a controller that simply did not run.
++ * Called when a command times out, to tell an SMMU translation fault apart
++ * from a controller that simply did not run.  Only the registers that are
++ * proven to exist are read here: a bus error would kill the kernel exactly
++ * when the timeout is being reported.
 + */
 +static void
 +sweet_ufs_smmu_fault(const char *tag)
@@ -142,16 +192,24 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +	if (!su.smmu) {
 +		return;
 +	}
-+	printf("METROID SMMU[%s]: FSR=%08x FAR=%08x GSR=%08x GERROR=%08x\n", tag,
-+	    smmu_rd(SMMU_FSR), smmu_rd(SMMU_FAR), smmu_rd(SMMU_GSR),
-+	    smmu_rd(SMMU_GERROR));
++	uint32_t gerror = smmu_rd(SMMU_GERROR);
++	uint32_t gerrorn = smmu_rd(SMMU_GERRORN);
++	uint32_t cr0 = smmu_rd(SMMU_CR0);
++	printf("METROID SMMU[%s]: GERROR=%08x GERRORN=%08x CR0=%08x\n", tag,
++	    gerror, gerrorn, cr0);
++	if (sweet_smmu_diag & SMMU_DIAG_FAULT) {
++		uint32_t fsr = smmu_rd(SMMU_FSR);
++		uint32_t far = smmu_rd(SMMU_FAR);
++		uint32_t gsr = smmu_rd(SMMU_GSR);
++		printf("METROID SMMU[%s]: FSR=%08x FAR=%08x GSR=%08x\n", tag, fsr,
++		    far, gsr);
++	}
 +}
 +
-+static void
+ static void
  dma_sync(uint32_t off, uint32_t len)
  {
- 	flush_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
-@@ -230,9 +352,12 @@
+@@ -230,9 +416,12 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
  		if (now > deadline) {
  			su.io_failed = true;  /* pending request may still DMA */
  			printf("METROID UFS TIMEOUT: cmd=%02x IS=%08x HCS=%08x HCE=%08x "
@@ -166,19 +224,30 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  			/* Do not blindly clear in-flight requests on an unknown MCQ/SMMU setup. */
  			return ETIMEDOUT;
  		}
-@@ -678,6 +803,11 @@
+@@ -660,6 +849,9 @@ sweet_ufs_init(void)
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
++	/* How much of the SMMU register block is read; see the SMMU notes
++	 * above.  The default reads only what is proven to exist. */
++	PE_parse_boot_argn("sweetsmmu", &sweet_smmu_diag, sizeof(sweet_smmu_diag));
+ 	/* The Android DT gives UFS an SMMU stream. A plain PA is NOT normally
+ 	 * a legal UFS DMA address. This opt-in is only for users who have
+ 	 * independently verified that UFS uses identity-mapped DMA at handoff.
+@@ -678,6 +870,12 @@ sweet_ufs_init(void)
  		return ENXIO;
  	}
  	su.regs = ml_io_map(reg[0], reg[1]);
 +	/* The UFS master is behind apps_smmu.  Dump its state before the
 +	 * controller is touched, so a later timeout can be attributed to the
-+	 * SMMU or to the host controller. */
++	 * SMMU or to the host controller.  Only the registers that are
++	 * proven to exist are read; see the SMMU notes above. */
 +	su.smmu = ml_io_map(SMMU_BASE_PHYS, SMMU_SIZE);
 +	sweet_ufs_smmu_dump("init");
  	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
  	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
  		printf("SWEET UFS: no contiguous DMA memory\n");
-@@ -716,10 +846,9 @@
+@@ -716,10 +914,9 @@ sweet_ufs_init(void)
  	if (rw != 0) {
  		if (rw != 1 || !write_partition[0] ||
  		    strcmp(write_partition, want) != 0 ||
