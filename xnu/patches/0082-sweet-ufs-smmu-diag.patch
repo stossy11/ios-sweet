@@ -1,67 +1,99 @@
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index da1ac45..3691fa4 100644
+index da1ac45..3ace660 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -68,6 +68,58 @@ extern int get_preemption_level(void);
+@@ -64,10 +64,90 @@ extern int get_preemption_level(void);
+ #define REG_UTRLDBR     0x58
+ #define REG_UTRLCLR     0x5c
+ #define REG_UTRLRSR     0x60
++#define REG_UTRLCNR     0x64
++#define REG_UECPA       0x38
++#define REG_UECDL       0x3c
++#define REG_UECN        0x40
++#define REG_UECT        0x44
++#define REG_UECDME      0x48
+ 
  #define HCS_DP          (1u << 0)
  #define HCS_UTRLRDY     (1u << 1)
  
 +/*
-+ * apps_smmu (Qualcomm QSMMUv500).  The live device tree gives the UFS
-+ * master an SMMU stream ("iommus = <&apps_smmu 0x60 0x00>" with
-+ * "qcom,iommu-dma = \"fastmap\""), so every DMA address the host uses is
-+ * translated by this block.  A plain physical address is only a legal UFS
-+ * DMA address when the SMMU context for that stream is a bypass, so the
-+ * state of the block is part of the bring-up story and is dumped here.
++ * apps_smmu: Qualcomm QSMMUv500.  Live device tree of the phone ("tuna"):
++ *   apps-smmu@15000000  compatible "qcom,qsmmu-v500"  reg <0x15000000 0x100000>
++ *   ufshc@1d84000       iommus = <&apps_smmu 0x60 0x00>, qcom,iommu-dma = "fastmap"
 + *
-+ * Only the registers of the first page are read by default.  A read of a
-+ * register that this implementation does not have raises a synchronous
-+ * external abort, and the kernel cannot recover from that: the boot ends
-+ * with "Unclassified kernel abort (fault_code=0x10)", which is ESR_EL1
-+ * DFSC 0x10 (external abort) and not a translation fault.  The offsets
-+ * that are not proven to exist are therefore behind the boot argument
-+ * "sweetsmmu"; the loader probe (metroid-loader) enumerates the
-+ * implemented offsets at EL1, where an abort is recoverable, and tells us
-+ * what may be read from here.
++ * QSMMUv500 is an Arm MMU-500, i.e. the SMMUv2 programming model: global
++ * register space 0 (sCR0, ID0..ID2, sGFSR, SMRn at 0x800, S2CRn at 0xc00),
++ * global space 1 (CBARn) and one page per context bank.  It is NOT an
++ * SMMUv3: there is no stream table, command queue, CR0 or GBPA.  An earlier
++ * revision of this patch used SMMUv3 offsets, so its "CR0" was really ID0.
++ * "qcom,handoff-smrs = <0x800 0x02>" and the "qcom,actlr" triplets in the
++ * same DT node are <stream-id mask value>, not register offsets.
 + *
-+ * The register offsets follow the SMMUv3 layout (ARM DDI 0487A): the device
-+ * tree programs 0x800 (SMR) and 0xc00 (S2CR) exactly like the
-+ * architecture defines, which corroborates the map.
++ * A raw physical address is a legal UFS DMA address only while stream 0x60
++ * is bypassed: sCR0.CLIENTPD=1, or an SMR matching 0x60 whose S2CR type is
++ * BYPASS, or no matching SMR while sCR0.USFCFG=0.  Anything else (S2CR type
++ * TRANSLATE with a context bank, or FAULT) makes the host controller's DMA
++ * fetch of the request list fail, so the doorbell never clears: a command
++ * timeout with otherwise sane HCS/HCE/UTRLBA.  The dump below decides which
++ * case this is.  It only reads registers that the architecture defines in
++ * global space 0/1 and in the context bank of the stream.
 + */
 +#define SMMU_BASE_PHYS  0x15000000ULL
 +#define SMMU_SIZE       0x100000ULL
-+#define SMMU_IDR0       0x00
-+#define SMMU_CR0        0x20
-+#define SMMU_CR0ACK     0x24
-+#define SMMU_GBPA       0x44
-+#define SMMU_GERROR     0x60
-+#define SMMU_GERRORN    0x64
-+#define SMMU_SMR        0x800
-+#define SMMU_STRTAB     0x8000
-+#define SMMU_CDBAR      0x8008
-+#define SMMU_FSR        0x9000
-+#define SMMU_FAR        0x9008
-+#define SMMU_GSR        0x9010
-+#define SMMU_CR0_S0EN   (1u << 0)   /* translation enabled, secure */
-+#define SMMU_CR0_NS0EN  (1u << 1)   /* translation enabled, non-secure */
++#define SMMU_SCR0       0x000
++#define SMMU_ID0        0x020
++#define SMMU_ID1        0x024
++#define SMMU_ID2        0x028
++#define SMMU_SGFAR      0x040   /* 64-bit */
++#define SMMU_SGFSR      0x048
++#define SMMU_SGFSYNR0   0x050
++#define SMMU_SGFSYNR1   0x054
++#define SMMU_SGFSYNR2   0x058
++#define SMMU_SMR(n)     (0x800 + 4 * (n))
++#define SMMU_S2CR(n)    (0xc00 + 4 * (n))
++#define SMMU_CB_SCTLR   0x00
++#define SMMU_CB_TTBR0   0x20    /* 64-bit */
++#define SMMU_CB_TCR     0x30
++#define SMMU_CB_FSR     0x58
++#define SMMU_CB_FAR     0x60    /* 64-bit */
++#define SMMU_CB_FSYNR0  0x68
++
++#define SCR0_CLIENTPD   (1u << 0)
++#define SCR0_EXIDENABLE (1u << 3)
++#define SCR0_USFCFG     (1u << 10)
++#define ID0_EXIDS       (1u << 8)
++#define ID0_SMS         (1u << 27)
++#define ID0_NUMSMRG(x)  ((x) & 0xffu)
++#define ID1_PAGESIZE    (1u << 31)      /* 1: 64 KiB pages */
++#define ID1_NUMPAGENDXB(x) (((x) >> 28) & 7u)
++#define ID1_NUMCB(x)    ((x) & 0xffu)
++#define SMR_VALID       (1u << 31)
++#define SMR_ID(x)       ((x) & 0xffffu)
++#define SMR_MASK(x)     (((x) >> 16) & 0x7fffu)
++#define S2CR_TYPE(x)    (((x) >> 16) & 3u)
++#define S2CR_TYPE_MASK  (3u << 16)
++#define S2CR_TRANS      0u
++#define S2CR_BYPASS     1u
++#define S2CR_FAULT      2u
++#define S2CR_CBNDX(x)   ((x) & 0xffu)
 +
 +/* Stream id of the UFS master (device tree: iommus = <&apps_smmu 0x60 0x00>). */
-+#define SMMU_UFS_SID    0x60
++#define SMMU_UFS_SID    0x60u
 +
 +/*
-+ * How much of the SMMU is read.  The boot argument "sweetsmmu" is a bit
-+ * mask; the default (0) reads only the registers that are proven to exist
-+ * on this device, the other bits add the registers that the loader probe
-+ * has found to be implemented.
++ * Boot argument "sweetsmmu" (bit mask).  0 leaves the SMMU completely alone.
++ * Any other value reads the ID registers and sCR0; the bits add more.
 + */
-+#define SMMU_DIAG_TBL   0x1   /* STRTAB, CDBAR */
-+#define SMMU_DIAG_FAULT 0x2   /* FSR, FAR, GSR */
-+#define SMMU_DIAG_SMR   0x4   /* stream match register of the UFS stream */
++#define SMMU_DIAG_BASIC  0x1    /* sCR0, ID0..ID2, sGFSR */
++#define SMMU_DIAG_STREAM 0x2    /* scan the SMRs for stream 0x60 and its S2CR/context bank */
++#define SMMU_DIAG_FAULT  0x4    /* sGFSR/sGFSYNR/sGFAR and the context bank FSR on a timeout */
++#define SMMU_DIAG_TRACE  0x8    /* print every register offset before it is read */
++#define SMMU_DIAG_DEFAULT (SMMU_DIAG_BASIC | SMMU_DIAG_STREAM | SMMU_DIAG_FAULT)
 +
  #define UFS_BLOCK       4096u
  #define BOUNCE_SIZE     (1u << 20)
  #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
-@@ -99,6 +151,7 @@ struct ucd {
+@@ -99,6 +179,7 @@ struct ucd {
  
  static struct {
  	vm_offset_t regs;
@@ -69,7 +101,7 @@ index da1ac45..3691fa4 100644
  	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
  	uint64_t dma_pa;
  	uint8_t lun;
-@@ -129,6 +182,139 @@ ufs_wr(uint32_t off, uint32_t v)
+@@ -129,6 +210,273 @@ ufs_wr(uint32_t off, uint32_t v)
  	*(volatile uint32_t *)(su.regs + off) = v;
  }
  
@@ -116,28 +148,92 @@ index da1ac45..3691fa4 100644
 +}
 +
 +/* How much of the SMMU is read; boot-arg sweetsmmu. */
-+static uint32_t sweet_smmu_diag = 0;
++static uint32_t sweet_smmu_diag = SMMU_DIAG_DEFAULT;
++
++/* What the dump learned about the UFS stream (stream id 0x60). */
++static struct {
++	bool ok;                /* ID registers read and plausible */
++	bool scanned;           /* SMRs scanned (needs SMMU_DIAG_STREAM, no EXIDS) */
++	bool clientpd, usfcfg;
++	uint32_t scr0, id0, id1;
++	uint32_t pgshift, numpage, nsmr, ncb;
++	uint32_t nmatch;        /* valid SMRs that match stream 0x60 */
++	int smr_idx;            /* first matching SMR, -1 if none */
++	uint32_t smr, s2cr;     /* that SMR and its S2CR */
++} smmu_st = { .smr_idx = -1 };
++
++enum smmu_verdict {
++	SMMU_UNKNOWN, SMMU_BYPASS, SMMU_TRANSLATE, SMMU_FAULT,
++	SMMU_UNMATCHED_BYPASS, SMMU_UNMATCHED_FAULT
++};
++
++static const char * const smmu_verdict_name[] = {
++	"unknown", "bypass (S2CR/CLIENTPD)", "TRANSLATE (needs a mapping)",
++	"FAULT (S2CR type fault)", "unmatched, USFCFG=0 (bypass)",
++	"unmatched, USFCFG=1 (FAULT)"
++};
 +
 +/*
-+ * Read one SMMU register.  The offset is printed before the access: a bus
-+ * error on a register that does not exist is fatal in the kernel, and the
-+ * last offset printed is then the one that killed the boot.
++ * Read one SMMU register.  With sweetsmmu bit 3 the offset is printed first:
++ * a bus error on a register that is not accessible from here is fatal in the
++ * kernel, and the last offset printed is then the one that killed the boot.
++ * The console may be buffered, so the last line on screen can lag behind.
 + */
 +static uint32_t
 +smmu_rd(uint32_t off)
 +{
-+	if (!su.smmu) {
++	if (!su.smmu || off > SMMU_SIZE - 4) {
 +		return 0xffffffffU;
 +	}
-+	printf("METROID SMMU: read 0x%04x\n", off);
++	if (sweet_smmu_diag & SMMU_DIAG_TRACE) {
++		printf("METROID SMMU: read 0x%05x\n", off);
++	}
 +	return *(volatile uint32_t *)(su.smmu + off);
 +}
 +
++static bool
++smmu_cb_ok(uint32_t cb)
++{
++	return smmu_st.ok && cb < smmu_st.ncb &&
++	       ((uint64_t)(smmu_st.numpage + cb + 1) << smmu_st.pgshift) <= SMMU_SIZE;
++}
++
++static uint32_t
++smmu_cb_rd(uint32_t cb, uint32_t off)
++{
++	return smmu_rd(((smmu_st.numpage + cb) << smmu_st.pgshift) + off);
++}
++
++static enum smmu_verdict
++smmu_ufs_verdict(void)
++{
++	if (!smmu_st.ok) {
++		return SMMU_UNKNOWN;
++	}
++	if (smmu_st.clientpd) {
++		return SMMU_BYPASS;             /* SMMU disabled for all clients */
++	}
++	if (!smmu_st.scanned || smmu_st.nmatch > 1) {
++		return SMMU_UNKNOWN;
++	}
++	if (smmu_st.nmatch == 0) {
++		return smmu_st.usfcfg ? SMMU_UNMATCHED_FAULT : SMMU_UNMATCHED_BYPASS;
++	}
++	switch (S2CR_TYPE(smmu_st.s2cr)) {
++	case S2CR_BYPASS:
++		return SMMU_BYPASS;
++	case S2CR_TRANS:
++		return SMMU_TRANSLATE;
++	case S2CR_FAULT:
++		return SMMU_FAULT;
++	default:
++		return SMMU_UNKNOWN;
++	}
++}
++
 +/*
-+ * Dump the SMMU state that decides whether the UFS master may DMA at all.
-+ * The interesting registers are the control register (is translation even
-+ * enabled), the stream match register of the UFS stream (does a context
-+ * exist for it) and the fault registers (did a translation fault happen).
++ * Dump the SMMU state that decides whether the UFS master may DMA with
++ * physical addresses, and remember it in smmu_st for the verdict.
 + */
 +static void
 +sweet_ufs_smmu_dump(const char *tag)
@@ -146,70 +242,140 @@ index da1ac45..3691fa4 100644
 +		printf("METROID SMMU[%s]: not mapped\n", tag);
 +		return;
 +	}
-+	uint32_t idr0 = smmu_rd(SMMU_IDR0);
-+	uint32_t cr0 = smmu_rd(SMMU_CR0);
-+	uint32_t cr0ack = smmu_rd(SMMU_CR0ACK);
-+	uint32_t gbpa = smmu_rd(SMMU_GBPA);
-+	uint32_t gerror = smmu_rd(SMMU_GERROR);
-+	uint32_t gerrorn = smmu_rd(SMMU_GERRORN);
-+	printf("METROID SMMU[%s]: IDR0=%08x CR0=%08x CR0ACK=%08x GBPA=%08x "
-+	    "GERROR=%08x GERRORN=%08x translate=%s\n", tag, idr0, cr0, cr0ack,
-+	    gbpa, gerror, gerrorn,
-+	    (cr0 & (SMMU_CR0_S0EN | SMMU_CR0_NS0EN)) ? "on" : "off");
-+	if (sweet_smmu_diag & SMMU_DIAG_TBL) {
-+		uint32_t strtab = smmu_rd(SMMU_STRTAB);
-+		uint32_t strtabh = smmu_rd(SMMU_STRTAB + 4);
-+		uint32_t cdbar = smmu_rd(SMMU_CDBAR);
-+		printf("METROID SMMU[%s]: STRTAB=%08x:%08x CDBAR=%08x\n", tag,
-+		    strtabh, strtab, cdbar);
++	uint32_t scr0 = smmu_rd(SMMU_SCR0);
++	uint32_t id0 = smmu_rd(SMMU_ID0);
++	uint32_t id1 = smmu_rd(SMMU_ID1);
++	uint32_t id2 = smmu_rd(SMMU_ID2);
++	uint32_t gfsr = smmu_rd(SMMU_SGFSR);
++	printf("METROID SMMU[%s]: sCR0=%08x ID0=%08x ID1=%08x ID2=%08x sGFSR=%08x\n",
++	    tag, scr0, id0, id1, id2, gfsr);
++	if (scr0 == 0xffffffffU || id0 == 0xffffffffU || id1 == 0xffffffffU ||
++	    id0 == 0 || id1 == 0) {
++		printf("METROID SMMU[%s]: ID registers read 0x%08x/0x%08x: block not "
++		    "readable here (owned by firmware/hypervisor?)\n", tag, id0, id1);
++		return;
 +	}
-+	if (sweet_smmu_diag & SMMU_DIAG_FAULT) {
-+		uint32_t fsr = smmu_rd(SMMU_FSR);
-+		uint32_t far = smmu_rd(SMMU_FAR);
-+		uint32_t gsr = smmu_rd(SMMU_GSR);
-+		printf("METROID SMMU[%s]: FSR=%08x FAR=%08x GSR=%08x\n", tag, fsr,
-+		    far, gsr);
++	smmu_st.scr0 = scr0;
++	smmu_st.id0 = id0;
++	smmu_st.id1 = id1;
++	smmu_st.pgshift = (id1 & ID1_PAGESIZE) ? 16 : 12;
++	smmu_st.numpage = 1u << (ID1_NUMPAGENDXB(id1) + 1);
++	smmu_st.nsmr = ID0_NUMSMRG(id0);
++	smmu_st.ncb = ID1_NUMCB(id1);
++	smmu_st.clientpd = (scr0 & SCR0_CLIENTPD) != 0;
++	smmu_st.usfcfg = (scr0 & SCR0_USFCFG) != 0;
++	smmu_st.ok = true;
++	printf("METROID SMMU[%s]: clientpd=%u usfcfg=%u exidenable=%u | stream-match=%u "
++	    "smrs=%u contexts=%u page=%uK numpage=%u\n", tag,
++	    smmu_st.clientpd, smmu_st.usfcfg, !!(scr0 & SCR0_EXIDENABLE),
++	    !!(id0 & ID0_SMS), smmu_st.nsmr, smmu_st.ncb,
++	    1u << (smmu_st.pgshift - 10), smmu_st.numpage);
++
++	if (!(sweet_smmu_diag & SMMU_DIAG_STREAM)) {
++		return;
 +	}
-+	if (sweet_smmu_diag & SMMU_DIAG_SMR) {
-+		/* SMR[n] is 8 bytes wide: the valid bit is in the low word, the
-+		 * stream id in the high word. */
-+		uint32_t smr_lo = smmu_rd(SMMU_SMR + 8 * SMMU_UFS_SID);
-+		uint32_t smr_hi = smmu_rd(SMMU_SMR + 8 * SMMU_UFS_SID + 4);
-+		printf("METROID SMMU[%s]: SMR[%u]=%08x:%08x\n", tag,
-+		    (unsigned)SMMU_UFS_SID, smr_hi, smr_lo);
++	if (!(id0 & ID0_SMS) || (scr0 & SCR0_EXIDENABLE)) {
++		printf("METROID SMMU[%s]: SMR scan not supported (no stream matching or EXIDENABLE)\n",
++		    tag);
++		return;
++	}
++	uint32_t nvalid = 0;
++	smmu_st.nmatch = 0;
++	smmu_st.smr_idx = -1;
++	for (uint32_t n = 0; n < smmu_st.nsmr; n++) {
++		uint32_t smr = smmu_rd(SMMU_SMR(n));
++		if (!(smr & SMR_VALID)) {
++			continue;
++		}
++		nvalid++;
++		/* The stream id matches when it equals SMR.ID on every bit the mask does not ignore. */
++		if (((SMMU_UFS_SID ^ SMR_ID(smr)) & ~SMR_MASK(smr) & 0xffffu) != 0) {
++			continue;
++		}
++		uint32_t s2cr = smmu_rd(SMMU_S2CR(n));
++		printf("METROID SMMU[%s]: SMR[%u]=%08x (id 0x%x mask 0x%x) matches stream 0x%x: "
++		    "S2CR=%08x type=%u cb=%u\n", tag, n, smr, SMR_ID(smr), SMR_MASK(smr),
++		    SMMU_UFS_SID, s2cr, S2CR_TYPE(s2cr), S2CR_CBNDX(s2cr));
++		if (smmu_st.smr_idx < 0) {
++			smmu_st.smr_idx = (int)n;
++			smmu_st.smr = smr;
++			smmu_st.s2cr = s2cr;
++		}
++		smmu_st.nmatch++;
++	}
++	smmu_st.scanned = true;
++	if (smmu_st.nmatch > 1) {
++		printf("METROID SMMU[%s]: %u SMRs match stream 0x%x (multi-match)\n", tag,
++		    smmu_st.nmatch, SMMU_UFS_SID);
++	}
++	printf("METROID SMMU[%s]: %u of %u SMRs valid; stream 0x%x: %s\n", tag, nvalid,
++	    smmu_st.nsmr, SMMU_UFS_SID, smmu_verdict_name[smmu_ufs_verdict()]);
++	if (smmu_st.smr_idx >= 0 && S2CR_TYPE(smmu_st.s2cr) == S2CR_TRANS) {
++		uint32_t cb = S2CR_CBNDX(smmu_st.s2cr);
++		if (smmu_cb_ok(cb)) {
++			/* CBARn is in global space 1 (the second page). */
++			uint32_t cbar = smmu_rd((1u << smmu_st.pgshift) + 4 * cb);
++			printf("METROID SMMU[%s]: CB%u CBAR=%08x SCTLR=%08x TTBR0=%08x:%08x "
++			    "TCR=%08x FSR=%08x\n", tag, cb, cbar,
++			    smmu_cb_rd(cb, SMMU_CB_SCTLR),
++			    smmu_cb_rd(cb, SMMU_CB_TTBR0 + 4), smmu_cb_rd(cb, SMMU_CB_TTBR0),
++			    smmu_cb_rd(cb, SMMU_CB_TCR), smmu_cb_rd(cb, SMMU_CB_FSR));
++		}
 +	}
 +}
 +
 +/*
-+ * Called when a command times out, to tell an SMMU translation fault apart
-+ * from a controller that simply did not run.  Only the registers that are
-+ * proven to exist are read here: a bus error would kill the kernel exactly
-+ * when the timeout is being reported.
++ * Called when a command times out, to tell an SMMU fault apart from a
++ * controller that simply did not run.  Reads only registers the architecture
++ * defines, and only after the dump found the SMMU readable.
 + */
 +static void
 +sweet_ufs_smmu_fault(const char *tag)
 +{
-+	if (!su.smmu) {
++	if (!su.smmu || !smmu_st.ok || !(sweet_smmu_diag & SMMU_DIAG_FAULT)) {
 +		return;
 +	}
-+	uint32_t gerror = smmu_rd(SMMU_GERROR);
-+	uint32_t gerrorn = smmu_rd(SMMU_GERRORN);
-+	uint32_t cr0 = smmu_rd(SMMU_CR0);
-+	printf("METROID SMMU[%s]: GERROR=%08x GERRORN=%08x CR0=%08x\n", tag,
-+	    gerror, gerrorn, cr0);
-+	if (sweet_smmu_diag & SMMU_DIAG_FAULT) {
-+		uint32_t fsr = smmu_rd(SMMU_FSR);
-+		uint32_t far = smmu_rd(SMMU_FAR);
-+		uint32_t gsr = smmu_rd(SMMU_GSR);
-+		printf("METROID SMMU[%s]: FSR=%08x FAR=%08x GSR=%08x\n", tag, fsr,
-+		    far, gsr);
++	printf("METROID SMMU[%s]: sGFSR=%08x sGFSYNR0=%08x sGFSYNR1=%08x sGFSYNR2=%08x "
++	    "sGFAR=%08x:%08x\n", tag, smmu_rd(SMMU_SGFSR), smmu_rd(SMMU_SGFSYNR0),
++	    smmu_rd(SMMU_SGFSYNR1), smmu_rd(SMMU_SGFSYNR2),
++	    smmu_rd(SMMU_SGFAR + 4), smmu_rd(SMMU_SGFAR));
++	if (smmu_st.smr_idx >= 0 && S2CR_TYPE(smmu_st.s2cr) == S2CR_TRANS) {
++		uint32_t cb = S2CR_CBNDX(smmu_st.s2cr);
++		if (smmu_cb_ok(cb)) {
++			printf("METROID SMMU[%s]: CB%u FSR=%08x FAR=%08x:%08x FSYNR0=%08x\n", tag, cb,
++			    smmu_cb_rd(cb, SMMU_CB_FSR), smmu_cb_rd(cb, SMMU_CB_FAR + 4),
++			    smmu_cb_rd(cb, SMMU_CB_FAR), smmu_cb_rd(cb, SMMU_CB_FSYNR0));
++		}
 +	}
++}
++
++/* Names of the interrupt status bits that explain a stuck request. */
++static const char *
++ufs_is_names(uint32_t is, char *buf, size_t n)
++{
++	static const struct {
++		uint32_t bit;
++		const char *name;
++	} t[] = {
++		{ 1u << 0, "UTRCS" }, { 1u << 2, "UE" }, { 1u << 7, "ULLS" },
++		{ 1u << 10, "UCCS" }, { 1u << 11, "DFES" }, { 1u << 12, "UTPES" },
++		{ 1u << 16, "HCFES" }, { 1u << 17, "SBFES(system bus fatal)" },
++		{ 1u << 18, "CEFES" },
++	};
++	buf[0] = '\0';
++	for (unsigned i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
++		if (is & t[i].bit) {
++			strlcat(buf, t[i].name, n);
++			strlcat(buf, " ", n);
++		}
++	}
++	return buf;
 +}
 +
  static void
  dma_sync(uint32_t off, uint32_t len)
  {
-@@ -230,9 +416,12 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+@@ -230,9 +578,22 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
  		if (now > deadline) {
  			su.io_failed = true;  /* pending request may still DMA */
  			printf("METROID UFS TIMEOUT: cmd=%02x IS=%08x HCS=%08x HCE=%08x "
@@ -220,34 +386,36 @@ index da1ac45..3691fa4 100644
 -			    ufs_rd(REG_UTRLDBR), ufs_rd(REG_UTRLRSR), utrd->dw2, ucd->resp[0]);
 +			    ufs_rd(REG_UTRLDBR), ufs_rd(REG_UTRLRSR), utrd->dw2, ucd->resp[0],
 +			    ufs_rd(REG_IE), ufs_rd(REG_UFS_MEM_CFG));
++			{
++				char isn[96];
++				uint32_t is = ufs_rd(REG_IS);
++				printf("METROID UFS TIMEOUT: IS bits: %s| UTRLBA=%08x:%08x UTRLCNR=%08x "
++				    "UECPA=%08x UECDL=%08x UECN=%08x UECT=%08x UECDME=%08x\n",
++				    ufs_is_names(is, isn, sizeof(isn)), ufs_rd(REG_UTRLBAU),
++				    ufs_rd(REG_UTRLBA), ufs_rd(REG_UTRLCNR), ufs_rd(REG_UECPA),
++				    ufs_rd(REG_UECDL), ufs_rd(REG_UECN), ufs_rd(REG_UECT),
++				    ufs_rd(REG_UECDME));
++			}
 +			sweet_ufs_smmu_fault("timeout");
  			/* Do not blindly clear in-flight requests on an unknown MCQ/SMMU setup. */
  			return ETIMEDOUT;
  		}
-@@ -660,6 +849,9 @@ sweet_ufs_init(void)
+@@ -660,6 +1021,14 @@ sweet_ufs_init(void)
  	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
  	su.cache = (cache == 1);
  	su.wait = (wait == 1);
-+	/* How much of the SMMU register block is read; see the SMMU notes
-+	 * above.  The default reads only what is proven to exist. */
++	/* What the SMMU dump reads; see the SMMU notes above.  sweetsmmu=0 leaves
++	 * the SMMU untouched.  The dump is read-only and runs before the DMA gate
++	 * below, so its result is in the log even when the gate stops the driver. */
 +	PE_parse_boot_argn("sweetsmmu", &sweet_smmu_diag, sizeof(sweet_smmu_diag));
++	if (sweet_smmu_diag && !su.smmu) {
++		su.smmu = ml_io_map(SMMU_BASE_PHYS, SMMU_SIZE);
++		sweet_ufs_smmu_dump("init");
++	}
  	/* The Android DT gives UFS an SMMU stream. A plain PA is NOT normally
  	 * a legal UFS DMA address. This opt-in is only for users who have
  	 * independently verified that UFS uses identity-mapped DMA at handoff.
-@@ -678,6 +870,12 @@ sweet_ufs_init(void)
- 		return ENXIO;
- 	}
- 	su.regs = ml_io_map(reg[0], reg[1]);
-+	/* The UFS master is behind apps_smmu.  Dump its state before the
-+	 * controller is touched, so a later timeout can be attributed to the
-+	 * SMMU or to the host controller.  Only the registers that are
-+	 * proven to exist are read; see the SMMU notes above. */
-+	su.smmu = ml_io_map(SMMU_BASE_PHYS, SMMU_SIZE);
-+	sweet_ufs_smmu_dump("init");
- 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
- 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
- 		printf("SWEET UFS: no contiguous DMA memory\n");
-@@ -716,10 +914,9 @@ sweet_ufs_init(void)
+@@ -716,10 +1085,9 @@ sweet_ufs_init(void)
  	if (rw != 0) {
  		if (rw != 1 || !write_partition[0] ||
  		    strcmp(write_partition, want) != 0 ||
