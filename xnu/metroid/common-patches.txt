@@ -27,6 +27,8 @@
 0027-sweet-bearssl-md5.patch
 0028-sweet-ufs-root-device.patch
 0029-sweet-unsealed-root-volume.patch
+0030-sweet-ufs-writes.patch
+0031-sweet-read-write-root.patch
 0032-sweet-bearssl-sha1.patch
 0033-sweet-bearssl-sha384-sha512.patch
 0035-sweet-amfi-entitlements-platform-binaries.patch
@@ -53,5 +55,6 @@
 0065-sweet-smp-psci.patch
 0066-sweet-crash-fault-region.patch
 0068-sweet-surface-lookup-cached.patch
+0069-sweet-ufs-faster.patch
 0070-sweet-pid-hibernate.patch
 0078-sweet-smp-8-cores.patch
