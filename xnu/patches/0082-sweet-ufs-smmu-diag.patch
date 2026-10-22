@@ -1,0 +1,194 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -68,6 +68,38 @@
+ #define HCS_DP          (1u << 0)
+ #define HCS_UTRLRDY     (1u << 1)
+ 
++/*
++ * apps_smmu (Qualcomm QSMMUv500).  The live device tree gives the UFS
++ * master an SMMU stream ("iommus = <&apps_smmu 0x60 0x00>" with
++ * "qcom,iommu-dma = \"fastmap\""), so every DMA address the host uses is
++ * translated by this block.  A plain physical address is only a legal UFS
++ * DMA address when the SMMU context for that stream is a bypass, so the
++ * state of the block is part of the bring-up story and is dumped here.
++ *
++ * Register offsets follow the SMMUv3 layout (ARM DDI 0487A): the device
++ * tree programs 0x800 (SMR) and 0xc00 (S2CR) exactly like the
++ * architecture defines, which corroborates the map.
++ */
++#define SMMU_BASE_PHYS  0x15000000ULL
++#define SMMU_SIZE       0x100000ULL
++#define SMMU_IDR0       0x00
++#define SMMU_CR0        0x20
++#define SMMU_CR0ACK     0x24
++#define SMMU_GBPA       0x44
++#define SMMU_GERROR     0x60
++#define SMMU_GERRORN    0x64
++#define SMMU_SMR        0x800
++#define SMMU_STRTAB     0x8000
++#define SMMU_CDBAR      0x8008
++#define SMMU_FSR        0x9000
++#define SMMU_FAR        0x9008
++#define SMMU_GSR        0x9010
++#define SMMU_CR0_S0EN   (1u << 0)   /* translation enabled, secure */
++#define SMMU_CR0_NS0EN  (1u << 1)   /* translation enabled, non-secure */
++
++/* Stream id of the UFS master (device tree: iommus = <&apps_smmu 0x60 0x00>). */
++#define SMMU_UFS_SID    0x60
++
+ #define UFS_BLOCK       4096u
+ #define BOUNCE_SIZE     (1u << 20)
+ #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+@@ -99,6 +131,7 @@
+ 
+ static struct {
+ 	vm_offset_t regs;
++	vm_offset_t smmu;                       /* apps_smmu, 0 when not mapped */
+ 	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
+ 	uint64_t dma_pa;
+ 	uint8_t lun;
+@@ -123,13 +156,102 @@
+ 	return *(volatile uint32_t *)(su.regs + off);
+ }
+ 
++/*
++ * Write policy for the experimental read-write mode.
++ *
++ * The only partitions that may be written are dedicated ones that this
++ * project owns: a GPT partition whose name starts with "metroid_" or
++ * "xnu_".  Every partition of the stock Android layout is refused, no
++ * matter how the boot arguments are spelled, because writing to one of
++ * them destroys the Android installation.  The name of the partition that
++ * is about to be written is also compared against the name that was
++ * requested with ufsrw_partition=, so a typo cannot silently retarget the
++ * writes.
++ */
++static const char * const sweet_ufs_android_partitions[] = {
++	"boot", "init_boot", "init_boot_a", "init_boot_b", "recovery", "vendor_boot",
++	"odm", "odm_dlkm", "system", "system_ext", "vendor", "product", "userdata",
++	"metadata", "cache", "misc", "persist", "persist_bkp", "log", "dsp",
++	"apex", "cdrom", "uefi_capsule", "uefi_capsule_a", "uefi_capsule_b",
++	"modemst1", "modemst2", "fsc", "fsg", "config", "devinfo", "frp",
++	"multiuser", "qc_efs", "spl", "devcfg", "rpmb", "sdp", "sns", "fsm",
++	"oplusmeta", "engineering", "preload", "sec", "sddc",
++};
++
++static bool
++sweet_ufs_write_partition_ok(const char *name)
++{
++	if (!name || !name[0]) {
++		return false;
++	}
++	/* Must look like a partition this project owns. */
++	if (strncmp(name, "metroid_", 8) != 0 && strncmp(name, "xnu_", 4) != 0) {
++		return false;
++	}
++	/* Must not be one of the stock Android partitions. */
++	for (unsigned i = 0; i < sizeof(sweet_ufs_android_partitions) /
++	    sizeof(sweet_ufs_android_partitions[0]); i++) {
++		if (strcmp(name, sweet_ufs_android_partitions[i]) == 0) {
++			return false;
++		}
++	}
++	return true;
++}
+ static inline void
+ ufs_wr(uint32_t off, uint32_t v)
+ {
+ 	*(volatile uint32_t *)(su.regs + off) = v;
+ }
+ 
++static inline uint32_t
++smmu_rd(uint32_t off)
++{
++	return su.smmu ? *(volatile uint32_t *)(su.smmu + off) : 0xffffffffU;
++}
++
++/*
++ * Dump the SMMU state that decides whether the UFS master may DMA at all.
++ * The interesting registers are the control register (is translation even
++ * enabled), the stream match register of the UFS stream (does a context
++ * exist for it) and the fault registers (did a translation fault happen).
++ */
+ static void
++sweet_ufs_smmu_dump(const char *tag)
++{
++	if (!su.smmu) {
++		printf("METROID SMMU[%s]: not mapped\n", tag);
++		return;
++	}
++	uint32_t cr0 = smmu_rd(SMMU_CR0);
++	printf("METROID SMMU[%s]: IDR0=%08x CR0=%08x CR0ACK=%08x GBPA=%08x "
++	    "GERROR=%08x GERRORN=%08x translate=%s\n", tag, smmu_rd(SMMU_IDR0), cr0,
++	    smmu_rd(SMMU_CR0ACK), smmu_rd(SMMU_GBPA), smmu_rd(SMMU_GERROR),
++	    smmu_rd(SMMU_GERRORN),
++	    (cr0 & (SMMU_CR0_S0EN | SMMU_CR0_NS0EN)) ? "on" : "off");
++	printf("METROID SMMU[%s]: STRTAB=%08x:%08x CDBAR=%08x FSR=%08x FAR=%08x "
++	    "GSR=%08x SMR=%08x/%08x\n", tag, smmu_rd(SMMU_STRTAB + 4),
++	    smmu_rd(SMMU_STRTAB), smmu_rd(SMMU_CDBAR), smmu_rd(SMMU_FSR),
++	    smmu_rd(SMMU_FAR), smmu_rd(SMMU_GSR),
++	    smmu_rd(SMMU_SMR + 4 * SMMU_UFS_SID),
++	    smmu_rd(SMMU_SMR + 8 * SMMU_UFS_SID));
++}
++
++/*
++ * Fault registers only: called when a command times out, to tell an SMMU
++ * translation fault apart from a controller that simply did not run.
++ */
++static void
++sweet_ufs_smmu_fault(const char *tag)
++{
++	if (!su.smmu) {
++		return;
++	}
++	printf("METROID SMMU[%s]: FSR=%08x FAR=%08x GSR=%08x GERROR=%08x\n", tag,
++	    smmu_rd(SMMU_FSR), smmu_rd(SMMU_FAR), smmu_rd(SMMU_GSR),
++	    smmu_rd(SMMU_GERROR));
++}
++
++static void
+ dma_sync(uint32_t off, uint32_t len)
+ {
+ 	flush_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
+@@ -230,9 +352,12 @@
+ 		if (now > deadline) {
+ 			su.io_failed = true;  /* pending request may still DMA */
+ 			printf("METROID UFS TIMEOUT: cmd=%02x IS=%08x HCS=%08x HCE=%08x "
+-			    "DBR=%08x RSR=%08x UTRD_OCS=%08x UPIU=%02x\n",
++			    "DBR=%08x RSR=%08x UTRD_OCS=%08x UPIU=%02x IE=%08x "
++			    "MEMCFG=%08x\n",
+ 			    cdb[0], ufs_rd(REG_IS), ufs_rd(REG_HCS), ufs_rd(REG_HCE),
+-			    ufs_rd(REG_UTRLDBR), ufs_rd(REG_UTRLRSR), utrd->dw2, ucd->resp[0]);
++			    ufs_rd(REG_UTRLDBR), ufs_rd(REG_UTRLRSR), utrd->dw2, ucd->resp[0],
++			    ufs_rd(REG_IE), ufs_rd(REG_UFS_MEM_CFG));
++			sweet_ufs_smmu_fault("timeout");
+ 			/* Do not blindly clear in-flight requests on an unknown MCQ/SMMU setup. */
+ 			return ETIMEDOUT;
+ 		}
+@@ -678,6 +803,11 @@
+ 		return ENXIO;
+ 	}
+ 	su.regs = ml_io_map(reg[0], reg[1]);
++	/* The UFS master is behind apps_smmu.  Dump its state before the
++	 * controller is touched, so a later timeout can be attributed to the
++	 * SMMU or to the host controller. */
++	su.smmu = ml_io_map(SMMU_BASE_PHYS, SMMU_SIZE);
++	sweet_ufs_smmu_dump("init");
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET UFS: no contiguous DMA memory\n");
+@@ -716,10 +846,9 @@
+ 	if (rw != 0) {
+ 		if (rw != 1 || !write_partition[0] ||
+ 		    strcmp(write_partition, want) != 0 ||
+-		    (strncmp(want, "userdata", 8) != 0 &&
+-		    strncmp(want, "xnu_", 4) != 0) &&
+-           strcmp(want, "userdata") != 0) {
+-			printf("METROID UFS: write opt-in rejected; require ufsrw=1");
++		    !sweet_ufs_write_partition_ok(want)) {
++			printf("METROID UFS: write opt-in rejected; require ufsrw=1 and "
++			    "ufsrw_partition=<dedicated metroid_/xnu_ partition>\n");
+ 			return EPERM;
+ 		}
+ 		if (su.first_block < 2 || su.first_block > UINT32_MAX ||

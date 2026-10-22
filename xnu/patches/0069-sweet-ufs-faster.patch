@@ -1,6 +1,7 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -30,6 +30,7 @@
+@@ -33,6 +33,7 @@
  #include <miscfs/devfs/devfs.h>
  #include <kern/locks.h>
  #include <kern/clock.h>
@@ -8,15 +9,15 @@
  #include <machine/machine_routines.h>
  #include <arm/caches_internal.h>
  #include <vm/pmap.h>
-@@ -42,6 +43,8 @@
+@@ -44,6 +45,8 @@
  extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
  /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
  extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +/* osfmk/arm/cpu_data.h, not exported to the BSD layer */
 +extern int get_preemption_level(void);
- extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
- extern void thread_deallocate(thread_t);
- extern int hz;
+ 
+ #define REG_CAP         0x00
+ #define REG_VER         0x08
 @@ -70,6 +73,8 @@
  #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
  #define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
@@ -29,13 +30,13 @@
 @@ -101,6 +106,8 @@
  	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
  	uint32_t secsize;                       /* logical sector size for the BSD layer */
- 	bool writable;                          /* boot-arg ufsrw=1 */
+ 	bool writable;                          /* explicit dedicated-partition opt-in */
 +	bool cache;                             /* boot-arg ufscache=1 */
 +	bool wait;                              /* boot-arg ufswait=1 */
+ 	bool io_failed;                         /* timeout: do not reuse outstanding DMA */
  	int bmajor, cmajor;
  	dev_t bdev;
- 	bool ready;
-@@ -127,6 +134,12 @@
+@@ -128,6 +135,12 @@
  	flush_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
  }
  
@@ -46,10 +47,10 @@
 +}
 +
  /*
-  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
-  * (to the device when write is set). Returns 0 or an errno.
-@@ -169,10 +182,24 @@
- 		utrd->prdt = (1024u / 4) << 16 | n;
+  * One SCSI command in slot 0. For write=true the bounce buffer already
+  * holds outgoing bytes; for read the controller fills it on completion.
+@@ -179,10 +192,24 @@
+ 		utrd->prdt = ((1024u / 4) << 16) | n;
  	}
  
 -	dma_sync(DMA_UTRL, sizeof(*utrd));
@@ -76,7 +77,7 @@
  	}
  	__builtin_arm_dsb(0xf);
  
-@@ -180,20 +207,42 @@
+@@ -190,8 +217,17 @@
  	uint64_t deadline;
  	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
  	deadline += mach_absolute_time();
@@ -92,8 +93,11 @@
 -		if (mach_absolute_time() > deadline) {
 +		uint64_t now = mach_absolute_time();
 +		if (now > deadline) {
- 			ufs_wr(REG_UTRLCLR, ~1u);
- 			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
+ 			su.io_failed = true;  /* pending request may still DMA */
+ 			printf("METROID UFS TIMEOUT: cmd=%02x IS=%08x HCS=%08x HCE=%08x "
+ 			    "DBR=%08x RSR=%08x UTRD_OCS=%08x UPIU=%02x\n",
+@@ -200,14 +236,27 @@
+ 			/* Do not blindly clear in-flight requests on an unknown MCQ/SMMU setup. */
  			return ETIMEDOUT;
  		}
 -		delay(1);
@@ -123,59 +127,15 @@
  		dma_sync(DMA_BOUNCE, len);
  	}
  
-@@ -551,6 +600,11 @@
- 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
- 	uint32_t rw = 0;
+@@ -606,6 +655,11 @@
  	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+ 	PE_parse_boot_argn("ufsrw_partition", write_partition, sizeof(write_partition));
+ 	write_partition[sizeof(write_partition) - 1] = '\0';
 +	uint32_t cache = 0, wait = 0;
 +	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
 +	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
 +	su.cache = (cache == 1);
 +	su.wait = (wait == 1);
- 
- 	su.regs = ml_io_map(reg[0], reg[1]);
- 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
-@@ -613,8 +667,8 @@
-  * console (kernel printf and /dev/console writes of daemons, both through
-  * _cnputs) is also kept in a 4 MiB ring, and once the partition is known
-  * and writable a thread copies new ring blocks to the LAST 4 MiB + 4 KiB of
-- * the partition about once a second (far behind the HFS image at its
-- * start). Device block 0 of that area is a header:
-+ * the partition every ufslogsecs seconds (default 10), far behind the HFS
-+ * image at its start. Device block 0 of that area is a header:
-  *   "SWEETLOG" | u32 version 1 | u32 ring size | u64 total bytes written
-  *   | u64 flush sequence
-  * ring offset of byte n = n % ring size. Read it from a recovery with
-@@ -622,10 +676,12 @@
-  */
- #define SWEET_LOG_SIZE          (4u << 20)
- #define SWEET_LOG_BLOCKS        (1 + SWEET_LOG_SIZE / UFS_BLOCK)
-+#define SWEET_LOG_SECS          10u
- 
- static char sweet_log_ring[SWEET_LOG_SIZE];
- static uint64_t _Atomic sweet_log_total;
- static int sweet_log_chan;
-+static uint32_t sweet_log_secs = SWEET_LOG_SECS;
- 
- /* Called for all console output, any context: never blocks. */
- void sweet_log_append(const char *c, int size);
-@@ -658,7 +714,7 @@
- 	printf("SWEET LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
- 	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
- 	for (;;) {
--		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz);
-+		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
- 		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
- 		if (total == flushed) {
- 			continue;
-@@ -708,6 +764,10 @@
- 	if (!on || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
- 		return;
- 	}
-+	PE_parse_boot_argn("ufslogsecs", &sweet_log_secs, sizeof(sweet_log_secs));
-+	if (sweet_log_secs == 0 || sweet_log_secs > 60) {
-+		sweet_log_secs = SWEET_LOG_SECS;
-+	}
- 	if (kernel_thread_start(sweet_log_thread, NULL, &thread) == KERN_SUCCESS) {
- 		thread_deallocate(thread);
- 	}
+ 	/* The Android DT gives UFS an SMMU stream. A plain PA is NOT normally
+ 	 * a legal UFS DMA address. This opt-in is only for users who have
+ 	 * independently verified that UFS uses identity-mapped DMA at handoff.

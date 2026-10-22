@@ -1,29 +1,27 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -37,10 +37,15 @@
+@@ -40,7 +40,12 @@
  #include <pexpert/pexpert.h>
  #include <pexpert/device_tree.h>
  #include <libkern/libkern.h>
 +#include <machine/atomic.h>
  
- extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
- /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
- extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 +extern void thread_deallocate(thread_t);
 +extern int hz;
 +static void sweet_log_start(void);
- 
- #define REG_CAP         0x00
- #define REG_IS          0x20
-@@ -591,9 +596,116 @@
- 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
- 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
- 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -692,9 +697,116 @@
+ 	    want, su.lun, (unsigned long long)su.first_block,
+ 	    (unsigned long long)(su.nblocks * UFS_BLOCK >> 20),
+ 	    su.writable ? "EXPERIMENTAL READ-WRITE" : "read-only");
 +	sweet_log_start();
  	return 0;
- }
- 
++}
++
 +/*
 + * Persistent console log ("sweetlog"). Filming the phone screen is the only
 + * other way to see the console, so every character that reaches the
@@ -113,8 +111,8 @@
 +		}
 +		flushed = total;
 +	}
-+}
-+
+ }
+ 
 +static void
 +sweet_log_start(void)
 +{

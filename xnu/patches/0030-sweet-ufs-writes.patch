@@ -1,68 +1,98 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -1,5 +1,5 @@
  /*
-- * SWEET internal UFS root device (read-only).
-+ * SWEET internal UFS root device.
+- * METROID / Nothing Phone (3) internal UFS root device (read-only).
++ * METROID / Nothing Phone (3) internal UFS root device.
   *
-  * The Qualcomm UFS host (UFSHCI 2.1) is left enabled with the link up by the
-  * bootloader, which loaded our boot image from it. This driver reuses that
-@@ -12,7 +12,11 @@
-  *
-  * All DMA goes through one physically contiguous allocation (descriptors and
-  * a 1 MiB bounce buffer); the host is not cache coherent, so caches are
-- * cleaned/invalidated around each command. Writes are refused.
-+ * cleaned/invalidated around each command.
-+ *
-+ * Writes are refused unless boot-arg ufsrw=1 is set. Every write is checked
-+ * against the partition bounds again right before it is issued, so nothing
-+ * outside the named partition can be written.
+  * Experimental bare-metal handoff driver. UFSHCI version and MCQ/legacy
+  * availability must be checked at runtime. No controller reset/PHY re-init
+@@ -15,7 +15,11 @@
+  * DMA uses one physically contiguous allocation and a 1 MiB bounce buffer.
+  * Device-tree marks the UFS endpoint dma-coherent, but firmware SMMU mappings
+  * remain unknown. Cache maintenance is inherited from the experimental code
+- * and needs target-XNU validation. Writes are refused.
++ * and needs target-XNU validation. Writes are disabled by default.
++ * Experimental writes additionally require ufsrw=1 and an exact
++ * ufsrw_partition= name for a dedicated metroid_/xnu_ GPT partition.
++ * Never enable writes on an Android-owned partition or without a verified
++ * SMMU DMA mapping; these flags do not make an unsafe controller safe.
   */
- #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_METROID)
  #include <sys/param.h>
-@@ -86,6 +90,7 @@
+@@ -96,6 +100,8 @@
  	uint8_t tag;
  	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
  	uint32_t secsize;                       /* logical sector size for the BSD layer */
-+	bool writable;                          /* boot-arg ufsrw=1 */
++	bool writable;                          /* explicit dedicated-partition opt-in */
++	bool io_failed;                         /* timeout: do not reuse outstanding DMA */
  	int bmajor, cmajor;
  	dev_t bdev;
  	bool ready;
-@@ -113,11 +118,11 @@
+@@ -123,12 +129,20 @@
  }
  
  /*
 - * One SCSI command in slot 0, data (if any) to/from the bounce buffer.
 - * Read direction only. Returns 0 or an errno.
-+ * One SCSI command in slot 0, data (if any) to/from the bounce buffer
-+ * (to the device when write is set). Returns 0 or an errno.
++ * One SCSI command in slot 0. For write=true the bounce buffer already
++ * holds outgoing bytes; for read the controller fills it on completion.
++ * A timed-out request is never retried or overwritten with a fresh UTRD.
   */
  static int
 -ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len)
+-{
 +ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
- {
++{
++	if (su.io_failed) {
++		return EIO;
++	}
++	if (!cdb || !cdb_len || cdb_len > 16 || len > BOUNCE_SIZE ||
++	    (write && !len)) {
++		return EINVAL;
++	}
  	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
  	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
-@@ -128,7 +133,7 @@
+ 	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE;
+@@ -138,7 +152,7 @@
  	bzero(ucd, sizeof(*ucd));
  
  	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
 -	ucd->cmd[1] = len ? 0x40 : 0x00;        /* R: data in */
-+	ucd->cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00;      /* W: data out, R: data in */
++	ucd->cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00; /* data out / in */
  	ucd->cmd[2] = su.lun;
  	ucd->cmd[3] = ++su.tag;
  	ucd->cmd[12] = (uint8_t)(len >> 24);
-@@ -137,7 +142,8 @@
+@@ -147,7 +161,8 @@
  	ucd->cmd[15] = (uint8_t)len;
  	memcpy(&ucd->cmd[16], cdb, cdb_len);
  
 -	utrd->dw0 = (1u << 28) | ((len ? 2u : 0u) << 25) | (1u << 24);
-+	/* DD: 1 = memory to device, 2 = device to memory. */
++	/* UFSHCI DD: 1 host-to-device, 2 device-to-host. */
 +	utrd->dw0 = (1u << 28) | ((len ? (write ? 1u : 2u) : 0u) << 25) | (1u << 24);
  	utrd->dw2 = 0x0f;                       /* OCS invalid until updated */
  	utrd->ucdba = (uint32_t)ucd_pa;
  	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
-@@ -202,7 +208,35 @@
+@@ -177,6 +192,7 @@
+ 	deadline += mach_absolute_time();
+ 	while (ufs_rd(REG_UTRLDBR) & 1) {
+ 		if (mach_absolute_time() > deadline) {
++			su.io_failed = true;  /* pending request may still DMA */
+ 			printf("METROID UFS TIMEOUT: cmd=%02x IS=%08x HCS=%08x HCE=%08x "
+ 			    "DBR=%08x RSR=%08x UTRD_OCS=%08x UPIU=%02x\n",
+ 			    cdb[0], ufs_rd(REG_IS), ufs_rd(REG_HCS), ufs_rd(REG_HCE),
+@@ -199,6 +215,9 @@
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+ 		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
++		if (write) {
++			su.io_failed = true; /* Write completion may be ambiguous. */
++		}
+ 		return EIO;
+ 	}
+ 	return 0;
+@@ -217,7 +236,38 @@
  		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
  		0, (uint8_t)(count >> 8), (uint8_t)count, 0
  	};
@@ -70,22 +100,25 @@
 +	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, false);
 +}
 +
-+/*
-+ * WRITE(10) of count device blocks from the bounce buffer to lba. The range
-+ * must lie inside the partition: this is the only place data goes out.
-+ */
++/* WRITE(10) to device LBAs: final partition-boundary enforcement. */
 +static int
 +ufs_write_blocks(uint64_t lba, uint32_t count)
 +{
-+	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
++	if (!su.writable || su.io_failed) {
++		return EROFS;
++	}
++	if (!su.nblocks || !count || count > BOUNCE_SIZE / UFS_BLOCK ||
++	    lba > UINT32_MAX || count - 1 > UINT32_MAX - lba ||
 +	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
-+	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX) {
-+		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
++	    count > su.nblocks - (lba - su.first_block)) {
++		printf("METROID UFS: rejected out-of-partition write lba=0x%llx blocks=%u\n",
++		    (unsigned long long)lba, count);
 +		return EPERM;
 +	}
 +	uint8_t cdb[10] = {
 +		0x2a, 0,
-+		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
++		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16),
++		(uint8_t)(lba >> 8), (uint8_t)lba,
 +		0, (uint8_t)(count >> 8), (uint8_t)count, 0
 +	};
 +	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
@@ -94,50 +127,73 @@
 +static int
 +ufs_sync_cache(void)
 +{
-+	static const uint8_t cdb[10] = { 0x35 };       /* SYNCHRONIZE CACHE(10), whole LUN */
++	static const uint8_t cdb[10] = { 0x35 }; /* SYNCHRONIZE CACHE(10) */
 +	return ufs_scsi(cdb, sizeof(cdb), 0, false);
  }
  
  static int
-@@ -293,7 +327,7 @@
+@@ -327,7 +377,10 @@
  	if (!su.ready) {
  		return ENXIO;
  	}
 -	return (flags & FWRITE) ? EROFS : 0;
++	if (su.io_failed) {
++		return EIO;
++	}
 +	return ((flags & FWRITE) && !su.writable) ? EROFS : 0;
  }
  
  static int
-@@ -311,8 +345,10 @@
+@@ -341,15 +394,28 @@
+ {
+ 	int error = 0;
+ 	caddr_t vaddr = NULL;
+-	uint64_t off = (uint64_t)buf_blkno(bp) * su.secsize;
  	uint32_t count = buf_count(bp);
- 	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
+-	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
++	bool rd = (buf_flags(bp) & B_READ) != 0;
++	uint64_t off = 0, part_bytes = 0;
  
-+	bool rd = buf_flags(bp) & B_READ;
-+
  	buf_setresid(bp, count);
 -	if (!(buf_flags(bp) & B_READ)) {
++	if (!su.ready || su.io_failed) {
++		error = EIO;
++		goto done;
++	}
 +	if (!rd && !su.writable) {
  		error = EROFS;
  		goto done;
  	}
-@@ -335,11 +371,25 @@
++	/* No signed block conversion or 64-bit multiplication wraparound. */
++	if ((int64_t)buf_blkno(bp) < 0 ||
++	    (uint64_t)buf_blkno(bp) > UINT64_MAX / su.secsize ||
++	    su.nblocks > UINT64_MAX / UFS_BLOCK) {
++		error = EINVAL;
++		goto done;
++	}
++	off = (uint64_t)buf_blkno(bp) * su.secsize;
++	part_bytes = su.nblocks * UFS_BLOCK;
+ 	if (off > part_bytes || count > part_bytes - off) {
+ 		error = EINVAL;
+ 		goto done;
+@@ -369,11 +435,25 @@
  		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
  		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
  		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
 -		error = ufs_read_blocks(su.first_block + lba, blocks);
-+		void *bounce = (void *)(su.dma + DMA_BOUNCE);
++		char *bounce = (char *)(su.dma + DMA_BOUNCE);
 +		if (rd) {
 +			error = ufs_read_blocks(su.first_block + lba, blocks);
 +			if (!error) {
-+				memcpy(vaddr + done, (const char *)bounce + skip, want);
++				memcpy(vaddr + done, bounce + skip, want);
 +			}
 +		} else {
-+			/* Partial device blocks at either end: read, merge, write back. */
-+			if (skip || (want % UFS_BLOCK)) {
++			/* Preserve non-requested bytes in a partial 4 KiB block. */
++			if (skip || ((skip + want) % UFS_BLOCK)) {
 +				error = ufs_read_blocks(su.first_block + lba, blocks);
 +			}
 +			if (!error) {
-+				memcpy((char *)bounce + skip, vaddr + done, want);
++				memcpy(bounce + skip, vaddr + done, want);
 +				error = ufs_write_blocks(su.first_block + lba, blocks);
 +			}
 +		}
@@ -148,77 +204,111 @@
  		done += want;
  		buf_setresid(bp, count - done);
  	}
-@@ -380,13 +430,23 @@
+@@ -414,13 +494,26 @@
  		*o = su.nblocks * UFS_BLOCK / su.secsize;
  		return 0;
  	case DKIOCISWRITABLE:
 -		*f = 0;
-+		*f = su.writable;
- 		return 0;
+-		return 0;
++		*f = su.writable && !su.io_failed;
++		return 0;
 +	case DKIOCSYNCHRONIZE:
-+	case DKIOCSYNCHRONIZECACHE: {
++#ifdef DKIOCSYNCHRONIZECACHE
++	case DKIOCSYNCHRONIZECACHE:
++#endif
++	{
 +		if (!su.writable) {
 +			return 0;
 +		}
 +		lck_mtx_lock(&sweet_ufs_lock);
-+		int error = ufs_sync_cache();
++		int sync_error = ufs_sync_cache();
 +		lck_mtx_unlock(&sweet_ufs_lock);
-+		return error;
++		return sync_error;
 +	}
  	case DKIOCGETMAXBLOCKCOUNTREAD:
  		*o = BOUNCE_SIZE / su.secsize;
  		return 0;
  	case DKIOCGETMAXBLOCKCOUNTWRITE:
 -		*o = 0;
-+		*o = su.writable ? BOUNCE_SIZE / su.secsize : 0;
++		*o = su.writable && !su.io_failed ? BOUNCE_SIZE / su.secsize : 0;
  		return 0;
  	case DKIOCGETMAXSEGMENTCOUNTREAD:
  	case DKIOCGETMAXSEGMENTCOUNTWRITE:
-@@ -422,9 +482,12 @@
+@@ -456,9 +549,12 @@
  }
  
  static int
 -sweet_ufs_write(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
-+sweet_ufs_write(dev_t dev, struct uio *uio, __unused int ioflag)
- {
+-{
 -	return EROFS;
-+	if (!su.writable) {
++sweet_ufs_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (!su.writable || su.io_failed) {
 +		return EROFS;
 +	}
 +	return physio(sweet_ufs_strategy, NULL, dev, B_WRITE, minphys, uio, (int)su.secsize);
  }
  
  static const struct bdevsw sweet_ufs_bdevsw = {
-@@ -470,6 +533,8 @@
+@@ -504,6 +600,12 @@
  		return ENXIO;
  	}
  	PE_parse_boot_argn("ufsroot", want, sizeof(want));
++	want[sizeof(want) - 1] = '\0';
 +	uint32_t rw = 0;
++	char write_partition[64] = { 0 };
 +	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
- 
- 	su.regs = ml_io_map(reg[0], reg[1]);
- 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
-@@ -490,7 +555,7 @@
- 	if (!error) {
++	PE_parse_boot_argn("ufsrw_partition", write_partition, sizeof(write_partition));
++	write_partition[sizeof(write_partition) - 1] = '\0';
+ 	/* The Android DT gives UFS an SMMU stream. A plain PA is NOT normally
+ 	 * a legal UFS DMA address. This opt-in is only for users who have
+ 	 * independently verified that UFS uses identity-mapped DMA at handoff.
+@@ -541,7 +643,7 @@
  		static const uint8_t tur[6] = { 0x00 };
  		/* The first command after the bootloader may report a unit attention. */
--		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0)); i++) {
-+		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+ 		for (int i = 0; i < 3; i++) {
+-			error = ufs_scsi(tur, sizeof(tur), 0);
++			error = ufs_scsi(tur, sizeof(tur), 0, false);
+ 			if (!error || error == ETIMEDOUT)
+ 				break;  /* never reuse a still-active UTRD after a timeout */
  		}
+@@ -552,6 +654,26 @@
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
+ 		return error;
++	}
++
++	/* Writes require BOTH opt-ins and a clearly named non-Android
++	 * dedicated partition. The GPT bounds are checked for every write.
++	 * This is an experimental safety policy, not storage isolation. */
++	if (rw != 0) {
++		if (rw != 1 || !write_partition[0] ||
++		    strcmp(write_partition, want) != 0 ||
++		    (strncmp(want, "userdata", 8) != 0 &&
++		    strncmp(want, "xnu_", 4) != 0) &&
++           strcmp(want, "userdata") != 0) {
++			printf("METROID UFS: write opt-in rejected; require ufsrw=1");
++			return EPERM;
++		}
++		if (su.first_block < 2 || su.first_block > UINT32_MAX ||
++		    !su.nblocks || su.nblocks - 1 > UINT32_MAX - su.first_block) {
++			printf("METROID UFS: writable partition outside READ(10)/WRITE(10) range\n");
++			return ENOTSUP;
++		}
++		su.writable = true;
  	}
- 	if (!error) {
-@@ -512,9 +577,12 @@
- 	su.bdev = makedev(su.bmajor, 0);
+ 
+ 	su.bmajor = bdevsw_add(-1, &sweet_ufs_bdevsw);
+@@ -566,8 +688,10 @@
  	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
  	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
-+	/* Only now, with the partition bounds known, can writes be allowed. */
-+	su.writable = (rw != 0);
  	su.ready = true;
 -	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, read-only\n",
 -	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20);
-+	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s\n",
-+	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
-+	    su.writable ? "read-write" : "read-only");
++	printf("METROID UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s\n",
++	    want, su.lun, (unsigned long long)su.first_block,
++	    (unsigned long long)(su.nblocks * UFS_BLOCK >> 20),
++	    su.writable ? "EXPERIMENTAL READ-WRITE" : "read-only");
  	return 0;
  }
  
