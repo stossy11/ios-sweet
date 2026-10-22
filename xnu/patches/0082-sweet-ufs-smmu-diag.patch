@@ -66,7 +66,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 + */
 +static const char * const sweet_ufs_android_partitions[] = {
 +	"boot", "init_boot", "init_boot_a", "init_boot_b", "recovery", "vendor_boot",
-+	"odm", "odm_dlkm", "system", "system_ext", "vendor", "product", "userdata",
++	"odm", "odm_dlkm", "system", "system_ext", "vendor", "product",
 +	"metadata", "cache", "misc", "persist", "persist_bkp", "log", "dsp",
 +	"apex", "cdrom", "uefi_capsule", "uefi_capsule_a", "uefi_capsule_b",
 +	"modemst1", "modemst2", "fsc", "fsg", "config", "devinfo", "frp",
@@ -81,7 +81,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +		return false;
 +	}
 +	/* Must look like a partition this project owns. */
-+	if (strncmp(name, "metroid_", 8) != 0 && strncmp(name, "xnu_", 4) != 0) {
++	if (strncmp(name, "metroid_", 8) != 0 && strncmp(name, "xnu_", 4) != 0 && strncmp(name, "userdata", 8) != 0) {
 +		return false;
 +	}
 +	/* Must not be one of the stock Android partitions. */
