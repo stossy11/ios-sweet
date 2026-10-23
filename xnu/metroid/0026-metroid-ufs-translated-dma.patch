@@ -1253,7 +1253,7 @@ diff --git a/bsd/dev/metroid_ufs_hw.h b/bsd/dev/metroid_ufs_hw.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/metroid_ufs_hw.h
-@@ -0,0 +1,1132 @@
+@@ -0,0 +1,1149 @@
 +/*
 + * Metroid UFSHCI + SMMUv2 transport. Independently implemented from the
 + * register formats and sequences documented by Nothing's SM8735 Linux tree
@@ -1823,9 +1823,18 @@ new file mode 100644
 +mu_io_update(uintptr_t addr, uint32_t mask, uint32_t value)
 +{
 +	uint32_t old = MU_READ32(addr);
-+	if (old == 0xffffffffu) { return ENXIO; }
++	if (old == 0xffffffffu) {
++		MU_LOG("METROID UFS: MMIO inaccessible addr=%llx\n", (unsigned long long)addr);
++		return ENXIO;
++	}
 +	MU_WRITE32(addr, (old & ~mask) | (value & mask)); MU_BARRIER();
-+	return (MU_READ32(addr) & mask) == (value & mask) ? 0 : EIO;
++	uint32_t got = MU_READ32(addr);
++	if ((got & mask) != (value & mask)) {
++		MU_LOG("METROID UFS: MMIO update addr=%llx old=%08x mask=%08x want=%08x got=%08x\n",
++		    (unsigned long long)addr, old, mask, value & mask, got);
++		return EIO;
++	}
++	return 0;
 +}
 +
 +/* RCG2 SRC_SEL/HID encodings, ftbl_gcc_ufs_phy_{axi,unipro}_clk_src.
@@ -1904,26 +1913,34 @@ new file mode 100644
 +	error = mu_io_update(h->reset, 1, 0);
 +	if (error) { goto fail; }
 +	MU_DELAY(10);
-+	/* Major6 ordering: assert BCR, ensure PHY analog power, release BCR. */
-+	h->phase = "cold-core-reset";
++	/* Major6 requires external PHY power while BCR is held. Our preflight
++	 * already requires those domains on, and preserves their supply votes.
++	 * Linux's is_phy_pwr_on guard skips repeating the analog power helper.
++	 * Do not access PHY registers while BCR can hold that bank in reset. */
++	h->phase = "cold-core-assert";
 +	core_asserted = true;
 +	error = mu_io_update(h->gcc + 0x77000, 1, 1);
 +	if (error) { goto fail; }
++	MU_DELAY(200);
++	h->phase = "cold-core-release";
++	error = mu_io_update(h->gcc + 0x77000, 1, 0);
++	if (error) { goto fail; }
++	core_asserted = false; MU_DELAY(1000);
++	h->phase = "cold-phy-power";
 +	error = mu_io_update(h->phy + 0x13e0, 1u << 6, 0);
 +	if (!error) { error = mu_io_update(h->phy + 0x1be0, 1u << 6, 0); }
 +	if (!error) { error = mu_io_update(h->phy + 0x404, 1, 1); }
 +	if (error) { goto fail; }
-+	MU_DELAY(200);
-+	error = mu_io_update(h->gcc + 0x77000, 1, 0);
-+	if (error) { goto fail; }
-+	core_asserted = false; MU_DELAY(1000);
++	h->phase = "cold-ref-clock";
 +	error = mu_io_update(h->regs + MU_QCOM_CFG1, MU_QCOM_REF_CLK | MU_QCOM_NO_ICE_CHECK,
 +	    MU_QCOM_REF_CLK | MU_QCOM_NO_ICE_CHECK);
 +	if (error) { goto fail; }
 +	MU_DELAY(60);
++	h->phase = "cold-device-release";
 +	error = mu_io_update(h->reset, 1, 1);
 +	if (error) { goto fail; }
 +	pin_asserted = false; MU_DELAY(10);
++	h->phase = "cold-hce-disable";
 +	mu_w(h, 0x34, 0);
 +	error = mu_poll(h, false, 0x34, 1, 0, 10000);
 +	if (error) { goto fail; }
