@@ -1027,7 +1027,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  static int
  sweet_ufs_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
  {
-@@ -1116,135 +389,83 @@
+@@ -1116,135 +389,92 @@
  	DTEntry node;
  	uintptr_t const *reg = NULL;
  	unsigned int size = 0;
@@ -1035,7 +1035,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 -	int error;
 -
 +	char want[64] = "userdata", write_partition[64] = { 0 };
-+	uint32_t rw = 0, lun = 0;
++	uint32_t rw = 0, lun = 0, cold = 1;
  	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
  	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
 -	    size < 2 * sizeof(uintptr_t)) {
@@ -1104,7 +1104,8 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 -	}
 +	write_partition[sizeof(write_partition) - 1] = 0;
 +	bool explicit_lun = PE_parse_boot_argn("ufslun", &lun, sizeof(lun));
-+	if (!want[0] || strlen(want) > 36 || lun > 7) { return EINVAL; }
++	PE_parse_boot_argn("ufscold", &cold, sizeof(cold));
++	if (!want[0] || strlen(want) > 36 || lun > 7 || cold > 1) { return EINVAL; }
 +	/* Existing write opt-in remains; no disk writes during init/discovery.
 +	 * Actual device tests must start without ufsrw. userdata writes require
 +	 * the separate destructive-step confirmation documented in AGENTS.md. */
@@ -1113,6 +1114,14 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +	su.host.regs = ml_io_map(reg[0], reg[1]);
 +	su.host.smmu = ml_io_map(0x15000000, 0x100000);
 +	if (!su.host.regs || !su.host.smmu) { return ENOMEM; }
++	su.host.cold_init = cold != 0;
++	if (su.host.cold_init) {
++		su.host.phy = ml_io_map(0x1d80000, 0x2000);
++		su.host.gcc = ml_io_map(0x100000, 0xa0000);
++		/* Tuna pin191 is a dedicated UFS_RESET output, not GPIO stride191. */
++		su.host.reset = ml_io_map(0xf1ca000, 0x1000);
++		if (!su.host.phy || !su.host.gcc || !su.host.reset) { return ENOMEM; }
++	}
 +	printf("METROID UFS v2: translated DMA; legacy polled transport; CAP=%08x VER=%08x\n",
 +	    mu_r(&su.host, 0), mu_r(&su.host, 8));
 +	mu_dump(&su.host, "init");
@@ -1229,7 +1238,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	return 0;
  }
  
-@@ -1255,7 +476,10 @@
+@@ -1255,7 +485,10 @@
  sweet_ufs_rootdev(dev_t *dev)
  {
  	if (!su.ready) {
@@ -1244,7 +1253,7 @@ diff --git a/bsd/dev/metroid_ufs_hw.h b/bsd/dev/metroid_ufs_hw.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/metroid_ufs_hw.h
-@@ -0,0 +1,733 @@
+@@ -0,0 +1,1132 @@
 +/*
 + * Metroid UFSHCI + SMMUv2 transport. Independently implemented from the
 + * register formats and sequences documented by Nothing's SM8735 Linux tree
@@ -1266,6 +1275,8 @@ new file mode 100644
 +#define MU_SID       0x60u
 +#define MU_ADDR_MASK 0x0000fffffffff000ull
 +#define MU_TIMEOUT_US 5000000u
++#define MU_DEVICE_WLUN 0xd0u
++#define MU_DEVICE_ACTIVE_TIMEOUT_US 10000000u /* Nothing START STOP: 10 * HZ */
 +#define MU_QUERY_ATTEMPTS 3u /* Nothing ufshcd.c QUERY_REQ_RETRIES */
 +#define MU_UIC_DONE (1u << 10)
 +#define MU_HIBERN8_EXIT_DONE (1u << 5)
@@ -1296,7 +1307,7 @@ new file mode 100644
 +_Static_assert(offsetof(struct mu_ucd, prdt) == 1024, "PRDT offset");
 +
 +struct mu_host {
-+	uintptr_t regs, smmu;
++	uintptr_t regs, smmu, phy, gcc, reset;
 +	uint8_t *pool;
 +	uint64_t pool_pa, tables_pa;
 +	uint64_t *tables;
@@ -1305,7 +1316,7 @@ new file mode 100644
 +	uint32_t tx_fsm;
 +	const char *phase;
 +	uint8_t probe_first, probe_last;
-+	bool mapped, failed, configured, inherited_ready;
++	bool mapped, failed, configured, inherited_ready, cold_init;
 +};
 +
 +static uint32_t mu_r(struct mu_host *h, uint32_t off) { return MU_READ32(h->regs + off); }
@@ -1385,7 +1396,7 @@ new file mode 100644
 +		MU_LOG("METROID UFS: MCQ active or legacy removed; MCQ teardown is not implemented\n");
 +		return ENOTSUP;
 +	}
-+	if (!(mu_r(h, 0x34) & 1)) {
++	if (!(mu_r(h, 0x34) & 1) && !h->cold_init) {
 +		MU_LOG("METROID UFS: firmware PHY/host is off; cold PHY/clock bring-up required\n");
 +		return ENXIO;
 +	}
@@ -1623,13 +1634,13 @@ new file mode 100644
 +/* UIC command completion and power-transition completion are independent.
 + * Follow ufshcd_uic_pwr_ctrl: Hibern8 exit needs UHXS and PWR_LOCAL too. */
 +static int
-+mu_uic(struct mu_host *h, uint32_t command, uint32_t arg1,
-+    uint32_t power_event, uint32_t *value)
++mu_uic_command(struct mu_host *h, uint32_t command, uint32_t arg1,
++    uint32_t arg3, uint32_t power_event, uint32_t *value)
 +{
 +	int error = mu_poll(h, false, 0x30, 1u << 3, 1u << 3, 1000000);
 +	if (error) { goto fail; }
 +	mu_w(h, 0x20, MU_UIC_DONE | power_event);
-+	mu_w(h, 0x94, arg1); mu_w(h, 0x98, 0); mu_w(h, 0x9c, 0);
++	mu_w(h, 0x94, arg1); mu_w(h, 0x98, 0); mu_w(h, 0x9c, arg3);
 +	mu_w(h, 0x90, command);
 +	error = mu_poll(h, false, 0x20, MU_UIC_DONE, MU_UIC_DONE, 1000000);
 +	if (error) { goto fail; }
@@ -1655,6 +1666,361 @@ new file mode 100644
 +	MU_LOG("METROID UFS: UIC cmd=%02x attr=%08x failed errno=%d IS=%08x HCS=%08x\n",
 +	    command, arg1, error, mu_r(h, 0x20), mu_r(h, 0x30));
 +	h->failed = true;
++	return error;
++}
++
++static int
++mu_uic(struct mu_host *h, uint32_t command, uint32_t arg1,
++    uint32_t power_event, uint32_t *value)
++{
++	return mu_uic_command(h, command, arg1, 0, power_event, value);
++}
++
++/* Niobe calibration register values: Nothing SM8735 kernel 031e8669,
++ * phy-qcom-ufs-qmp-v4-niobe.h (Qualcomm 2024, GPL-2.0-only).
++ * Ordered Rate A base, optional G4 limits, second lane, then Rate B overrides.
++ */
++struct mu_phy_setting { uint16_t off; uint8_t value; };
++static const struct mu_phy_setting mu_phy_rate_A_g5[] = {
++	{ 0x0404, 0x01 },
++	{ 0x0110, 0xd9 },
++	{ 0x0174, 0x16 },
++	{ 0x003c, 0x11 },
++	{ 0x009c, 0x00 },
++	{ 0x0120, 0x01 },
++	{ 0x00f4, 0x1f },
++	{ 0x00f8, 0x1f },
++	{ 0x00fc, 0x0a },
++	{ 0x0100, 0x17 },
++	{ 0x0140, 0x04 },
++	{ 0x0148, 0x00 },
++	{ 0x0088, 0x41 },
++	{ 0x0070, 0x06 },
++	{ 0x0074, 0x18 },
++	{ 0x0078, 0x14 },
++	{ 0x0080, 0x7f },
++	{ 0x0084, 0x06 },
++	{ 0x0028, 0x4c },
++	{ 0x0010, 0x06 },
++	{ 0x0014, 0x18 },
++	{ 0x0018, 0x14 },
++	{ 0x0020, 0x99 },
++	{ 0x0024, 0x07 },
++	{ 0x107c, 0x01 },
++	{ 0x1030, 0x07 },
++	{ 0x1034, 0x0e },
++	{ 0x12d4, 0x0c },
++	{ 0x12dc, 0x0c },
++	{ 0x12f0, 0x04 },
++	{ 0x13bc, 0x14 },
++	{ 0x12f4, 0x07 },
++	{ 0x13c4, 0x0e },
++	{ 0x1254, 0x02 },
++	{ 0x1210, 0x1c },
++	{ 0x1224, 0x06 },
++	{ 0x1378, 0x8e },
++	{ 0x13ac, 0x0f },
++	{ 0x1408, 0xce },
++	{ 0x140c, 0xce },
++	{ 0x1410, 0x18 },
++	{ 0x1414, 0x1a },
++	{ 0x1418, 0x0f },
++	{ 0x1420, 0x60 },
++	{ 0x1438, 0x9e },
++	{ 0x1444, 0x60 },
++	{ 0x145c, 0x9e },
++	{ 0x1460, 0x0e },
++	{ 0x1464, 0x36 },
++	{ 0x1470, 0x02 },
++	{ 0x1474, 0x1b },
++	{ 0x1478, 0x1b },
++	{ 0x147c, 0x20 },
++	{ 0x1480, 0xb9 },
++	{ 0x1484, 0x5d },
++	{ 0x1228, 0x1f },
++	{ 0x1258, 0x94 },
++	{ 0x12c4, 0xfa },
++	{ 0x14f8, 0x30 },
++	{ 0x187c, 0x01 },
++	{ 0x1830, 0x07 },
++	{ 0x1834, 0x0e },
++	{ 0x1ad4, 0x0c },
++	{ 0x1adc, 0x0c },
++	{ 0x1af0, 0x04 },
++	{ 0x1bbc, 0x14 },
++	{ 0x1af4, 0x07 },
++	{ 0x1bc4, 0x0e },
++	{ 0x1a54, 0x02 },
++	{ 0x1a10, 0x1c },
++	{ 0x1a24, 0x06 },
++	{ 0x1b78, 0x8e },
++	{ 0x1bac, 0x0f },
++	{ 0x1c08, 0xce },
++	{ 0x1c0c, 0xce },
++	{ 0x1c10, 0x18 },
++	{ 0x1c14, 0x1a },
++	{ 0x1c18, 0x0f },
++	{ 0x1c20, 0x60 },
++	{ 0x1c38, 0x9e },
++	{ 0x1c44, 0x60 },
++	{ 0x1c5c, 0x9e },
++	{ 0x1c60, 0x0e },
++	{ 0x1c64, 0x36 },
++	{ 0x1c70, 0x02 },
++	{ 0x1c74, 0x1b },
++	{ 0x1c78, 0x1b },
++	{ 0x1c7c, 0x20 },
++	{ 0x1c80, 0xb9 },
++	{ 0x1c84, 0x5d },
++	{ 0x1a28, 0x1f },
++	{ 0x1a58, 0x94 },
++	{ 0x1ac4, 0xfa },
++	{ 0x1cf8, 0x30 },
++	{ 0x05fc, 0x00 },
++	{ 0x05f4, 0x43 },
++	{ 0x0420, 0xc0 },
++	{ 0x042c, 0x33 },
++	{ 0x0474, 0x05 },
++	{ 0x04bc, 0x05 },
++	{ 0x0430, 0x0f },
++	{ 0x058c, 0x67 },
++	{ 0x052c, 0x4d },
++	{ 0x0620, 0x9e },
++	{ 0x0640, 0x0e },
++	{ 0x0644, 0x12 },
++	{ 0x0648, 0x15 },
++	{ 0x064c, 0x19 },
++};
++static const struct mu_phy_setting mu_phy_rate_A_g4[] = {
++	{ 0x0474, 0x04 },
++	{ 0x04bc, 0x04 },
++};
++static const struct mu_phy_setting mu_phy_2nd_lane[] = {
++	{ 0x05fc, 0x02 },
++};
++static const struct mu_phy_setting mu_phy_rate_B[] = {
++	{ 0x0140, 0x04 },
++	{ 0x0420, 0xc1 },
++};
++/* Metroid live DT: PHY1d80000, GCC100000, dedicated reset output f1ca000.
++ * GCC/TLMM offsets and mux encodings follow Nothing gcc-tuna/pinctrl-tuna.
++ * No shared PLL is retuned and no PMIC/RPMh votes are guessed: firmware must
++ * retain the external rails and valid RCG parents. Refuse absent prerequisites
++ * before asserting reset. This is controller/PHY reinitialization, not PMIC
++ * bring-up from a completely unpowered board. */
++static int
++mu_io_poll(uintptr_t addr, uint32_t mask, uint32_t want, uint32_t timeout)
++{
++	uint64_t start = MU_NOW_US();
++	do {
++		if ((MU_READ32(addr) & mask) == want) { return 0; }
++		MU_DELAY(10);
++	} while (MU_NOW_US() - start < timeout);
++	return ETIMEDOUT;
++}
++
++static int
++mu_io_update(uintptr_t addr, uint32_t mask, uint32_t value)
++{
++	uint32_t old = MU_READ32(addr);
++	if (old == 0xffffffffu) { return ENXIO; }
++	MU_WRITE32(addr, (old & ~mask) | (value & mask)); MU_BARRIER();
++	return (MU_READ32(addr) & mask) == (value & mask) ? 0 : EIO;
++}
++
++/* RCG2 SRC_SEL/HID encodings, ftbl_gcc_ufs_phy_{axi,unipro}_clk_src.
++ * Preserve inherited rate/voltage; derive timers from it instead of assuming
++ * Linux's 403MHz maximum without a corresponding RPMh voltage vote. */
++static uint32_t
++mu_clock_mhz(uint32_t cfg)
++{
++	if (cfg & (3u << 12)) { return 0; } /* no fractional entries in this table */
++	uint32_t select = (cfg >> 8) & 7, div = cfg & 31;
++	if (select == 6 && div == 5) { return 100; }
++	if (select == 5 && div == 7) { return 202; } /* ceil(201.5MHz) */
++	if (select == 5 && div == 3) { return 403; }
++	return 0;
++}
++
++static int
++mu_dme_update(struct mu_host *h, uint32_t attr, uint32_t mask, uint32_t value)
++{
++	uint32_t old;
++	int error = mu_uic(h, 1, attr << 16, 0, &old);
++	if (error) { return error; }
++	return mu_uic_command(h, 2, attr << 16, (old & ~mask) | (value & mask), 0, NULL);
++}
++
++static void
++mu_phy_table(struct mu_host *h, const struct mu_phy_setting *table, unsigned count)
++{
++	for (unsigned i = 0; i < count; i++) {
++		MU_WRITE32(h->phy + table[i].off, table[i].value);
++	}
++	MU_BARRIER();
++}
++
++static int
++mu_cold_start(struct mu_host *h)
++{
++	bool pin_asserted = false, core_asserted = false, phy_asserted = false;
++	int error = ENXIO;
++	h->phase = "cold-preflight";
++	if (!h->phy || !h->gcc || !h->reset || (mu_r(h, MU_QCOM_HW_VERSION) >> 28) != 6) {
++		return ENOTSUP;
++	}
++	if (mu_r(h, 0x58) || mu_r(h, 0x78) || (mu_r(h, 0x60) & 1) || (mu_r(h, 0x80) & 1)) {
++		return EBUSY;
++	}
++	uint32_t host_power = MU_READ32(h->gcc + 0x77004);
++	uint32_t phy_power = MU_READ32(h->gcc + 0x9e000);
++	uint32_t core_mhz = mu_clock_mhz(MU_READ32(h->gcc + 0x77038));
++	uint32_t unipro_mhz = mu_clock_mhz(MU_READ32(h->gcc + 0x770a8));
++	uint32_t aux = MU_READ32(h->gcc + 0x770c4);
++	if (!(host_power & (1u << 31)) || !(phy_power & (1u << 31)) ||
++	    host_power == 0xffffffffu || phy_power == 0xffffffffu ||
++	    !core_mhz || !unipro_mhz || (aux & (7u << 8)) ||
++	    ((aux & 31) != 1 && (aux & 31) != 3)) {
++		MU_LOG("METROID UFS: cold prerequisites missing GDSC=%08x/%08x core=%u UniPro=%u aux=%08x; firmware rails/clock parents required\n",
++		    host_power, phy_power, core_mhz, unipro_mhz, aux);
++		return ENXIO;
++	}
++	unsigned gear = ((mu_r(h, 0x284c) >> 4) & 15) >= 4 ? 5 : 4;
++	MU_LOG("METROID UFS: cold reset/PHY G%u RateB core=%u UniPro=%u MHz; retaining firmware supplies\n",
++	    gear, core_mhz, unipro_mhz);
++	/* Request dedicated UFS clocks on, disabling their automatic GCC gates.
++	 * All other bits, shared PLLs and upstream rate/voltage votes are retained. */
++	const uint32_t clocks[] = { 0x77028, 0x77018, 0x770f4, 0x7706c, 0x7707c, 0x770bc };
++	h->phase = "cold-clocks";
++	for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
++		error = mu_io_update(h->gcc + clocks[i], 3, 1);
++		if (error) { goto fail; }
++		error = mu_io_poll(h->gcc + clocks[i], 1u << 31, 0, 10000);
++		if (error) { goto fail; }
++	}
++	/* GPIO191 is the dedicated UFS_RESET pad: output bit0, no GPIO mux/OE. */
++	h->phase = "cold-device-reset";
++	pin_asserted = true;
++	error = mu_io_update(h->reset, 1, 0);
++	if (error) { goto fail; }
++	MU_DELAY(10);
++	/* Major6 ordering: assert BCR, ensure PHY analog power, release BCR. */
++	h->phase = "cold-core-reset";
++	core_asserted = true;
++	error = mu_io_update(h->gcc + 0x77000, 1, 1);
++	if (error) { goto fail; }
++	error = mu_io_update(h->phy + 0x13e0, 1u << 6, 0);
++	if (!error) { error = mu_io_update(h->phy + 0x1be0, 1u << 6, 0); }
++	if (!error) { error = mu_io_update(h->phy + 0x404, 1, 1); }
++	if (error) { goto fail; }
++	MU_DELAY(200);
++	error = mu_io_update(h->gcc + 0x77000, 1, 0);
++	if (error) { goto fail; }
++	core_asserted = false; MU_DELAY(1000);
++	error = mu_io_update(h->regs + MU_QCOM_CFG1, MU_QCOM_REF_CLK | MU_QCOM_NO_ICE_CHECK,
++	    MU_QCOM_REF_CLK | MU_QCOM_NO_ICE_CHECK);
++	if (error) { goto fail; }
++	MU_DELAY(60);
++	error = mu_io_update(h->reset, 1, 1);
++	if (error) { goto fail; }
++	pin_asserted = false; MU_DELAY(10);
++	mu_w(h, 0x34, 0);
++	error = mu_poll(h, false, 0x34, 1, 0, 10000);
++	if (error) { goto fail; }
++	/* Route symbol clocks to XO while the PHY PLL is reset. */
++	const uint32_t lanes[] = { 0x77030, 0x770d8, 0x7702c };
++	const uint32_t muxes[] = { 0x77068, 0x770ec, 0x77058 };
++	h->phase = "cold-phy-calibrate";
++	for (unsigned i = 0; i < 3; i++) {
++		error = mu_io_update(h->gcc + lanes[i], 1, 0);
++		if (!error) { error = mu_io_update(h->gcc + muxes[i], 3, 2); }
++		if (error) { goto fail; }
++	}
++	phy_asserted = true;
++	error = mu_io_update(h->regs + MU_QCOM_CFG1, 2, 2);
++	if (error) { goto fail; }
++	MU_DELAY(1000);
++	error = mu_io_update(h->phy + 0x408, 1, 1);
++	if (error) { goto fail; }
++	mu_phy_table(h, mu_phy_rate_A_g5, sizeof(mu_phy_rate_A_g5) / sizeof(mu_phy_rate_A_g5[0]));
++	if (gear == 4) {
++		mu_phy_table(h, mu_phy_rate_A_g4, sizeof(mu_phy_rate_A_g4) / sizeof(mu_phy_rate_A_g4[0]));
++	}
++	mu_phy_table(h, mu_phy_2nd_lane, sizeof(mu_phy_2nd_lane) / sizeof(mu_phy_2nd_lane[0]));
++	mu_phy_table(h, mu_phy_rate_B, sizeof(mu_phy_rate_B) / sizeof(mu_phy_rate_B[0]));
++	error = mu_io_update(h->phy + 0x408, 1, 0);
++	if (!error) { error = mu_io_update(h->regs + MU_QCOM_CFG1, 2, 0); }
++	if (error) { goto fail; }
++	phy_asserted = false; MU_DELAY(1000);
++	error = mu_io_update(h->phy + 0x400, 1, 1);
++	if (error) { goto fail; }
++	h->phase = "cold-pcs-ready";
++	error = mu_io_poll(h->phy + 0x5a8, 1, 1, 1000000);
++	if (error) { goto fail; }
++	for (unsigned i = 0; i < 3; i++) {
++		error = mu_io_update(h->gcc + muxes[i], 3, 0);
++		if (!error) { error = mu_io_update(h->gcc + lanes[i], 1, 1); }
++		if (error) { goto fail; }
++		MU_DELAY(10); /* lane branches use BRANCH_HALT_DELAY in gcc-tuna */
++	}
++	/* Qunipro selection, modern CFG0, non-SCSI ICE-check bypass/ref clock. */
++	error = mu_io_update(h->regs + MU_QCOM_CFG1, 1 | MU_QCOM_REF_CLK | MU_QCOM_NO_ICE_CHECK,
++	    1 | MU_QCOM_REF_CLK | MU_QCOM_NO_ICE_CHECK);
++	if (!error) { error = mu_io_update(h->regs + 0xd8, (1u << 5) | 1, 0); }
++	if (error) { goto fail; }
++	MU_DELAY(60);
++	h->phase = "cold-hce-enable";
++	mu_w(h, 0x34, 1); MU_DELAY(1000);
++	error = mu_poll(h, false, 0x34, 1, 1, 50000);
++	if (error) { goto fail; }
++	uint64_t start = MU_NOW_US();
++	do {
++		error = mu_uic(h, 1, MU_TX_FSM_ATTRIBUTE, 0, &h->tx_fsm);
++		if (error || h->tx_fsm == MU_TX_FSM_HIBERN8) { break; }
++		MU_DELAY(100);
++	} while (MU_NOW_US() - start < 100000);
++	if (error) { goto fail; }
++	if (h->tx_fsm != MU_TX_FSM_HIBERN8) { error = ETIMEDOUT; goto fail; }
++	h->phase = "cold-link-config";
++	mu_w(h, 0xc0, core_mhz);
++	if (mu_r(h, 0xc0) != core_mhz) { error = EIO; goto fail; }
++	error = mu_dme_update(h, 0xd002, (0xfffu << 16) | (1u << 8), unipro_mhz << 16);
++	if (!error) { error = mu_dme_update(h, 0x9007, 0x3f, unipro_mhz == 403 ? 16 : unipro_mhz == 202 ? 8 : 4); }
++	if (!error) { error = mu_dme_update(h, 0xa00b, 0x3ff, 0x3ff); }
++	if (!error) { error = mu_dme_update(h, 0x9004, 0x1ff, 0x1ff); }
++	if (!error) { error = mu_dme_update(h, 0xd002, 1u << 9, 1u << 9); }
++	if (!error) { error = mu_io_update(h->regs + 0xe0, 0xff, 0xff); }
++	if (!error) { error = mu_io_update(h->phy + 0x57c, 2, 0); }
++	/* Like ufshcd_get_local_unipro_ver(), this modern HCI is >= UniPro1.6. */
++	if (!error) { error = mu_dme_update(h, 0x155e, 1, 0); }
++	if (error) { goto fail; }
++	/* Linux repeats startup when device-active state is unknown. */
++	h->phase = "cold-link-startup";
++	for (unsigned i = 0; i < 2; i++) {
++		error = mu_uic(h, 0x16, 0, 0, NULL);
++		if (error) { goto fail; }
++		if (!(mu_r(h, 0x30) & 1)) { error = ENXIO; goto fail; }
++	}
++	uint32_t connected = 0;
++	error = mu_uic(h, 1, 0x1561u << 16, 0, &connected);
++	if (error) { goto fail; }
++	if (!connected || connected > 2) { error = EIO; goto fail; }
++	(void)mu_r(h, 0x38); /* consume PHY adapter error after line reset */
++	mu_w(h, 0x18, 0); mu_w(h, 0x24, 0);
++	MU_LOG("METROID UFS: cold reset/PHY ready; PCS=%08x HCS=%08x TX lanes=%u\n",
++	    MU_READ32(h->phy + 0x5a8), mu_r(h, 0x30), connected);
++	return 0;
++fail:
++	MU_LOG("METROID UFS: %s failed errno=%d PCS=%08x HCE=%08x HCS=%08x\n",
++	    h->phase, error, MU_READ32(h->phy + 0x5a8), mu_r(h, 0x34), mu_r(h, 0x30));
++	/* Best effort deassertion: do not intentionally leave the phone in reset.
++	 * No queue is started and no command retried after partial reset failure. */
++	if (phy_asserted) {
++		(void)mu_io_update(h->phy + 0x408, 1, 0);
++		(void)mu_io_update(h->regs + MU_QCOM_CFG1, 2, 0);
++	}
++	if (core_asserted) { (void)mu_io_update(h->gcc + 0x77000, 1, 0); }
++	if (pin_asserted) { (void)mu_io_update(h->reset, 1, 1); }
 +	return error;
 +}
 +
@@ -1714,7 +2080,7 @@ new file mode 100644
 +{
 +	if (!h->mapped || h->failed) { return EIO; }
 +	/* PHY/lane clocks must remain powered, but a sleeping link is recoverable. */
-+	int error = mu_wake_link(h);
++	int error = h->cold_init ? mu_cold_start(h) : mu_wake_link(h);
 +	if (error) { h->failed = true; return error; }
 +	h->phase = "list-start";
 +	mu_w(h, 0x4c, 0); /* interrupt aggregation */
@@ -1760,11 +2126,14 @@ new file mode 100644
 +	if (len) { MU_FLUSH((uintptr_t)h->pool + MU_DATA, len); }
 +	MU_BARRIER();
 +	mu_w(h, 0x58, 1);
++	/* Device power transitions have Linux's separate ten-second deadline. */
++	uint32_t timeout = response_type == 0x21 && c->request[2] == MU_DEVICE_WLUN &&
++	    c->request[16] == 0x1b ? MU_DEVICE_ACTIVE_TIMEOUT_US : MU_TIMEOUT_US;
 +	uint64_t start = MU_NOW_US();
 +	while (mu_r(h, 0x58) & 1) {
 +		uint32_t is = mu_r(h, 0x20);
 +		uint32_t fault = mu_sr(h, mu_cb(h, h->cb) + 0x58) & MU_SMMU_FSR_FAULT;
-+		if ((is & MU_FATAL_IS) || fault || MU_NOW_US() - start >= MU_TIMEOUT_US) {
++		if ((is & MU_FATAL_IS) || fault || MU_NOW_US() - start >= timeout) {
 +			h->failed = true;
 +			mu_dump(h, "timeout/fault");
 +			return ((is & MU_FATAL_IS) || fault) ? EIO : ETIMEDOUT;
@@ -1804,7 +2173,7 @@ new file mode 100644
 +mu_scsi(struct mu_host *h, uint8_t lun, const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
 +{
 +	if (h->failed) { return EIO; }
-+	h->phase = "scsi";
++	h->phase = lun == MU_DEVICE_WLUN && cdb_len && cdb[0] == 0x1b ? "device-active" : "scsi";
 +	if (cdb_len > 16 || !cdb_len || len > MU_BOUNCE) { return EINVAL; }
 +	int error = mu_prepare(h, 1, lun);
 +	if (error) { return error; }
@@ -1827,14 +2196,35 @@ new file mode 100644
 +		    ((sense[0] & 0x7f) == 0x72 || (sense[0] & 0x7f) == 0x73)) {
 +			key = sense[1] & 0xf; asc = sense[2]; ascq = sense[3];
 +		}
-+		MU_LOG("METROID UFS: SCSI cmd=%02x response=%02x status=%02x sense=%02x/%02x/%02x\n",
-+		    cdb[0], c->response[6], c->response[7], key, asc, ascq);
++		MU_LOG("METROID UFS: SCSI cmd=%02x LUN=%02x response=%02x status=%02x sense=%02x/%02x/%02x\n",
++		    cdb[0], lun, c->response[6], c->response[7], key, asc, ascq);
 +		/* UNIT ATTENTION / NOT READY may be retried only after completion. */
 +		return !c->response[6] && c->response[7] == 2 && (key == 6 || key == 2) ? EAGAIN : EIO;
 +	}
 +	/* Refuse short/overflowed reads; stale bounce bytes must not reach BSD. */
 +	if (c->response[1] & 0x60) { return EIO; }
 +	return 0;
++}
++
++/* Link active and device active are separate states. Nothing's resume path
++ * exits Hibern8 then sends START STOP UNIT / ACTIVE to the UFS Device WLUN.
++ * We cannot trust inherited software power state, so request ACTIVE explicitly.
++ * This has no data payload and does not address an ordinary storage LUN. */
++static int
++mu_activate_device(struct mu_host *h)
++{
++	const uint8_t active[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
++	for (unsigned attempt = 1; attempt <= 3; attempt++) {
++		int error = mu_scsi(h, MU_DEVICE_WLUN, active, sizeof(active), 0, false);
++		MU_LOG("METROID UFS: device ACTIVE LUN=d0 attempt=%u/3 errno=%d transport_failed=%u\n",
++		    attempt, error, (unsigned)h->failed);
++		if (!error || h->failed) { return error; }
++		/* Retry only a completed sense response indicating UA/NOT READY.
++		 * Unknown/permanent rejections are not improved by repetition. */
++		if (error != EAGAIN || attempt == 3) { return error; }
++		MU_DELAY(10000);
++	}
++	return EIO;
 +}
 +
 +static uint32_t
@@ -1948,6 +2338,20 @@ new file mode 100644
 +	if (error) { return error; }
 +	error = mu_submit(h, 0, false, 0x20);
 +	if (error) { return error; }
++	if (h->cold_init) {
++		/* Match Nothing's fresh initialization: NOP, SET, then READ/poll.
++		 * Inherited-state READ/probes are only for the resume/takeover path. */
++		uint8_t flag = 1;
++		error = mu_query_flag(h, true, &flag);
++		if (!error) { error = mu_wait_device_init(h, &flag); }
++		return error ? error : mu_activate_device(h);
++	}
++	/* Hibern8 exit only woke the link. Restore the device power mode before
++	 * attempting ordinary-LUN commands or querying inherited initialization.
++	 * A completed rejection can mean cold initialization is still needed;
++	 * retain the normal query/init path in that case. Transport errors stop. */
++	int wake_error = mu_activate_device(h);
++	if (h->failed) { return wake_error; }
 +	/* Probe before READ_FLAG so a rejected management query cannot hide
 +	 * whether ordinary read-only SCSI commands work. Never bypass the
 +	 * query on success, or submit anything after a transport failure. */
@@ -1975,6 +2379,10 @@ new file mode 100644
 +	 * SET remains an error; it must never be treated as readiness. */
 +	error = mu_query_flag(h, true, &flag);
 +	if (error) { return error; }
-+	return mu_wait_device_init(h, &flag);
++	error = mu_wait_device_init(h, &flag);
++	if (error) { return error; }
++	/* A cold device may have rejected the early power command. Retry it
++	 * after successful initialization, before ordinary disk discovery. */
++	return wake_error ? mu_activate_device(h) : 0;
 +}
 +#endif
