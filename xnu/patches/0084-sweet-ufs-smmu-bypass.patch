@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 3ace660..c46755d 100644
+index 3ace660..6d5397f 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -454,6 +454,116 @@ sweet_ufs_smmu_fault(const char *tag)
+@@ -454,6 +454,122 @@ sweet_ufs_smmu_fault(const char *tag)
  	}
  }
  
@@ -78,8 +78,14 @@ index 3ace660..c46755d 100644
 +		smmu_tlb_sync();
 +		uint32_t got = smmu_rd(SMMU_S2CR(n));
 +		if (S2CR_TYPE(got) != S2CR_BYPASS) {
-+			printf("METROID SMMU: S2CR[%u] reads back %08x: write ignored (secure/hypervisor owned?)\n",
-+			    n, got);
++			/* The write did not produce bypass; something else (hypervisor or
++			 * firmware) may own this register and may even have changed it to
++			 * something other than what was written.  Put the old value back. */
++			printf("METROID SMMU: S2CR[%u] reads back %08x, not bypass; restoring %08x\n",
++			    n, got, smmu_st.s2cr);
++			smmu_wr(SMMU_S2CR(n), smmu_st.s2cr);
++			smmu_tlb_sync();
++			printf("METROID SMMU: S2CR[%u] after restore: %08x\n", n, smmu_rd(SMMU_S2CR(n)));
 +			return EPERM;
 +		}
 +		return 0;
@@ -119,7 +125,7 @@ index 3ace660..c46755d 100644
  /* Names of the interrupt status bits that explain a stuck request. */
  static const char *
  ufs_is_names(uint32_t is, char *buf, size_t n)
-@@ -1030,16 +1140,31 @@ sweet_ufs_init(void)
+@@ -1030,16 +1146,31 @@ sweet_ufs_init(void)
  		sweet_ufs_smmu_dump("init");
  	}
  	/* The Android DT gives UFS an SMMU stream. A plain PA is NOT normally
