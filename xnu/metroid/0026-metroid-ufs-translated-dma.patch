@@ -1237,7 +1237,7 @@ diff --git a/bsd/dev/metroid_ufs_hw.h b/bsd/dev/metroid_ufs_hw.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/metroid_ufs_hw.h
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,486 @@
 +/*
 + * Metroid UFSHCI + SMMUv2 transport. Independently implemented from the
 + * register formats and sequences documented by Nothing's SM8735 Linux tree
@@ -1359,8 +1359,8 @@ new file mode 100644
 +	return (smr & (1u << 31)) && !(((smr & 0xffff) ^ MU_SID) & ~mask);
 +}
 +
-+/* Find an exclusive exact UFS stream and an unshared stage-1 context bank.
-+ * Existing broad/multi matches and shared contexts must not be repurposed.
++/* Find the exact UFS stream, then allocate a fresh stage-1 context bank.
++ * Every context referenced by firmware, including UFS, remains reserved.
 + * No global reset, CLIENTPD change or unrelated-stream TLB invalidation. */
 +static int
 +mu_choose_context(struct mu_host *h)
@@ -1411,18 +1411,7 @@ new file mode 100644
 +		h->old_smr = mu_sr(h, 0x800 + 4 * h->smr);
 +		h->old_s2cr = mu_sr(h, 0xc00 + 4 * h->smr);
 +		if (h->old_smr != ((1u << 31) | MU_SID)) { return EBUSY; }
-+		if (((h->old_s2cr >> 16) & 3) == 0) {
-+			h->cb = h->old_s2cr & 0xff;
-+			if (h->cb < h->ns2cb || h->cb >= h->ncb) {
-+				MU_LOG("METROID SMMU: UFS context outside stage-1 range: SMR=%u S2CR=%08x CB=%u stage2_only=%u contexts=%u\n",
-+				    h->smr, h->old_s2cr, h->cb, h->ns2cb, h->ncb);
-+				return ENOTSUP;
-+			}
-+			for (uint32_t i = 0; i < h->nsmr; i++) {
-+				uint32_t s = mu_sr(h, 0x800 + 4 * i), c = mu_sr(h, 0xc00 + 4 * i);
-+				if (i != h->smr && (s & (1u << 31)) && ((c >> 16) & 3) == 0 && (c & 0xff) == h->cb) { return EBUSY; }
-+			}
-+		}
++
 +	} else {
 +		if (free_smr == UINT32_MAX) { return ENOSPC; }
 +		h->smr = free_smr;
@@ -1434,16 +1423,14 @@ new file mode 100644
 +		uint64_t ttbr = mu_sr64(h, b + 0x20), ttbr1 = mu_sr64(h, b + 0x28);
 +		used_asid[(ttbr >> 48) & 0xff] = true;
 +		used_asid[(ttbr1 >> 48) & 0xff] = true;
-+		if (h->cb == UINT32_MAX && !referenced[i] && mu_sr(h, b) == 0) { h->cb = i; }
++		if (h->cb == UINT32_MAX && !referenced[i] && !(mu_sr(h, b) & 1)) { h->cb = i; }
 +	}
-+	if (h->cb == UINT32_MAX) { return ENOSPC; }
-+	/* Never replace a context whose stage-2 setup we do not own. */
-+	uint32_t cbar = mu_sr(h, h->gr1 + 4 * h->cb);
-+	if (matches && ((h->old_s2cr >> 16) & 3) == 0 && ((cbar >> 16) & 3) != 1) {
-+		MU_LOG("METROID SMMU: UFS context requires unsupported stage-2 handling: SMR=%u S2CR=%08x CB=%u CBAR=%08x TYPE=%u\n",
-+		    h->smr, h->old_s2cr, h->cb, cbar, (cbar >> 16) & 3);
-+		return ENOTSUP;
++	if (h->cb == UINT32_MAX) {
++		MU_LOG("METROID SMMU: no unused disabled stage-1 context; firmware contexts preserved\n");
++		return ENOSPC;
 +	}
++	MU_LOG("METROID SMMU: allocate fresh CB=%u; firmware UFS S2CR=%08x is preserved until attach\n",
++	    h->cb, h->old_s2cr);
 +	h->asid = 0;
 +	for (uint32_t i = 1; i < 256; i++) { if (!used_asid[i]) { h->asid = i; break; } }
 +	return h->asid ? 0 : ENOSPC;
@@ -1482,6 +1469,33 @@ new file mode 100644
 +	return mu_poll(h, true, b + 0x7f4, 1, 0, 100000);
 +}
 +
++/* Linux writes configuration without whole-register equality checks.
++ * Report normalization, but only reject differences that would change the
++ * translation format, page-table address, or UFS stream destination. */
++static int
++mu_check32(struct mu_host *h, uint32_t off, uint32_t want, uint32_t mask, const char *name)
++{
++	uint32_t got = mu_sr(h, off);
++	if (got != want) {
++		MU_LOG("METROID SMMU: %s readback want=%08x got=%08x required=%08x %s\n",
++		    name, want, got, mask, ((got ^ want) & mask) ? "blocked/incompatible" : "continuing");
++	}
++	return ((got ^ want) & mask) ? EPERM : 0;
++}
++
++static int
++mu_check_ttbr(struct mu_host *h, uint32_t off, uint64_t want)
++{
++	uint64_t got = mu_sr64(h, off);
++	const uint64_t mask = MU_ADDR_MASK | (0xffffull << 48);
++	if (got != want) {
++		MU_LOG("METROID SMMU: TTBR0 readback want=%llx got=%llx %s\n",
++		    (unsigned long long)want, (unsigned long long)got,
++		    ((got ^ want) & mask) ? "blocked/incompatible" : "continuing");
++	}
++	return ((got ^ want) & mask) ? EPERM : 0;
++}
++
 +static int
 +mu_map_dma(struct mu_host *h)
 +{
@@ -1496,7 +1510,7 @@ new file mode 100644
 +	h->configured = true;
 +	uint32_t old_asid = (uint32_t)(mu_sr64(h, b + 0x20) >> 48);
 +	mu_sw(h, b, 0);
-+	if (mu_sr(h, b) != 0) { error = EPERM; goto fail; }
++	if ((error = mu_check32(h, b, 0, 1, "SCTLR disable"))) { goto fail; }
 +	if (mu_tlb_sync(h, old_asid)) { error = ETIMEDOUT; goto fail; }
 +	uint32_t cbar = (1u << 16) | (0xfu << 12) | (3u << 8);
 +	uint32_t tcr = (1u << 23) | (3u << 12) | (1u << 10) | (1u << 8) | 32;
@@ -1511,21 +1525,23 @@ new file mode 100644
 +	mu_sw(h, b + 0x38, 0xff); /* MAIR0 Attr0: Normal WB */
 +	mu_sw(h, b + 0x3c, 0);
 +	mu_sw(h, b + 0x58, mu_sr(h, b + 0x58));
-+	if (mu_sr(h, h->gr1 + 0x800 + 4 * h->cb) != 1 ||
-+	    mu_sr(h, h->gr1 + 4 * h->cb) != cbar || mu_sr(h, b + 0x10) != tcr2 ||
-+	    mu_sr(h, b + 0x30) != tcr || mu_sr64(h, b + 0x20) != ttbr ||
-+	    mu_sr64(h, b + 0x28) != 0 || mu_sr(h, b + 0x38) != 0xff) { error = EPERM; goto fail; }
++	if ((error = mu_check32(h, h->gr1 + 0x800 + 4 * h->cb, 1, 1, "CBA2R VA64")) ||
++	    (error = mu_check32(h, h->gr1 + 4 * h->cb, cbar, 3u << 16, "CBAR stage")) ||
++	    (error = mu_check32(h, b + 0x10, tcr2, 0xf, "TCR2 PA size")) ||
++	    (error = mu_check32(h, b + 0x30, tcr, (1u << 23) | (1u << 22) | (3u << 14) | (1u << 7) | 0x3f, "TCR format")) ||
++	    (error = mu_check_ttbr(h, b + 0x20, ttbr)) ||
++	    (error = mu_check32(h, b + 0x38, 0xff, 0xff, "MAIR Attr0"))) { goto fail; }
 +	if (mu_tlb_sync(h, h->asid)) { error = ETIMEDOUT; goto fail; }
 +	/* Abort on faults rather than stall forever; poll FSR instead of using IRQ. */
 +	uint32_t sctlr = (1u << 12) | (1u << 5) | (1u << 2) | (1u << 1) | 1;
 +	mu_sw(h, b, sctlr);
-+	if (mu_sr(h, b) != sctlr) { error = EPERM; goto fail; }
-+	/* TRANS + unprivileged: actual translation, never S2CR.TYPE=BYPASS. */
-+	uint32_t s2cr = (2u << 24) | h->cb;
++	if ((error = mu_check32(h, b, sctlr, 1, "SCTLR enable"))) { goto fail; }
++	/* Linux uses TRANS + PRIVCFG_DEFAULT when attaching a DMA domain. */
++	uint32_t s2cr = h->cb;
 +	mu_sw(h, 0xc00 + 4 * h->smr, s2cr);
-+	if (mu_sr(h, 0xc00 + 4 * h->smr) != s2cr) { error = EPERM; goto fail; }
++	if ((error = mu_check32(h, 0xc00 + 4 * h->smr, s2cr, (3u << 16) | 0xff, "S2CR route"))) { goto fail; }
 +	mu_sw(h, 0x800 + 4 * h->smr, (1u << 31) | MU_SID);
-+	if (mu_sr(h, 0x800 + 4 * h->smr) != ((1u << 31) | MU_SID)) { error = EPERM; goto fail; }
++	if ((error = mu_check32(h, 0x800 + 4 * h->smr, (1u << 31) | MU_SID, UINT32_MAX, "SMR match"))) { goto fail; }
 +	h->mapped = true;
 +	MU_LOG("METROID DMA: SID=60 SMR=%u CB=%u ASID=%u IOVA=%llx PA=%llx bytes=%x TTBR=%llx\n",
 +	    h->smr, h->cb, h->asid, (unsigned long long)MU_IOVA,
