@@ -1027,7 +1027,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  static int
  sweet_ufs_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
  {
-@@ -1116,135 +389,80 @@
+@@ -1116,135 +389,83 @@
  	DTEntry node;
  	uintptr_t const *reg = NULL;
  	unsigned int size = 0;
@@ -1139,9 +1139,12 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +	su.host.tables_pa = su.host.pool_pa + MU_POOL_SIZE;
 +	error = mu_map_dma(&su.host);
 +	if (!error) { error = mu_start_host(&su.host); }
++	su.host.probe_first = (uint8_t)(explicit_lun ? lun : 0);
++	su.host.probe_last = (uint8_t)(explicit_lun ? lun : 7);
 +	if (!error) { error = mu_device_init(&su.host); }
 +	if (error) { printf("METROID UFS: initialization failed errno=%d\n", error); mu_dump(&su.host, "init-failed"); return error; }
-+	printf("METROID UFS: NOP IN received; fDeviceInit complete\n");
++	printf("METROID UFS: NOP IN received; %s\n",
++	    su.host.inherited_ready ? "firmware initialization verified" : "fDeviceInit complete");
 +	/* Probe ordinary LUNs, or the explicitly selected ufslun. Only completed
 +	 * UNIT ATTENTION/NOT READY is retried; DMA faults/timeouts stop probing. */
 +	int found_error = ENOENT;
@@ -1226,7 +1229,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	return 0;
  }
  
-@@ -1255,7 +473,10 @@
+@@ -1255,7 +476,10 @@
  sweet_ufs_rootdev(dev_t *dev)
  {
  	if (!su.ready) {
@@ -1241,7 +1244,7 @@ diff --git a/bsd/dev/metroid_ufs_hw.h b/bsd/dev/metroid_ufs_hw.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/metroid_ufs_hw.h
-@@ -0,0 +1,629 @@
+@@ -0,0 +1,713 @@
 +/*
 + * Metroid UFSHCI + SMMUv2 transport. Independently implemented from the
 + * register formats and sequences documented by Nothing's SM8735 Linux tree
@@ -1263,6 +1266,7 @@ new file mode 100644
 +#define MU_SID       0x60u
 +#define MU_ADDR_MASK 0x0000fffffffff000ull
 +#define MU_TIMEOUT_US 5000000u
++#define MU_QUERY_ATTEMPTS 3u /* Nothing ufshcd.c QUERY_REQ_RETRIES */
 +#define MU_UIC_DONE (1u << 10)
 +#define MU_HIBERN8_EXIT_DONE (1u << 5)
 +#define MU_TX_FSM_ATTRIBUTE (0x41u << 16) /* QCOM MPHY_TX_FSM_STATE, lane 0 */
@@ -1300,7 +1304,8 @@ new file mode 100644
 +	uint32_t old_smr, old_s2cr;
 +	uint32_t tx_fsm;
 +	const char *phase;
-+	bool mapped, failed, configured;
++	uint8_t probe_first, probe_last;
++	bool mapped, failed, configured, inherited_ready;
 +};
 +
 +static uint32_t mu_r(struct mu_host *h, uint32_t off) { return MU_READ32(h->regs + off); }
@@ -1832,42 +1837,124 @@ new file mode 100644
 +	return 0;
 +}
 +
++static uint32_t
++mu_upiu_word(const uint8_t *p)
++{
++	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
++}
++
++static void
++mu_query_dump(const char *which, const uint8_t *p)
++{
++	MU_LOG("METROID UFS: query-%s %08x %08x %08x %08x %08x %08x %08x %08x\n",
++	    which, mu_upiu_word(p), mu_upiu_word(p + 4), mu_upiu_word(p + 8), mu_upiu_word(p + 12),
++	    mu_upiu_word(p + 16), mu_upiu_word(p + 20), mu_upiu_word(p + 24), mu_upiu_word(p + 28));
++}
++
 +static int
 +mu_query_flag(struct mu_host *h, bool set, uint8_t *value)
 +{
 +	if (h->failed) { return EIO; }
 +	h->phase = set ? "fDeviceInit-set" : "fDeviceInit-read";
-+	int error = mu_prepare(h, 0x16, 0);
-+	if (error) { return error; }
-+	struct mu_ucd *c = (struct mu_ucd *)(h->pool + MU_UCD);
-+	c->request[5] = set ? 0x81 : 0x01; /* standard write/read query */
-+	c->request[12] = set ? 6 : 5; /* SET_FLAG / READ_FLAG */
-+	c->request[13] = 1; /* fDeviceInit */
-+	error = mu_submit(h, 0, false, 0x36);
-+	if (error) { return error; }
-+	if (c->response[6] || c->response[12] != c->request[12] || c->response[13] != 1) { return EIO; }
-+	*value = c->response[23] & 1;
-+	return 0;
++	for (unsigned attempt = 1; attempt <= MU_QUERY_ATTEMPTS; attempt++) {
++		int error = mu_prepare(h, 0x16, 0);
++		if (error) { return error; }
++		struct mu_ucd *c = (struct mu_ucd *)(h->pool + MU_UCD);
++		c->request[5] = set ? 0x81 : 0x01; /* standard write/read query */
++		c->request[12] = set ? 6 : 5; /* SET_FLAG / READ_FLAG */
++		c->request[13] = 1; /* fDeviceInit, index=selector=0 */
++		error = mu_submit(h, 0, false, 0x36);
++		/* Only validated completion releases this slot. No transport error,
++		 * timeout, fault, OCS failure or malformed header may be retried. */
++		if (error) { return error; }
++		uint8_t result = c->response[6];
++		if (!result && !c->response[7] && !c->response[10] && !c->response[11] &&
++		    !memcmp(c->response + 12, c->request + 12, 4)) {
++			*value = c->response[23] & 1;
++			return 0;
++		}
++		MU_LOG("METROID UFS: %s attempt=%u/%u result=%02x status=%02x opcode=%02x IDN=%02x index=%02x selector=%02x\n",
++		    h->phase, attempt, MU_QUERY_ATTEMPTS, result, c->response[7],
++		    c->response[12], c->response[13], c->response[14], c->response[15]);
++		mu_query_dump("req", c->request);
++		mu_query_dump("rsp", c->response);
++		/* QUERY_RESULT_GENERAL_FAILURE may be transient. Match Linux's
++		 * three-attempt bound, but never turn a rejected query into success.
++		 * Failed queries need not echo the OSF, so inspect it only on success.
++		 * Explicit invalid/not-writable results and malformed success stop. */
++		if (result != 0xff || c->response[7] || attempt == MU_QUERY_ATTEMPTS) { return EIO; }
++		MU_DELAY(1000);
++	}
++	return EIO;
++}
++
++/* A clear flag alone does not prove initialization: firmware may never have
++ * requested it. Require actual SCSI readiness and plausible capacity as well. */
++static int
++mu_probe_inherited_ready(struct mu_host *h)
++{
++	if (h->probe_first > h->probe_last || h->probe_last > 7) { return EINVAL; }
++	const uint8_t tur[6] = { 0 };
++	uint8_t capacity[16] = { 0x9e, 0x10 };
++	capacity[13] = 32;
++	for (unsigned lun = h->probe_first; lun <= h->probe_last; lun++) {
++		int error = EIO;
++		for (unsigned attempt = 0; attempt < 3; attempt++) {
++			error = mu_scsi(h, (uint8_t)lun, tur, sizeof(tur), 0, false);
++			if (!error) { error = mu_scsi(h, (uint8_t)lun, capacity, sizeof(capacity), 32, false); }
++			if (error != EAGAIN) { break; }
++			if (attempt < 2) { MU_DELAY(10000); }
++		}
++		if (h->failed) { return error; }
++		if (error) { continue; }
++		const uint8_t *data = h->pool + MU_DATA;
++		uint64_t last = (uint64_t)mu_upiu_word(data) << 32 | mu_upiu_word(data + 4);
++		uint32_t block = mu_upiu_word(data + 8);
++		if (last == ~(uint64_t)0 || block < 512 || block > 4096 ||
++		    (block & (block - 1)) || last + 1 > (~(uint64_t)0) / block) { continue; }
++		h->inherited_ready = true;
++		MU_LOG("METROID UFS: firmware readiness verified LUN=%u block=%u\n", lun, block);
++		return 0;
++	}
++	return ENOENT;
++}
++
++static int
++mu_wait_device_init(struct mu_host *h, uint8_t *flag)
++{
++	uint64_t start = MU_NOW_US();
++	do {
++		int error = mu_query_flag(h, false, flag);
++		if (error || !*flag) { return error; }
++		MU_DELAY(1000);
++	} while (MU_NOW_US() - start < MU_TIMEOUT_US);
++	return ETIMEDOUT;
 +}
 +
 +static int
 +mu_device_init(struct mu_host *h)
 +{
 +	if (h->failed) { return EIO; }
++	h->inherited_ready = false;
 +	h->phase = "nop";
 +	int error = mu_prepare(h, 0, 0); /* NOP OUT */
 +	if (error) { return error; }
 +	error = mu_submit(h, 0, false, 0x20);
 +	if (error) { return error; }
 +	uint8_t flag = 1;
++	error = mu_query_flag(h, false, &flag);
++	if (error) { return error; }
++	/* Finish an inherited in-progress initialization before probing. */
++	if (flag) {
++		error = mu_wait_device_init(h, &flag);
++		if (error) { return error; }
++	}
++	error = mu_probe_inherited_ready(h);
++	if (error != ENOENT || h->failed) { return error; }
++	/* No proven usable LUN: use the ordinary SET/poll sequence. A rejected
++	 * SET remains an error; it must never be treated as readiness. */
 +	error = mu_query_flag(h, true, &flag);
 +	if (error) { return error; }
-+	uint64_t start = MU_NOW_US();
-+	do {
-+		error = mu_query_flag(h, false, &flag);
-+		if (error || !flag) { return error; }
-+		MU_DELAY(1000);
-+	} while (MU_NOW_US() - start < MU_TIMEOUT_US);
-+	return ETIMEDOUT;
++	return mu_wait_device_init(h, &flag);
 +}
 +#endif
