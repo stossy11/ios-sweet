@@ -1253,7 +1253,7 @@ diff --git a/bsd/dev/metroid_ufs_hw.h b/bsd/dev/metroid_ufs_hw.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/metroid_ufs_hw.h
-@@ -0,0 +1,1149 @@
+@@ -0,0 +1,1162 @@
 +/*
 + * Metroid UFSHCI + SMMUv2 transport. Independently implemented from the
 + * register formats and sequences documented by Nothing's SM8735 Linux tree
@@ -1980,9 +1980,22 @@ new file mode 100644
 +		if (error) { goto fail; }
 +		MU_DELAY(10); /* lane branches use BRANCH_HALT_DELAY in gcc-tuna */
 +	}
-+	/* Qunipro selection, modern CFG0, non-SCSI ICE-check bypass/ref clock. */
-+	error = mu_io_update(h->regs + MU_QCOM_CFG1, 1 | MU_QCOM_REF_CLK | MU_QCOM_NO_ICE_CHECK,
-+	    1 | MU_QCOM_REF_CLK | MU_QCOM_NO_ICE_CHECK);
++	/* Nothing select_unipro_mode writes QUNIPRO_SEL without checking its
++	 * readback. On this major6 controller hardware reports bit0 clear even
++	 * after that write. Keep the write and diagnose the mismatch; subsequent
++	 * HCE, DME attributes and LINK_STARTUP must prove usable UniPro operation.
++	 * This exception is only bit0, not PHY reset/ref-clock/ICE-check controls. */
++	h->phase = "cold-unipro-select";
++	uint32_t cfg1 = mu_r(h, MU_QCOM_CFG1);
++	if (cfg1 == 0xffffffffu) { error = ENXIO; goto fail; }
++	mu_w(h, MU_QCOM_CFG1, cfg1 | 1);
++	uint32_t selected = mu_r(h, MU_QCOM_CFG1);
++	if (selected == 0xffffffffu) { error = ENXIO; goto fail; }
++	if (!(selected & 1)) {
++		MU_LOG("METROID UFS: QUNIPRO_SEL readback remains0 CFG1=%08x; validating HCE/UIC/link\n", selected);
++	}
++	error = mu_io_update(h->regs + MU_QCOM_CFG1, MU_QCOM_REF_CLK | MU_QCOM_NO_ICE_CHECK,
++	    MU_QCOM_REF_CLK | MU_QCOM_NO_ICE_CHECK);
 +	if (!error) { error = mu_io_update(h->regs + 0xd8, (1u << 5) | 1, 0); }
 +	if (error) { goto fail; }
 +	MU_DELAY(60);
