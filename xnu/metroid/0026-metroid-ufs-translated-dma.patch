@@ -39,7 +39,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  #include <machine/machine_routines.h>
  #include <arm/caches_internal.h>
  #include <vm/pmap.h>
-@@ -43,860 +25,147 @@
+@@ -43,860 +25,151 @@
  #include <libkern/libkern.h>
  
  extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
@@ -191,8 +191,12 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +#define MU_READ32(a) (*(volatile uint32_t *)(uintptr_t)(a))
 +#define MU_WRITE32(a, v) (*(volatile uint32_t *)(uintptr_t)(a) = (v))
 +#define MU_WRITE64(a, v) (*(volatile uint64_t *)(uintptr_t)(a) = (v))
-+#define MU_CLEAN(pa, n) clean_dcache64((addr64_t)(pa), (n), TRUE)
-+#define MU_FLUSH(pa, n) flush_dcache64((addr64_t)(pa), (n), TRUE)
++/* The private DMA domain has no Linux DMA API/coherency initialization.
++ * Operate on our owning CPU VA and force writes to PoC, even when the
++ * generic physical-address cache wrapper was built as coherent-I/O only.
++ * SWEET/METROID uses the generic ARM CVAC/CIVAC cache implementation. */
++#define MU_CLEAN(va, n) CleanPoC_DcacheRegion_Force((vm_offset_t)(va), (n))
++#define MU_FLUSH(va, n) FlushPoC_DcacheRegion((vm_offset_t)(va), (n))
 +#define MU_LOG(...) printf(__VA_ARGS__)
 +#include "metroid_ufs_hw.h"
 +
@@ -1023,7 +1027,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  static int
  sweet_ufs_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
  {
-@@ -1116,135 +385,80 @@
+@@ -1116,135 +389,80 @@
  	DTEntry node;
  	uintptr_t const *reg = NULL;
  	unsigned int size = 0;
@@ -1222,7 +1226,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	return 0;
  }
  
-@@ -1255,7 +469,10 @@
+@@ -1255,7 +473,10 @@
  sweet_ufs_rootdev(dev_t *dev)
  {
  	if (!su.ready) {
@@ -1237,7 +1241,7 @@ diff --git a/bsd/dev/metroid_ufs_hw.h b/bsd/dev/metroid_ufs_hw.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/metroid_ufs_hw.h
-@@ -0,0 +1,512 @@
+@@ -0,0 +1,629 @@
 +/*
 + * Metroid UFSHCI + SMMUv2 transport. Independently implemented from the
 + * register formats and sequences documented by Nothing's SM8735 Linux tree
@@ -1259,6 +1263,14 @@ new file mode 100644
 +#define MU_SID       0x60u
 +#define MU_ADDR_MASK 0x0000fffffffff000ull
 +#define MU_TIMEOUT_US 5000000u
++#define MU_UIC_DONE (1u << 10)
++#define MU_HIBERN8_EXIT_DONE (1u << 5)
++#define MU_TX_FSM_ATTRIBUTE (0x41u << 16) /* QCOM MPHY_TX_FSM_STATE, lane 0 */
++#define MU_TX_FSM_HIBERN8 1u
++#define MU_QCOM_CFG1 0xdcu
++#define MU_QCOM_HW_VERSION 0xe4u
++#define MU_QCOM_REF_CLK (1u << 26)
++#define MU_QCOM_NO_ICE_CHECK (1u << 31)
 +/* Nothing arm-smmu.h ARM_SMMU_FSR_FAULT: MULTI, SS and bits 8:1.
 + * Bit 10 (0x400) is not a recognized context fault. Do not infer a valid
 + * fault address from FAR unless an actual fault bit is set.
@@ -1286,6 +1298,8 @@ new file mode 100644
 +	uint64_t *tables;
 +	uint32_t pgshift, cb_base, gr1, ncb, ns2cb, nsmr, cb, smr, asid, ips;
 +	uint32_t old_smr, old_s2cr;
++	uint32_t tx_fsm;
++	const char *phase;
 +	bool mapped, failed, configured;
 +};
 +
@@ -1317,13 +1331,16 @@ new file mode 100644
 +	MU_LOG("METROID UFS[%s]: IS=%08x HCS=%08x HCE=%08x DBR=%08x RSR=%08x MEMCFG=%08x UTRL=%08x:%08x\n",
 +	    stage, mu_r(h, 0x20), mu_r(h, 0x30), mu_r(h, 0x34), mu_r(h, 0x58),
 +	    mu_r(h, 0x60), mu_r(h, 0x300), mu_r(h, 0x54), mu_r(h, 0x50));
++	MU_LOG("METROID UFS[%s]: phase=%s AHIT=%08x QCOM_VER=%08x CFG1=%08x TX_FSM=%x\n",
++	    stage, h->phase ? h->phase : "idle", mu_r(h, 0x18),
++	    mu_r(h, MU_QCOM_HW_VERSION), mu_r(h, MU_QCOM_CFG1), h->tx_fsm);
 +	if (h->mapped && h->pool) {
 +		/* Descriptors were cleaned before submission; no CPU writes occur
 +		 * while DMA owns them. Refresh cache lines for diagnostic reads only.
 +		 * OCS=invalid with DBR=1 alone does not prove the request was unfetched.
 +		 */
-+		MU_FLUSH(h->pool_pa, sizeof(struct mu_utrd));
-+		MU_FLUSH(h->pool_pa + MU_UCD + offsetof(struct mu_ucd, response), 32);
++		MU_FLUSH((uintptr_t)h->pool, sizeof(struct mu_utrd));
++		MU_FLUSH((uintptr_t)h->pool + MU_UCD + offsetof(struct mu_ucd, response), 32);
 +		MU_BARRIER();
 +		const volatile struct mu_utrd *d = (const volatile struct mu_utrd *)h->pool;
 +		const volatile struct mu_ucd *c = (const volatile struct mu_ucd *)(h->pool + MU_UCD);
@@ -1333,8 +1350,8 @@ new file mode 100644
 +		    stage, c->response[0], c->response[1], c->response[2], c->response[3], c->response[6], c->response[7],
 +		    d->response_offset, d->response_len, d->prdt_len);
 +	}
-+	MU_LOG("METROID SMMU[%s]: sCR0=%08x GFSR=%08x GFSYNR1=%08x\n",
-+	    stage, mu_sr(h, 0), mu_sr(h, 0x48), mu_sr(h, 0x54));
++	MU_LOG("METROID SMMU[%s]: sCR0=%08x sACR=%08x GFSR=%08x GFSYNR1=%08x\n",
++	    stage, mu_sr(h, 0), mu_sr(h, 0x10), mu_sr(h, 0x48), mu_sr(h, 0x54));
 +	MU_LOG("METROID UFS[%s]: UECPA=%08x UECDL=%08x UECN=%08x UECT=%08x UECDME=%08x\n",
 +	    stage, mu_r(h, 0x38), mu_r(h, 0x3c), mu_r(h, 0x40), mu_r(h, 0x44), mu_r(h, 0x48));
 +	if (h->configured) {
@@ -1368,6 +1385,13 @@ new file mode 100644
 +		return ENXIO;
 +	}
 +	if (mu_r(h, 0x58) || mu_r(h, 0x78)) { return EBUSY; }
++	/* Freeze automatic link sleep before changing the DMA domain. Existing
++	 * manual Hibern8 is handled explicitly before enabling request lists. */
++	mu_w(h, 0x18, 0);
++	if (mu_r(h, 0x18) & 0x1fff) {
++		MU_LOG("METROID UFS: cannot disable automatic Hibern8\n");
++		return EIO;
++	}
 +	mu_w(h, 0x24, 0);
 +	mu_w(h, 0x60, 0);
 +	mu_w(h, 0x80, 0);
@@ -1479,7 +1503,7 @@ new file mode 100644
 +		l3[i] = (h->pool_pa + (uint64_t)i * 4096) | 3 | (1u << 6) |
 +		    (3u << 8) | (1u << 10) | (1u << 11) | (3ull << 53);
 +	}
-+	MU_CLEAN(h->tables_pa, MU_TABLE_SIZE);
++	MU_CLEAN((uintptr_t)h->tables, MU_TABLE_SIZE);
 +	MU_BARRIER();
 +	return 0;
 +}
@@ -1523,9 +1547,19 @@ new file mode 100644
 +static int
 +mu_map_dma(struct mu_host *h)
 +{
++	h->phase = "dma-map";
 +	if (mu_r(h, 0x58) || mu_r(h, 0x78) || (mu_r(h, 0x60) & 1) || (mu_r(h, 0x80) & 1)) { return EBUSY; }
 +	int error = mu_choose_context(h);
 +	if (error) { return error; }
++	/* Nothing's qsmmuv500_cfg_probe clears only this implementation bit.
++	 * Firmware may protect it; preserve every other sACR bit and report
++	 * blocked writes like Linux, without resetting global SMMU state. */
++	uint32_t acr = mu_sr(h, 0x10);
++	if (acr & (1u << 26)) {
++		mu_sw(h, 0x10, acr & ~(1u << 26));
++		MU_LOG("METROID SMMU: CACHE_LOCK old=%08x new=%08x%s\n", acr, mu_sr(h, 0x10),
++		    (mu_sr(h, 0x10) & (1u << 26)) ? " firmware-locked" : " cleared");
++	}
 +	error = mu_build_tables(h);
 +	if (error) { return error; }
 +	uint32_t b = mu_cb(h, h->cb);
@@ -1537,7 +1571,11 @@ new file mode 100644
 +	if ((error = mu_check32(h, b, 0, 1, "SCTLR disable"))) { goto fail; }
 +	if (mu_tlb_sync(h, old_asid)) { error = ETIMEDOUT; goto fail; }
 +	uint32_t cbar = (1u << 16) | (0xfu << 12) | (3u << 8);
-+	uint32_t tcr = (1u << 23) | (3u << 12) | (1u << 10) | (1u << 8) | 32;
++	/* Linux io-pgtable's noncoherent-walk case: outer-shareable, inner
++	 * and outer noncacheable table reads. Tables are explicitly cleaned
++	 * above and immutable while attached; firmware coherency is not assumed.
++	 * Endpoint PTEs remain Normal WB and use explicit cache ownership below. */
++	uint32_t tcr = (1u << 23) | (2u << 12) | 32;
 +	uint32_t tcr2 = (7u << 15) | h->ips; /* 8-bit ASID; TCR2.AS stays zero */
 +	uint64_t ttbr = h->tables_pa | ((uint64_t)h->asid << 48);
 +	mu_sw(h, h->gr1 + 0x800 + 4 * h->cb, 1); /* AArch64 */
@@ -1567,7 +1605,7 @@ new file mode 100644
 +	mu_sw(h, 0x800 + 4 * h->smr, (1u << 31) | MU_SID);
 +	if ((error = mu_check32(h, 0x800 + 4 * h->smr, (1u << 31) | MU_SID, UINT32_MAX, "SMR match"))) { goto fail; }
 +	h->mapped = true;
-+	MU_LOG("METROID DMA: SID=60 SMR=%u CB=%u ASID=%u IOVA=%llx PA=%llx bytes=%x TTBR=%llx\n",
++	MU_LOG("METROID DMA: SID=60 SMR=%u CB=%u ASID=%u IOVA=%llx PA=%llx bytes=%x TTBR=%llx (NC table walks, explicit cache sync)\n",
 +	    h->smr, h->cb, h->asid, (unsigned long long)MU_IOVA,
 +	    (unsigned long long)h->pool_pa, MU_POOL_SIZE, (unsigned long long)h->tables_pa);
 +	return 0;
@@ -1577,37 +1615,108 @@ new file mode 100644
 +	return error;
 +}
 +
-+/* UIC commands are polled, with W1C completion and result checked separately. */
++/* UIC command completion and power-transition completion are independent.
++ * Follow ufshcd_uic_pwr_ctrl: Hibern8 exit needs UHXS and PWR_LOCAL too. */
 +static int
-+mu_uic(struct mu_host *h, uint32_t command)
++mu_uic(struct mu_host *h, uint32_t command, uint32_t arg1,
++    uint32_t power_event, uint32_t *value)
 +{
-+	if (mu_poll(h, false, 0x30, 1u << 3, 1u << 3, 1000000)) { return ETIMEDOUT; }
-+	mu_w(h, 0x20, 1u << 10);
-+	mu_w(h, 0x94, 0); mu_w(h, 0x98, 0); mu_w(h, 0x9c, 0);
++	int error = mu_poll(h, false, 0x30, 1u << 3, 1u << 3, 1000000);
++	if (error) { goto fail; }
++	mu_w(h, 0x20, MU_UIC_DONE | power_event);
++	mu_w(h, 0x94, arg1); mu_w(h, 0x98, 0); mu_w(h, 0x9c, 0);
 +	mu_w(h, 0x90, command);
-+	if (mu_poll(h, false, 0x20, 1u << 10, 1u << 10, 1000000)) { h->failed = true; return ETIMEDOUT; }
++	error = mu_poll(h, false, 0x20, MU_UIC_DONE, MU_UIC_DONE, 1000000);
++	if (error) { goto fail; }
 +	uint32_t result = mu_r(h, 0x98) & 0xff;
-+	mu_w(h, 0x20, 1u << 10);
-+	return result ? EIO : 0;
++	mu_w(h, 0x20, MU_UIC_DONE);
++	if (result) {
++		MU_LOG("METROID UFS: UIC cmd=%02x attr=%08x result=%02x\n", command, arg1, result);
++		error = EIO; goto fail;
++	}
++	if (value) { *value = mu_r(h, 0x9c); }
++	if (power_event) {
++		error = mu_poll(h, false, 0x20, power_event, power_event, 1000000);
++		if (error) { goto fail; }
++		uint32_t status = (mu_r(h, 0x30) >> 8) & 7;
++		mu_w(h, 0x20, power_event);
++		if (status != 1) {
++			MU_LOG("METROID UFS: UIC power cmd=%02x status=%x (need PWR_LOCAL=1)\n", command, status);
++			error = EIO; goto fail;
++		}
++	}
++	return 0;
++fail:
++	MU_LOG("METROID UFS: UIC cmd=%02x attr=%08x failed errno=%d IS=%08x HCS=%08x\n",
++	    command, arg1, error, mu_r(h, 0x20), mu_r(h, 0x30));
++	h->failed = true;
++	return error;
++}
++
++static int
++mu_wake_link(struct mu_host *h)
++{
++	h->phase = "link-wake";
++	uint32_t revision = mu_r(h, MU_QCOM_HW_VERSION), major = revision >> 28;
++	if (major < 2 || major == 0xf) {
++		MU_LOG("METROID UFS: unsupported Qualcomm controller revision=%08x\n", revision);
++		return ENOTSUP;
++	}
++	/* ufs_qcom_populate_ref_clk_ctrl/dev_ref_clk_ctrl + link_startup_notify.
++	 * RMW preserves PHY/reset/UniPro controls. Clock must settle before H8 exit.
++	 * Bit31 bypasses ICE configuration checks even for NOP/query requests. */
++	uint32_t cfg = mu_r(h, MU_QCOM_CFG1);
++	mu_w(h, MU_QCOM_CFG1, cfg | MU_QCOM_REF_CLK | MU_QCOM_NO_ICE_CHECK);
++	uint32_t got = mu_r(h, MU_QCOM_CFG1);
++	if ((got & (MU_QCOM_REF_CLK | MU_QCOM_NO_ICE_CHECK)) !=
++	    (MU_QCOM_REF_CLK | MU_QCOM_NO_ICE_CHECK)) {
++		MU_LOG("METROID UFS: CFG1 wake/ICE setup blocked old=%08x got=%08x\n", cfg, got);
++		return EPERM;
++	}
++	MU_DELAY(60);
++	int error;
++	if (!(mu_r(h, 0x30) & 1)) {
++		error = mu_uic(h, 0x16, 0, 0, NULL); /* DME_LINK_STARTUP */
++		if (error) { return error; }
++	}
++	if (mu_poll(h, false, 0x30, 0xf, 0xf, 1000000)) { return ENXIO; }
++	error = mu_uic(h, 1, MU_TX_FSM_ATTRIBUTE, 0, &h->tx_fsm);
++	if (error) { return error; }
++	MU_LOG("METROID UFS: inherited TX_FSM=%x CFG1=%08x\n", h->tx_fsm, got);
++	if (h->tx_fsm == MU_TX_FSM_HIBERN8) {
++		MU_LOG("METROID UFS: exiting inherited Hibern8\n");
++		error = mu_uic(h, 0x18, 0, MU_HIBERN8_EXIT_DONE, NULL);
++		if (error) { return error; }
++		uint64_t start = MU_NOW_US();
++		do {
++			error = mu_uic(h, 1, MU_TX_FSM_ATTRIBUTE, 0, &h->tx_fsm);
++			if (error) { return error; }
++			if (h->tx_fsm != MU_TX_FSM_HIBERN8) { break; }
++			MU_DELAY(100);
++		} while (MU_NOW_US() - start < 100000);
++		if (h->tx_fsm == MU_TX_FSM_HIBERN8) { return ETIMEDOUT; }
++	}
++	if (!h->tx_fsm) {
++		MU_LOG("METROID UFS: TX disabled; cold PHY/clock bring-up required\n");
++		return ENXIO;
++	}
++	MU_LOG("METROID UFS: link awake TX_FSM=%x\n", h->tx_fsm);
++	return 0;
 +}
 +
 +static int
 +mu_start_host(struct mu_host *h)
 +{
 +	if (!h->mapped || h->failed) { return EIO; }
-+	/* Firmware PHY/clocks stay live. Recover an inactive UniPro link using
-+	 * DME_LINK_STARTUP, rather than assuming device-present from HCE alone. */
-+	if (!(mu_r(h, 0x30) & 1)) {
-+		int error = mu_uic(h, 0x16);
-+		if (error) { return error; }
-+	}
-+	if (mu_poll(h, false, 0x30, 0xf, 0xf, 1000000)) { return ENXIO; }
-+	mu_w(h, 0x18, 0); /* disable auto-Hibern8 while using a polled transport */
++	/* PHY/lane clocks must remain powered, but a sleeping link is recoverable. */
++	int error = mu_wake_link(h);
++	if (error) { h->failed = true; return error; }
++	h->phase = "list-start";
 +	mu_w(h, 0x4c, 0); /* interrupt aggregation */
 +	mu_w(h, 0x20, mu_r(h, 0x20));
 +	mu_w(h, 0x50, (uint32_t)MU_IOVA); mu_w(h, 0x54, 0);
 +	mu_w(h, 0x70, (uint32_t)(MU_IOVA + MU_TASK)); mu_w(h, 0x74, 0);
-+	MU_CLEAN(h->pool_pa, MU_POOL_SIZE);
++	MU_FLUSH((uintptr_t)h->pool, MU_POOL_SIZE);
 +	MU_BARRIER();
 +	if (mu_r(h, 0x50) != MU_IOVA || mu_r(h, 0x54) ||
 +	    mu_r(h, 0x70) != MU_IOVA + MU_TASK || mu_r(h, 0x74)) { return EIO; }
@@ -1622,6 +1731,13 @@ new file mode 100644
 +	if (!h->mapped || h->failed || mu_r(h, 0x58) || !(mu_r(h, 0x60) & 1)) { return EIO; }
 +	struct mu_utrd *d = (struct mu_utrd *)h->pool;
 +	struct mu_ucd *c = (struct mu_ucd *)(h->pool + MU_UCD);
++	/* Detect a lost/changed stream or list base before publishing a request. */
++	if (mu_sr(h, 0x800 + 4 * h->smr) != ((1u << 31) | MU_SID) ||
++	    (mu_sr(h, 0xc00 + 4 * h->smr) & ((3u << 16) | 0xff)) != h->cb ||
++	    !(mu_sr(h, mu_cb(h, h->cb)) & 1) ||
++	    mu_r(h, 0x50) != MU_IOVA || mu_r(h, 0x54)) {
++		h->failed = true; mu_dump(h, "dma-route-changed"); return EIO;
++	}
 +	d->header = (1u << 28) | (1u << 24) | (len ? (write ? 1u : 2u) << 25 : 0);
 +	d->ocs = 0xf;
 +	d->ucd_lo = (uint32_t)(MU_IOVA + MU_UCD); d->ucd_hi = 0;
@@ -1633,8 +1749,10 @@ new file mode 100644
 +		c->prdt[i].hi = 0; c->prdt[i].bytes = chunk - 1;
 +		done += chunk;
 +	}
-+	MU_CLEAN(h->pool_pa, MU_DATA);
-+	if (len) { MU_FLUSH(h->pool_pa + MU_DATA, len); }
++	/* Transfer cache ownership, including previously cached response/OCS
++	 * lines, before doorbell. CPU never writes these while DMA owns them. */
++	MU_FLUSH((uintptr_t)h->pool, MU_DATA);
++	if (len) { MU_FLUSH((uintptr_t)h->pool + MU_DATA, len); }
 +	MU_BARRIER();
 +	mu_w(h, 0x58, 1);
 +	uint64_t start = MU_NOW_US();
@@ -1649,8 +1767,8 @@ new file mode 100644
 +		MU_DELAY(10);
 +	}
 +	MU_BARRIER();
-+	MU_FLUSH(h->pool_pa, MU_DATA);
-+	if (len && !write) { MU_FLUSH(h->pool_pa + MU_DATA, len); }
++	MU_FLUSH((uintptr_t)h->pool, MU_DATA);
++	if (len && !write) { MU_FLUSH((uintptr_t)h->pool + MU_DATA, len); }
 +	if ((mu_r(h, 0x20) & MU_FATAL_IS) ||
 +	    (mu_sr(h, mu_cb(h, h->cb) + 0x58) & MU_SMMU_FSR_FAULT)) {
 +		h->failed = true; mu_dump(h, "completion-fault"); return EIO;
@@ -1681,6 +1799,7 @@ new file mode 100644
 +mu_scsi(struct mu_host *h, uint8_t lun, const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
 +{
 +	if (h->failed) { return EIO; }
++	h->phase = "scsi";
 +	if (cdb_len > 16 || !cdb_len || len > MU_BOUNCE) { return EINVAL; }
 +	int error = mu_prepare(h, 1, lun);
 +	if (error) { return error; }
@@ -1717,6 +1836,7 @@ new file mode 100644
 +mu_query_flag(struct mu_host *h, bool set, uint8_t *value)
 +{
 +	if (h->failed) { return EIO; }
++	h->phase = set ? "fDeviceInit-set" : "fDeviceInit-read";
 +	int error = mu_prepare(h, 0x16, 0);
 +	if (error) { return error; }
 +	struct mu_ucd *c = (struct mu_ucd *)(h->pool + MU_UCD);
@@ -1734,6 +1854,7 @@ new file mode 100644
 +mu_device_init(struct mu_host *h)
 +{
 +	if (h->failed) { return EIO; }
++	h->phase = "nop";
 +	int error = mu_prepare(h, 0, 0); /* NOP OUT */
 +	if (error) { return error; }
 +	error = mu_submit(h, 0, false, 0x20);
