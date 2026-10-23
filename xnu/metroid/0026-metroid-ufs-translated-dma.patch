@@ -1237,7 +1237,7 @@ diff --git a/bsd/dev/metroid_ufs_hw.h b/bsd/dev/metroid_ufs_hw.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/metroid_ufs_hw.h
-@@ -0,0 +1,463 @@
+@@ -0,0 +1,470 @@
 +/*
 + * Metroid UFSHCI + SMMUv2 transport. Independently implemented from the
 + * register formats and sequences documented by Nothing's SM8735 Linux tree
@@ -1382,7 +1382,14 @@ new file mode 100644
 +	h->nsmr = id0 & 0xff;
 +	/* Stage-1 output width is ID2.IAS (IPA width), not ID2.OAS. */
 +	h->ips = id2 & 0xf;
-+	if (!h->ncb || h->ncb > 128 || !h->nsmr || h->nsmr > 128 ||
++	/* QSMMUv500 exposes more than 128 SMR/S2CR groups (138 on Metroid).
++	 * Nothing's qsmmuv500_impl retains ID0.NUMSMRG; the generic Qualcomm
++	 * implementation's 128-group workaround is not installed for this IP.
++	 * The 8-bit count bounds both arrays of registers inside GR0: up to
++	 * SMR[254] at 0xbf8 and S2CR[254] at 0xff8. Context-bank bookkeeping
++	 * below is indexed by CBNDX, not by the number of streams.
++	 */
++	if (!h->ncb || h->ncb > 128 || !h->nsmr ||
 +	    h->ns2cb >= h->ncb || h->ips > 5 ||
 +	    (uint64_t)h->cb_base + ((uint64_t)h->ncb << h->pgshift) > 0x100000) {
 +		MU_LOG("METROID SMMU: unsupported geometry: page_shift=%u CB_base=%x contexts=%u stage2_only=%u SMRs=%u IPS=%u aperture=100000\n",
