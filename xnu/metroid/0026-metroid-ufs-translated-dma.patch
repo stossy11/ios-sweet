@@ -1237,7 +1237,7 @@ diff --git a/bsd/dev/metroid_ufs_hw.h b/bsd/dev/metroid_ufs_hw.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/metroid_ufs_hw.h
-@@ -0,0 +1,486 @@
+@@ -0,0 +1,496 @@
 +/*
 + * Metroid UFSHCI + SMMUv2 transport. Independently implemented from the
 + * register formats and sequences documented by Nothing's SM8735 Linux tree
@@ -1259,6 +1259,11 @@ new file mode 100644
 +#define MU_SID       0x60u
 +#define MU_ADDR_MASK 0x0000fffffffff000ull
 +#define MU_TIMEOUT_US 5000000u
++/* Nothing arm-smmu.h ARM_SMMU_FSR_FAULT: MULTI, SS and bits 8:1.
++ * Bit 10 (0x400) is not a recognized context fault. Do not infer a valid
++ * fault address from FAR unless an actual fault bit is set.
++ */
++#define MU_SMMU_FSR_FAULT 0xc00001feu
 +#define MU_FATAL_IS ((1u << 2) | (1u << 7) | (1u << 11) | (1u << 16) | (1u << 17) | (1u << 18))
 +
 +struct mu_utrd {
@@ -1321,6 +1326,9 @@ new file mode 100644
 +		MU_LOG("METROID SMMU[%s]: SID=60 SMR[%u]=%08x S2CR=%08x CB=%u SCTLR=%08x FSR=%08x FAR=%08x:%08x FSYNR0=%08x\n",
 +		    stage, h->smr, mu_sr(h, 0x800 + 4 * h->smr), mu_sr(h, 0xc00 + 4 * h->smr),
 +		    h->cb, mu_sr(h, b), mu_sr(h, b + 0x58), mu_sr(h, b + 0x64), mu_sr(h, b + 0x60), mu_sr(h, b + 0x68));
++		MU_LOG("METROID SMMU[%s]: fault_bits=%08x fault_SID=%04x (FAR meaningful only with fault_bits)\n",
++		    stage, mu_sr(h, b + 0x58) & MU_SMMU_FSR_FAULT,
++		    mu_sr(h, h->gr1 + 0x400 + 4 * h->cb) & 0xffff);
 +		MU_LOG("METROID SMMU[%s]: CBAR=%08x CBA2R=%08x TCR=%08x TCR2=%08x TTBR0=%08x:%08x MAIR=%08x:%08x\n",
 +		    stage, mu_sr(h, h->gr1 + 4 * h->cb), mu_sr(h, h->gr1 + 0x800 + 4 * h->cb),
 +		    mu_sr(h, b + 0x30), mu_sr(h, b + 0x10), mu_sr(h, b + 0x24), mu_sr(h, b + 0x20),
@@ -1524,7 +1532,7 @@ new file mode 100644
 +	mu_sw64(h, b + 0x28, 0);
 +	mu_sw(h, b + 0x38, 0xff); /* MAIR0 Attr0: Normal WB */
 +	mu_sw(h, b + 0x3c, 0);
-+	mu_sw(h, b + 0x58, mu_sr(h, b + 0x58));
++	mu_sw(h, b + 0x58, mu_sr(h, b + 0x58) & MU_SMMU_FSR_FAULT);
 +	if ((error = mu_check32(h, h->gr1 + 0x800 + 4 * h->cb, 1, 1, "CBA2R VA64")) ||
 +	    (error = mu_check32(h, h->gr1 + 4 * h->cb, cbar, 3u << 16, "CBAR stage")) ||
 +	    (error = mu_check32(h, b + 0x10, tcr2, 0xf, "TCR2 PA size")) ||
@@ -1615,18 +1623,20 @@ new file mode 100644
 +	mu_w(h, 0x58, 1);
 +	uint64_t start = MU_NOW_US();
 +	while (mu_r(h, 0x58) & 1) {
-+		if ((mu_r(h, 0x20) & MU_FATAL_IS) || mu_sr(h, mu_cb(h, h->cb) + 0x58) ||
-+		    MU_NOW_US() - start >= MU_TIMEOUT_US) {
++		uint32_t is = mu_r(h, 0x20);
++		uint32_t fault = mu_sr(h, mu_cb(h, h->cb) + 0x58) & MU_SMMU_FSR_FAULT;
++		if ((is & MU_FATAL_IS) || fault || MU_NOW_US() - start >= MU_TIMEOUT_US) {
 +			h->failed = true;
 +			mu_dump(h, "timeout/fault");
-+			return ((mu_r(h, 0x20) & MU_FATAL_IS) || mu_sr(h, mu_cb(h, h->cb) + 0x58)) ? EIO : ETIMEDOUT;
++			return ((is & MU_FATAL_IS) || fault) ? EIO : ETIMEDOUT;
 +		}
 +		MU_DELAY(10);
 +	}
 +	MU_BARRIER();
 +	MU_FLUSH(h->pool_pa, MU_DATA);
 +	if (len && !write) { MU_FLUSH(h->pool_pa + MU_DATA, len); }
-+	if ((mu_r(h, 0x20) & MU_FATAL_IS) || mu_sr(h, mu_cb(h, h->cb) + 0x58)) {
++	if ((mu_r(h, 0x20) & MU_FATAL_IS) ||
++	    (mu_sr(h, mu_cb(h, h->cb) + 0x58) & MU_SMMU_FSR_FAULT)) {
 +		h->failed = true; mu_dump(h, "completion-fault"); return EIO;
 +	}
 +	mu_w(h, 0x20, 1); /* acknowledge transfer completion only */
