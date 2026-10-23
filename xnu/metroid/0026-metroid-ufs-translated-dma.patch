@@ -1237,7 +1237,7 @@ diff --git a/bsd/dev/metroid_ufs_hw.h b/bsd/dev/metroid_ufs_hw.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/metroid_ufs_hw.h
-@@ -0,0 +1,450 @@
+@@ -0,0 +1,463 @@
 +/*
 + * Metroid UFSHCI + SMMUv2 transport. Independently implemented from the
 + * register formats and sequences documented by Nothing's SM8735 Linux tree
@@ -1367,6 +1367,7 @@ new file mode 100644
 +{
 +	uint32_t id0 = mu_sr(h, 0x20), id1 = mu_sr(h, 0x24), id2 = mu_sr(h, 0x28);
 +	uint32_t scr0 = mu_sr(h, 0);
++	MU_LOG("METROID SMMU: ID0=%08x ID1=%08x ID2=%08x CR0=%08x\n", id0, id1, id2, scr0);
 +	if (!id0 || id0 == UINT32_MAX || !id1 || id1 == UINT32_MAX || id2 == UINT32_MAX ||
 +	    !(id0 & (1u << 30)) || !(id0 & (1u << 27)) || !(id2 & (1u << 12)) ||
 +	    (scr0 & ((1u << 0) | (1u << 3)))) {
@@ -1383,7 +1384,11 @@ new file mode 100644
 +	h->ips = id2 & 0xf;
 +	if (!h->ncb || h->ncb > 128 || !h->nsmr || h->nsmr > 128 ||
 +	    h->ns2cb >= h->ncb || h->ips > 5 ||
-+	    (uint64_t)h->cb_base + ((uint64_t)h->ncb << h->pgshift) > 0x100000) { return ENOTSUP; }
++	    (uint64_t)h->cb_base + ((uint64_t)h->ncb << h->pgshift) > 0x100000) {
++		MU_LOG("METROID SMMU: unsupported geometry: page_shift=%u CB_base=%x contexts=%u stage2_only=%u SMRs=%u IPS=%u aperture=100000\n",
++		    h->pgshift, h->cb_base, h->ncb, h->ns2cb, h->nsmr, h->ips);
++		return ENOTSUP;
++	}
 +	bool referenced[128] = { false }, used_asid[256] = { false };
 +	uint32_t matches = 0, free_smr = UINT32_MAX;
 +	h->smr = UINT32_MAX;
@@ -1401,7 +1406,11 @@ new file mode 100644
 +		if (h->old_smr != ((1u << 31) | MU_SID)) { return EBUSY; }
 +		if (((h->old_s2cr >> 16) & 3) == 0) {
 +			h->cb = h->old_s2cr & 0xff;
-+			if (h->cb < h->ns2cb || h->cb >= h->ncb) { return ENOTSUP; }
++			if (h->cb < h->ns2cb || h->cb >= h->ncb) {
++				MU_LOG("METROID SMMU: UFS context outside stage-1 range: SMR=%u S2CR=%08x CB=%u stage2_only=%u contexts=%u\n",
++				    h->smr, h->old_s2cr, h->cb, h->ns2cb, h->ncb);
++				return ENOTSUP;
++			}
 +			for (uint32_t i = 0; i < h->nsmr; i++) {
 +				uint32_t s = mu_sr(h, 0x800 + 4 * i), c = mu_sr(h, 0xc00 + 4 * i);
 +				if (i != h->smr && (s & (1u << 31)) && ((c >> 16) & 3) == 0 && (c & 0xff) == h->cb) { return EBUSY; }
@@ -1423,7 +1432,11 @@ new file mode 100644
 +	if (h->cb == UINT32_MAX) { return ENOSPC; }
 +	/* Never replace a context whose stage-2 setup we do not own. */
 +	uint32_t cbar = mu_sr(h, h->gr1 + 4 * h->cb);
-+	if (matches && ((h->old_s2cr >> 16) & 3) == 0 && ((cbar >> 16) & 3) != 1) { return ENOTSUP; }
++	if (matches && ((h->old_s2cr >> 16) & 3) == 0 && ((cbar >> 16) & 3) != 1) {
++		MU_LOG("METROID SMMU: UFS context requires unsupported stage-2 handling: SMR=%u S2CR=%08x CB=%u CBAR=%08x TYPE=%u\n",
++		    h->smr, h->old_s2cr, h->cb, cbar, (cbar >> 16) & 3);
++		return ENOTSUP;
++	}
 +	h->asid = 0;
 +	for (uint32_t i = 1; i < 256; i++) { if (!used_asid[i]) { h->asid = i; break; } }
 +	return h->asid ? 0 : ENOSPC;
