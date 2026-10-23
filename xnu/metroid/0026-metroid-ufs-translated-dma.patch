@@ -1244,7 +1244,7 @@ diff --git a/bsd/dev/metroid_ufs_hw.h b/bsd/dev/metroid_ufs_hw.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/metroid_ufs_hw.h
-@@ -0,0 +1,713 @@
+@@ -0,0 +1,733 @@
 +/*
 + * Metroid UFSHCI + SMMUv2 transport. Independently implemented from the
 + * register formats and sequences documented by Nothing's SM8735 Linux tree
@@ -1888,10 +1888,10 @@ new file mode 100644
 +	return EIO;
 +}
 +
-+/* A clear flag alone does not prove initialization: firmware may never have
-+ * requested it. Require actual SCSI readiness and plausible capacity as well. */
++/* Read-only readiness probe, also usable before management queries for
++ * diagnostics. Its success alone must not authorize firmware takeover. */
 +static int
-+mu_probe_inherited_ready(struct mu_host *h)
++mu_probe_scsi_ready(struct mu_host *h)
 +{
 +	if (h->probe_first > h->probe_last || h->probe_last > 7) { return EINVAL; }
 +	const uint8_t tur[6] = { 0 };
@@ -1901,7 +1901,11 @@ new file mode 100644
 +		int error = EIO;
 +		for (unsigned attempt = 0; attempt < 3; attempt++) {
 +			error = mu_scsi(h, (uint8_t)lun, tur, sizeof(tur), 0, false);
-+			if (!error) { error = mu_scsi(h, (uint8_t)lun, capacity, sizeof(capacity), 32, false); }
++			MU_LOG("METROID UFS: SCSI probe LUN=%u TUR attempt=%u errno=%d\n", lun, attempt + 1, error);
++			if (!error) {
++				error = mu_scsi(h, (uint8_t)lun, capacity, sizeof(capacity), 32, false);
++				MU_LOG("METROID UFS: SCSI probe LUN=%u READ CAPACITY errno=%d\n", lun, error);
++			}
 +			if (error != EAGAIN) { break; }
 +			if (attempt < 2) { MU_DELAY(10000); }
 +		}
@@ -1911,9 +1915,12 @@ new file mode 100644
 +		uint64_t last = (uint64_t)mu_upiu_word(data) << 32 | mu_upiu_word(data + 4);
 +		uint32_t block = mu_upiu_word(data + 8);
 +		if (last == ~(uint64_t)0 || block < 512 || block > 4096 ||
-+		    (block & (block - 1)) || last + 1 > (~(uint64_t)0) / block) { continue; }
-+		h->inherited_ready = true;
-+		MU_LOG("METROID UFS: firmware readiness verified LUN=%u block=%u\n", lun, block);
++		    (block & (block - 1)) || last + 1 > (~(uint64_t)0) / block) {
++			MU_LOG("METROID UFS: SCSI probe LUN=%u invalid capacity last=%08x%08x block=%u\n",
++			    lun, (uint32_t)(last >> 32), (uint32_t)last, block);
++			continue;
++		}
++		MU_LOG("METROID UFS: SCSI readiness verified LUN=%u block=%u\n", lun, block);
 +		return 0;
 +	}
 +	return ENOENT;
@@ -1941,6 +1948,14 @@ new file mode 100644
 +	if (error) { return error; }
 +	error = mu_submit(h, 0, false, 0x20);
 +	if (error) { return error; }
++	/* Probe before READ_FLAG so a rejected management query cannot hide
++	 * whether ordinary read-only SCSI commands work. Never bypass the
++	 * query on success, or submit anything after a transport failure. */
++	MU_LOG("METROID UFS: pre-query SCSI probe begin\n");
++	int readiness = mu_probe_scsi_ready(h);
++	MU_LOG("METROID UFS: pre-query SCSI probe errno=%d transport_failed=%u\n",
++	    readiness, (unsigned)h->failed);
++	if (h->failed || (readiness && readiness != ENOENT)) { return readiness; }
 +	uint8_t flag = 1;
 +	error = mu_query_flag(h, false, &flag);
 +	if (error) { return error; }
@@ -1948,9 +1963,14 @@ new file mode 100644
 +	if (flag) {
 +		error = mu_wait_device_init(h, &flag);
 +		if (error) { return error; }
++		/* Initialization changed state; refresh the earlier evidence. */
++		readiness = mu_probe_scsi_ready(h);
 +	}
-+	error = mu_probe_inherited_ready(h);
-+	if (error != ENOENT || h->failed) { return error; }
++	if (!readiness) {
++		h->inherited_ready = true;
++		return 0;
++	}
++	if (readiness != ENOENT || h->failed) { return readiness; }
 +	/* No proven usable LUN: use the ordinary SET/poll sequence. A rejected
 +	 * SET remains an error; it must never be treated as readiness. */
 +	error = mu_query_flag(h, true, &flag);
