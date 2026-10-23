@@ -1237,7 +1237,7 @@ diff --git a/bsd/dev/metroid_ufs_hw.h b/bsd/dev/metroid_ufs_hw.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/metroid_ufs_hw.h
-@@ -0,0 +1,496 @@
+@@ -0,0 +1,512 @@
 +/*
 + * Metroid UFSHCI + SMMUv2 transport. Independently implemented from the
 + * register formats and sequences documented by Nothing's SM8735 Linux tree
@@ -1317,6 +1317,22 @@ new file mode 100644
 +	MU_LOG("METROID UFS[%s]: IS=%08x HCS=%08x HCE=%08x DBR=%08x RSR=%08x MEMCFG=%08x UTRL=%08x:%08x\n",
 +	    stage, mu_r(h, 0x20), mu_r(h, 0x30), mu_r(h, 0x34), mu_r(h, 0x58),
 +	    mu_r(h, 0x60), mu_r(h, 0x300), mu_r(h, 0x54), mu_r(h, 0x50));
++	if (h->mapped && h->pool) {
++		/* Descriptors were cleaned before submission; no CPU writes occur
++		 * while DMA owns them. Refresh cache lines for diagnostic reads only.
++		 * OCS=invalid with DBR=1 alone does not prove the request was unfetched.
++		 */
++		MU_FLUSH(h->pool_pa, sizeof(struct mu_utrd));
++		MU_FLUSH(h->pool_pa + MU_UCD + offsetof(struct mu_ucd, response), 32);
++		MU_BARRIER();
++		const volatile struct mu_utrd *d = (const volatile struct mu_utrd *)h->pool;
++		const volatile struct mu_ucd *c = (const volatile struct mu_ucd *)(h->pool + MU_UCD);
++		MU_LOG("METROID UFS[%s]: request=%02x cdb=%02x tag=%02x UTRD_OCS=%08x header=%08x UCD=%08x:%08x\n",
++		    stage, c->request[0], c->request[16], c->request[3], d->ocs, d->header, d->ucd_hi, d->ucd_lo);
++		MU_LOG("METROID UFS[%s]: response=%02x flags=%02x lun=%02x tag=%02x result=%02x status=%02x resp_off=%u resp_len=%u prdt_len=%u\n",
++		    stage, c->response[0], c->response[1], c->response[2], c->response[3], c->response[6], c->response[7],
++		    d->response_offset, d->response_len, d->prdt_len);
++	}
 +	MU_LOG("METROID SMMU[%s]: sCR0=%08x GFSR=%08x GFSYNR1=%08x\n",
 +	    stage, mu_sr(h, 0), mu_sr(h, 0x48), mu_sr(h, 0x54));
 +	MU_LOG("METROID UFS[%s]: UECPA=%08x UECDL=%08x UECN=%08x UECT=%08x UECDME=%08x\n",
