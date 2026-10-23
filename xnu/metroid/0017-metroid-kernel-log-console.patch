@@ -281,7 +281,7 @@ diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
 +    PE_state.video.v_depth = 32;
 +    PE_state.video.v_rotate = 0;
 +    PE_state.video.v_scale = 1;
-+    PE_state.video.v_display = 0;
++    PE_state.video.v_display = 0; /* Native verbose text console. */
 +    strlcpy(PE_state.video.v_pixelFormat, "BBBBBBBBGGGGGGGGRRRRRRRR",
 +        sizeof(PE_state.video.v_pixelFormat));
 +    kprintf("METROID FB: takeover %ux%u stride %u at 0x%llx\n",

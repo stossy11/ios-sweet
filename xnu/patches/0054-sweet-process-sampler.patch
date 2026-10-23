@@ -8,24 +8,6 @@
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
---- a/bsd/dev/sweet_ufs.c
-+++ b/bsd/dev/sweet_ufs.c
-@@ -46,6 +46,7 @@
- extern void thread_deallocate(thread_t);
- extern int hz;
- static void sweet_log_start(void);
-+extern void sweet_sample_start(void);
- 
- #define REG_CAP         0x00
- #define REG_IS          0x20
-@@ -597,6 +598,7 @@
- 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
- 	    su.writable ? "read-write" : "read-only", su.dma_pa);
- 	sweet_log_start();
-+	sweet_sample_start();
- 	return 0;
- }
- 
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
 @@ -971,6 +971,56 @@

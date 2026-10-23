@@ -37,6 +37,7 @@
 0038-sweet-applekeystore.patch
 0039-sweet-coredump-default-off.patch
 0040-sweet-iowatchdog.patch
+0041-sweet-hfs-link-notes.patch
 0042-sweet-short-exec-log.patch
 0043-sweet-console-crash-log.patch
 0044-sweet-crash-log-reason.patch
@@ -48,6 +49,9 @@
 0051-sweet-crash-heap-strings.patch
 0052-sweet-hfs-rename-swap.patch
 0053-sweet-crash-scan-springboard.patch
+0054-sweet-process-sampler.patch
+0055-sweet-aks-ext-state-sampler-depth.patch
+0056-sweet-fb-throttled-present.patch
 0057-sweet-no-ext-resolver.patch
 0058-sweet-hid-event-services.patch
 0059-sweet-iphone-identity.patch
@@ -58,3 +62,4 @@
 0069-sweet-ufs-faster.patch
 0070-sweet-pid-hibernate.patch
 0078-sweet-smp-8-cores.patch
+0079-sweet-display-power.patch
