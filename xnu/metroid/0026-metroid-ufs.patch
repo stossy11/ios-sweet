@@ -1040,7 +1040,7 @@ diff --git a/bsd/dev/metroid_ufs_hci.h b/bsd/dev/metroid_ufs_hci.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/metroid_ufs_hci.h
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,117 @@
 +/* Serialized legacy UTP queue with explicit DMA/cache ownership.
 + * v4 supports this transport when CAP.LSDBRemoved=0; MCQ is not required. */
 +/* No timeout retries: a late DMA must never land in a reused command buffer. */
@@ -1146,8 +1146,13 @@ new file mode 100644
 +		}
 +		MU_LOG("METROID UFS: SCSI cmd=%02x LUN=%02x response=%02x status=%02x sense=%02x/%02x/%02x\n",
 +		    cdb[0], lun, c->response[6], c->response[7], key, asc, ascq);
-+		/* UNIT ATTENTION / NOT READY may be retried only after completion. */
-+		return !c->response[6] && c->response[7] == 2 && (key == 6 || key == 2) ? EAGAIN : EIO;
++		/* Retry completed sense conditions, never a transport failure.
++		 * Some devices report target failure (response=1) with the reset
++		 * UNIT ATTENTION after our reset. Consume that notification with
++		 * a bounded retry; it is not successful device activation. */
++		bool reset_attention = c->response[6] == 1 && key == 6 && asc == 0x29 && ascq == 2;
++		return c->response[7] == 2 &&
++		    ((!c->response[6] && (key == 6 || key == 2)) || reset_attention) ? EAGAIN : EIO;
 +	}
 +	/* Refuse short/overflowed reads; stale bounce bytes must not reach BSD. */
 +	if (c->response[1] & 0x60) { return EIO; }
