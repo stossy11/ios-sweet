@@ -292,7 +292,7 @@
  	MT_WR(0x618, 0xffffffffu);
 --- /dev/null
 +++ b/bsd/dev/metroid_touch_gpi.h
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,304 @@
 +/* Polled QUP1 GPI SPI. Register/TRE reference: NothingOSS 031e8669,
 + * msm_gpi{,_mmio.h}, msm_gpi.h, spi-msm-geni.c. No GSI firmware upload.
 + * Only app dynamic GPIIs 1..4; static GPII0 and other EEs are never reset.
@@ -318,7 +318,7 @@
 +struct mg_host {
 +	uint8_t *pool;
 +	uint32_t instance, tx_wp, rx_wp, ev_rp;
-+	unsigned notice_logs;
++	unsigned notice_logs, status_logs;
 +	bool owned, dead, ready;
 +};
 +static struct mg_host mg;
@@ -542,7 +542,7 @@
 +			MG_FLUSH(mg.pool + MG_EV + mg.ev_rp, 16);
 +			memcpy(&e, mg.pool + MG_EV + mg.ev_rp, sizeof(e));
 +			unsigned type = (e.d[3] >> 16) & 255, ch = e.d[3] >> 24;
-+			if (type == 0xff || (type == 0x31 && ch < 2)) {
++			if ((type == 0xff || type == 0x31) && ch < 2) {
 +				/* Nothing's SPI callback logs QUP_NOTIFY and continues.
 +				 * Its words are status/timestamp/count, not a DMA pointer.
 +				 * Stale records are discarded by the GPI core. Neither
@@ -557,14 +557,24 @@
 +				continue;
 +			}
 +			unsigned code = e.d[2] >> 24, len = e.d[2] & 0xffffff;
++			unsigned status = e.d[3] & 0xffff;
++			/* Nothing SPI callbacks reject status == UNEXP_ERR (16),
++			 * not every nonzero peripheral status. In particular the
++			 * observed RX EOT has status 3. Status and completion code
++			 * are separate fields; keep the exact EOT/ownership checks. */
 +			if (type != 0x22 || ch > 1 || code != 2 || len != n ||
-+			    (e.d[3] & 0xffff) || e.d[1] || e.d[0] != (ch ? expected_rx : expected_tx) ||
++			    status == 16 || e.d[1] || e.d[0] != (ch ? expected_rx : expected_tx) ||
 +			    (done & (1u << ch))) {
 +				MG_LOG("METROID TOUCH GPI: rejected event %08x %08x %08x %08x\n", e.d[0], e.d[1], e.d[2], e.d[3]);
 +				MG_LOG("METROID TOUCH GPI: type=%#x ch=%u code=%#x len=%u want=%u status=%#x ptr=%#x:%08x expected-TX=%#x RX=%#x done=%#x\n",
 +				    type, ch, code, len, n, e.d[3] & 0xffff, e.d[1], e.d[0], expected_tx, expected_rx, done);
 +				return mg_stop(type == 0x30 ? "unexpected immediate-data event for buffer DMA" :
 +				    ((type == 0x35 || type == 0x36) ? "unexpected Q2SPI event for SPI" : "bad/stale completion"));
++			}
++			if (status && mg.status_logs < 4) {
++				mg.status_logs++;
++				MG_LOG("METROID TOUCH GPI: EOT ch=%u status=%#x len=%u; vendor SPI status policy\n",
++				    ch, status, len);
 +			}
 +			done |= 1u << ch;
 +			mg.ev_rp = mg_next(mg.ev_rp, MG_EVENT_SIZE);
@@ -573,6 +583,9 @@
 +		mg_w(0x230c0, 1);
 +		if (done == 3 && mg_r(0x20010) == MG_IOVA + MG_TX + tw &&
 +		    mg_r(0x20090) == MG_IOVA + MG_RX + rw && !mg_r(0x20014) && !mg_r(0x20094)) {
++			/* Do not publish RX if a fault arrived with the completions. */
++			if (mg_error() || mg_state(0x20000) != 2 || mg_state(0x20080) != 2)
++				return mg_stop("DMA fault/channel error at completion");
 +			mg.tx_wp = tw; mg.rx_wp = rw;
 +			MG_FLUSH(mg.pool + MG_RX_DATA, 128);
 +			memcpy(rx, mg.pool + MG_RX_DATA, n);
