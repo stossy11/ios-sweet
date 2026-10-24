@@ -146,8 +146,7 @@ jobs:
               optimization = [f for f in flags if f.startswith('-O')]
               if not optimization or optimization[-1] not in ('-O2', '-O3', '-Os', '-Oz'):
                   raise SystemExit('Unoptimized RELEASE flags: ' + str(config))
-              if '-DRELEASE' not in flags and '-DRELEASE=1' not in flags:
-                  raise SystemExit('Missing RELEASE define: ' + str(config))
+              # XNU has DEBUG/DEVELOPMENT options, but no RELEASE define.
               if any(f in flags for f in ('-DDEBUG', '-DDEBUG=1', '-DDEVELOPMENT', '-DDEVELOPMENT=1')):
                   raise SystemExit('Debug/development configuration: ' + str(config))
               print(str(config) + ': RELEASE ' + optimization[-1])
