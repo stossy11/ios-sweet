@@ -63,3 +63,4 @@
 0070-sweet-pid-hibernate.patch
 0078-sweet-smp-8-cores.patch
 0079-sweet-display-power.patch
+0085-sweet-release-boot-args.patch
