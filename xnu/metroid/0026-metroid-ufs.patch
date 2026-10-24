@@ -31,7 +31,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_METROID)
  #include <sys/param.h>
-@@ -43,383 +26,169 @@
+@@ -43,383 +26,183 @@
  #include <libkern/libkern.h>
  
  extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
@@ -88,7 +88,6 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 -#define DMA_UCD         0x1000                  /* 128 byte aligned */
 -#define DMA_BOUNCE      0x4000
 -#define DMA_SIZE        (DMA_BOUNCE + BOUNCE_SIZE)
--
 +/* Keep ownership of slot zero/bounce memory while sleeping. Never block
 + * during early bootstrap, with IRQs masked, or in a non-preemptible context. */
 +static bool
@@ -104,7 +103,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +	thread_block(THREAD_CONTINUE_NULL);
 +	return true;
 +}
-+
+ 
 +static uint64_t
 +metroid_ufs_now_us(void)
 +{
@@ -151,6 +150,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	dev_t bdev;
 -	bool ready;
 +	bool ready, writable, io_failed;
++	bool cache_dirty; /* protected by sweet_ufs_lock; clear only after successful sync */
 +	bool attempted;
 +	int init_error;
  } su;
@@ -179,17 +179,23 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 -
 -static void
 -dma_clean(uint32_t off, uint32_t len)
--{
++static int
++ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ {
 -	clean_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
--}
--
++	int error = mu_scsi(&su.host, su.lun, cdb, cdb_len, len, write);
++	su.io_failed = su.host.failed;
++	return error;
+ }
+ 
 -/*
 - * One SCSI command in slot 0. For write=true the bounce buffer already
 - * holds outgoing bytes; for read the controller fills it on completion.
 - * A timed-out request is never retried or overwritten with a fresh UTRD.
 - */
  static int
- ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+-ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++ufs_rw_blocks(uint64_t lba, uint32_t count, bool write)
  {
 -	if (su.io_failed) {
 -		return EIO;
@@ -311,14 +317,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 -		}
 -		return EIO;
 -	}
-+	int error = mu_scsi(&su.host, su.lun, cdb, cdb_len, len, write);
-+	su.io_failed = su.host.failed;
-+	return error;
-+}
-+
-+static int
-+ufs_rw_blocks(uint64_t lba, uint32_t count, bool write)
-+{
+-	return 0;
 +	if (!count || count > BOUNCE_SIZE / su.blocksize || lba >= su.total_blocks ||
 +	    count > su.total_blocks - lba) { return EINVAL; }
 +	if (write && (!su.writable || lba < su.first_block ||
@@ -328,50 +327,18 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +	cdb[0] = write ? 0x8a : 0x88;
 +	for (unsigned i = 0; i < 8; i++) { cdb[2 + i] = (uint8_t)(lba >> (56 - i * 8)); }
 +	for (unsigned i = 0; i < 4; i++) { cdb[10 + i] = (uint8_t)(count >> (24 - i * 8)); }
++	/* An unsuccessful write may still have reached the device cache. */
++	if (write) { su.cache_dirty = true; }
 +	return ufs_scsi(cdb, sizeof(cdb), count * su.blocksize, write);
-+}
+ }
+-
+-/* READ(10) of count device blocks at lba into the bounce buffer. */
 +static int ufs_read_blocks(uint64_t lba, uint32_t count) { return ufs_rw_blocks(lba, count, false); }
 +static int ufs_write_blocks(uint64_t lba, uint32_t count) { return ufs_rw_blocks(lba, count, true); }
-+static int ufs_sync_cache(void) { const uint8_t cdb[16] = { 0x91 }; return ufs_scsi(cdb, sizeof(cdb), 0, false); }
-+
-+static uint32_t mu_be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
-+static uint64_t mu_be64(const uint8_t *p) { return (uint64_t)mu_be32(p) << 32 | mu_be32(p + 4); }
-+static uint32_t mu_le32(const uint8_t *p) { return (uint32_t)p[3] << 24 | (uint32_t)p[2] << 16 | (uint32_t)p[1] << 8 | p[0]; }
-+static uint64_t mu_le64(const uint8_t *p) { return (uint64_t)mu_le32(p + 4) << 32 | mu_le32(p); }
-+
-+static uint32_t
-+mu_crc32(const uint8_t *data, uint32_t len)
-+{
-+	uint32_t crc = UINT32_MAX;
-+	for (uint32_t i = 0; i < len; i++) {
-+		crc ^= data[i];
-+		for (unsigned bit = 0; bit < 8; bit++) { crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1))); }
-+	}
-+	return ~crc;
-+}
-+
-+static int
-+ufs_capacity(void)
-+{
-+	uint8_t cdb[16] = { 0x9e, 0x10 }; /* READ CAPACITY(16) */
-+	cdb[13] = 32;
-+	int error = ufs_scsi(cdb, sizeof(cdb), 32, false);
-+	if (error) { return error; }
-+	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
-+	uint64_t last = mu_be64(b);
-+	uint32_t block = mu_be32(b + 8);
-+	if (last == UINT64_MAX || block < 512 || block > 4096 || (block & (block - 1)) ||
-+	    last + 1 > UINT64_MAX / block) { return ENOTSUP; }
-+	su.blocksize = block; su.total_blocks = last + 1;
-+	printf("METROID UFS: LUN %u capacity=%llu blocks, blocksize=%u\n",
-+	    su.lun, (unsigned long long)su.total_blocks, block);
- 	return 0;
- }
- 
--/* READ(10) of count device blocks at lba into the bounce buffer. */
--static int
+ static int
 -ufs_read_blocks(uint64_t lba, uint32_t count)
--{
++ufs_sync_cache(void)
+ {
 -	if (lba > UINT32_MAX || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
 -	    count - 1 > UINT32_MAX - lba) {
 -		return EINVAL;
@@ -382,15 +349,34 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 -		0, (uint8_t)(count >> 8), (uint8_t)count, 0
 -	};
 -	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, false);
--}
--
++	if (su.io_failed || su.host.failed) { return EIO; }
++	/* All writes and flushes share the adapter lock. A clean cache needs no
++	 * second device-wide flush; never elide a flush following any write. */
++	if (!su.cache_dirty) { return 0; }
++	const uint8_t cdb[16] = { 0x91 };
++	int error = ufs_scsi(cdb, sizeof(cdb), 0, false);
++	if (!error) { su.cache_dirty = false; }
++	return error;
+ }
+ 
 -/* WRITE(10) to device LBAs: final partition-boundary enforcement. */
 -static int
 -ufs_write_blocks(uint64_t lba, uint32_t count)
--{
++static uint32_t mu_be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
++static uint64_t mu_be64(const uint8_t *p) { return (uint64_t)mu_be32(p) << 32 | mu_be32(p + 4); }
++static uint32_t mu_le32(const uint8_t *p) { return (uint32_t)p[3] << 24 | (uint32_t)p[2] << 16 | (uint32_t)p[1] << 8 | p[0]; }
++static uint64_t mu_le64(const uint8_t *p) { return (uint64_t)mu_le32(p + 4) << 32 | mu_le32(p); }
++
++static uint32_t
++mu_crc32(const uint8_t *data, uint32_t len)
+ {
 -	if (!su.writable || su.io_failed) {
 -		return EROFS;
--	}
++	uint32_t crc = UINT32_MAX;
++	for (uint32_t i = 0; i < len; i++) {
++		crc ^= data[i];
++		for (unsigned bit = 0; bit < 8; bit++) { crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1))); }
+ 	}
 -	if (!su.nblocks || !count || count > BOUNCE_SIZE / UFS_BLOCK ||
 -	    lba > UINT32_MAX || count - 1 > UINT32_MAX - lba ||
 -	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
@@ -406,15 +392,30 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 -		0, (uint8_t)(count >> 8), (uint8_t)count, 0
 -	};
 -	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
--}
--
--static int
++	return ~crc;
+ }
+ 
+ static int
 -ufs_sync_cache(void)
--{
++ufs_capacity(void)
+ {
 -	static const uint8_t cdb[10] = { 0x35 }; /* SYNCHRONIZE CACHE(10) */
 -	return ufs_scsi(cdb, sizeof(cdb), 0, false);
--}
--
++	uint8_t cdb[16] = { 0x9e, 0x10 }; /* READ CAPACITY(16) */
++	cdb[13] = 32;
++	int error = ufs_scsi(cdb, sizeof(cdb), 32, false);
++	if (error) { return error; }
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	uint64_t last = mu_be64(b);
++	uint32_t block = mu_be32(b + 8);
++	if (last == UINT64_MAX || block < 512 || block > 4096 || (block & (block - 1)) ||
++	    last + 1 > UINT64_MAX / block) { return ENOTSUP; }
++	su.blocksize = block; su.total_blocks = last + 1;
++	printf("METROID UFS: LUN %u capacity=%llu blocks, blocksize=%u\n",
++	    su.lun, (unsigned long long)su.total_blocks, block);
++	return 0;
+ }
+ 
  static int
  ufs_find_partition(const char *want)
  {
@@ -473,7 +474,16 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 -		name[c] = 0;
 -		if (strcmp(name, want) != 0) {
 -			continue;
--		}
++		uint8_t used = 0;
++		for (unsigned j = 0; j < 16; j++) { used |= e[j]; }
++		if (!used) { continue; }
++		char name[37]; unsigned j; bool ascii = true;
++		for (j = 0; j < 36; j++) {
++			uint16_t ch = (uint16_t)((uint16_t)e[56 + j * 2] | (uint16_t)e[57 + j * 2] << 8);
++			if (ch > 127) { ascii = false; break; }
++			if (!ch) { break; }
++			name[j] = (char)ch;
+ 		}
 -		uint64_t first, last;
 -		memcpy(&first, e + 32, 8);
 -		memcpy(&last, e + 40, 8);
@@ -483,10 +493,16 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 -		su.first_block = first;
 -		su.nblocks = last - first + 1;
 -		return 0;
--	}
++		name[j] = 0;
++		if (!ascii || strcmp(name, want)) { continue; }
++		uint64_t first = mu_le64(e + 32), last = mu_le64(e + 40);
++		if (found || first < first_usable || last > last_usable || last < first) { return EINVAL; }
++		su.first_block = first; su.nblocks = last - first + 1; found = true;
+ 	}
 -	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
 -	return ENOENT;
--}
++	return found ? 0 : ENOENT;
+ }
 -
 -static int
 -ufs_take_over_host(void)
@@ -535,28 +551,20 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 -	return 0;
 -}
 -
-+		uint8_t used = 0;
-+		for (unsigned j = 0; j < 16; j++) { used |= e[j]; }
-+		if (!used) { continue; }
-+		char name[37]; unsigned j; bool ascii = true;
-+		for (j = 0; j < 36; j++) {
-+			uint16_t ch = (uint16_t)((uint16_t)e[56 + j * 2] | (uint16_t)e[57 + j * 2] << 8);
-+			if (ch > 127) { ascii = false; break; }
-+			if (!ch) { break; }
-+			name[j] = (char)ch;
-+		}
-+		name[j] = 0;
-+		if (!ascii || strcmp(name, want)) { continue; }
-+		uint64_t first = mu_le64(e + 32), last = mu_le64(e + 40);
-+		if (found || first < first_usable || last > last_usable || last < first) { return EINVAL; }
-+		su.first_block = first; su.nblocks = last - first + 1; found = true;
-+	}
-+	return found ? 0 : ENOENT;
-+}
  static int
  sweet_ufs_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
  {
-@@ -483,6 +252,12 @@
+@@ -477,12 +260,22 @@ sweet_ufs_strategy(buf_t bp)
+ 		goto done;
+ 	}
+ 
++	uint64_t lock_start = MU_NOW_US();
+ 	lck_mtx_lock(&sweet_ufs_lock);
++	uint64_t lock_us = MU_NOW_US() - lock_start;
++	su.host.lock_wait_us += lock_us;
++	if (lock_us > su.host.lock_max_us) { su.host.lock_max_us = lock_us; }
+ 	for (uint32_t done = 0; done < count;) {
+ 		uint64_t pos = off + done;
  		uint64_t lba = pos / UFS_BLOCK;
  		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
  		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
@@ -569,7 +577,58 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
  		char *bounce = (char *)(su.dma + DMA_BOUNCE);
  		if (rd) {
-@@ -639,113 +414,95 @@
+@@ -524,6 +317,27 @@ sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+ 	uint64_t *o = (uint64_t *)data;
+ 
+ 	switch (cmd) {
++	case DKIOCISSOLIDSTATE:
++		*f = 1;
++		return 0;
++	case DKIOCGETFEATURES:
++		/* No FUA, barrier-only flush, or UNMAP until implemented end to end. */
++		*f = 0;
++		return 0;
++	case DKIOCGETMAXBYTECOUNTREAD:
++	case DKIOCGETMAXSEGMENTBYTECOUNTREAD:
++		*o = BOUNCE_SIZE;
++		return 0;
++	case DKIOCGETMAXBYTECOUNTWRITE:
++	case DKIOCGETMAXSEGMENTBYTECOUNTWRITE:
++		*o = su.writable && !su.io_failed ? BOUNCE_SIZE : 0;
++		return 0;
++	case DKIOCGETMINSEGMENTALIGNMENTBYTECOUNT:
++		*o = 1; /* buf_map + memcpy impose no physical segment alignment */
++		return 0;
++	case DKIOCGETCOMMANDPOOLSIZE:
++		*f = 1; /* one serialized UTP slot */
++		return 0;
+ 	case DKIOCGETBLOCKSIZE:
+ 		*f = su.secsize;
+ 		return 0;
+@@ -553,7 +367,11 @@ sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+ 		if (!su.writable) {
+ 			return 0;
+ 		}
++		uint64_t lock_start = MU_NOW_US();
+ 		lck_mtx_lock(&sweet_ufs_lock);
++		uint64_t lock_us = MU_NOW_US() - lock_start;
++		su.host.lock_wait_us += lock_us;
++		if (lock_us > su.host.lock_max_us) { su.host.lock_max_us = lock_us; }
+ 		int sync_error = ufs_sync_cache();
+ 		lck_mtx_unlock(&sweet_ufs_lock);
+ 		return sync_error;
+@@ -566,7 +384,9 @@ sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+ 		return 0;
+ 	case DKIOCGETMAXSEGMENTCOUNTREAD:
+ 	case DKIOCGETMAXSEGMENTCOUNTWRITE:
+-		*o = 1;
++		/* HFS bounds I/O by segment count * PAGE_SIZE. We bounce-copy
++		 * mapped buffers; physical pages need not be contiguous. */
++		*o = BOUNCE_SIZE / PAGE_SIZE;
+ 		return 0;
+ 	default:
+ 		return ENOTTY;
+@@ -639,113 +459,97 @@ sweet_ufs_init(void)
  	DTEntry node;
  	uintptr_t const *reg = NULL;
  	unsigned int size = 0;
@@ -639,13 +698,15 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +		su.host.reset = ml_io_map(0xf1ca000, 0x1000);
 +		if (!su.host.phy || !su.host.gcc || !su.host.reset) { return ENOMEM; }
 +	}
-+	uint32_t busy = 0, hs = 0, stats = 0;
++	uint32_t busy = 0, hs = MU_DEFAULT_HS_GEAR, stats = 0;
 +	PE_parse_boot_argn("ufsbusy", &busy, sizeof(busy));
 +	PE_parse_boot_argn("ufshs", &hs, sizeof(hs));
 +	PE_parse_boot_argn("ufsstats", &stats, sizeof(stats));
 +	if (busy > 1 || hs > 3 || stats > 1) { return EINVAL; }
++	/* Include any inherited cache state in the first explicit sync. */
++	su.cache_dirty = true;
 +	su.host.poll_only = busy != 0; su.host.target_gear = hs; su.host.stats = stats != 0;
-+	printf("METROID UFS v4 (NOS031e8669): translated DMA; UFSHCI legacy transport; CAP=%08x VER=%08x\n",
++	printf("METROID UFS v5 (NOS031e8669): translated DMA; UFSHCI legacy transport; CAP=%08x VER=%08x\n",
 +	    mu_r(&su.host, 0), mu_r(&su.host, 8));
 +	printf("METROID UFS: completion=%s HS-gear-cap=%u stats=%u\n",
 +	    busy ? "poll" : "spin/sleep", hs, stats);
@@ -662,6 +723,14 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 -	}
 -	su.dma_pa = ptoa_64(pn);
 -	su.lun = 0;
+-	su.secsize = DEV_BSIZE;
+-
+-	lck_mtx_lock(&sweet_ufs_lock);
+-	error = ufs_take_over_host();
+-	if (!error) {
+-		static const uint8_t tur[6] = { 0x00 };
+-		/* The first command after the bootloader may report a unit attention. */
+-		for (int i = 0; i < 3; i++) {
 +	if (!pn) { return ENOMEM; }
 +	su.host.pool = (uint8_t *)su.dma; su.host.pool_pa = ptoa_64(pn);
 +	/* Validate every CPU page; table pages are ordinary pinned RAM too. */
@@ -683,27 +752,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +		su.lun = (uint8_t)candidate;
 +		const uint8_t tur[6] = { 0 };
 +		for (unsigned retry = 0; retry < 10; retry++) {
-+			error = ufs_scsi(tur, sizeof(tur), 0, false);
-+			if (error != EAGAIN) { break; }
-+			delay(10000);
-+		}
-+		if (!error) { error = ufs_capacity(); }
-+		if (!error) { error = ufs_find_partition(want); }
-+		if (!error) { found_error = 0; break; }
-+		if (su.host.failed) { return error; }
-+		if (explicit_lun) { return error; }
-+		if (error != EIO && error != EAGAIN && error != ENOENT) { found_error = error; }
-+	}
-+	if (found_error) { return found_error; }
- 	su.secsize = DEV_BSIZE;
--
--	lck_mtx_lock(&sweet_ufs_lock);
--	error = ufs_take_over_host();
--	if (!error) {
--		static const uint8_t tur[6] = { 0x00 };
--		/* The first command after the bootloader may report a unit attention. */
--		for (int i = 0; i < 3; i++) {
--			error = ufs_scsi(tur, sizeof(tur), 0, false);
+ 			error = ufs_scsi(tur, sizeof(tur), 0, false);
 -			if (!error || error == ETIMEDOUT)
 -				break;  /* never reuse a still-active UTRD after a timeout */
 -		}
@@ -727,7 +776,9 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 -           strcmp(want, "userdata") != 0) {
 -			printf("METROID UFS: write opt-in rejected; require ufsrw=1");
 -			return EPERM;
--		}
++			if (error != EAGAIN) { break; }
++			delay(10000);
+ 		}
 -		if (su.first_block < 2 || su.first_block > UINT32_MAX ||
 -		    !su.nblocks || su.nblocks - 1 > UINT32_MAX - su.first_block) {
 -			printf("METROID UFS: writable partition outside READ(10)/WRITE(10) range\n");
@@ -736,6 +787,15 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 -		su.writable = true;
 -	}
 -
++		if (!error) { error = ufs_capacity(); }
++		if (!error) { error = ufs_find_partition(want); }
++		if (!error) { found_error = 0; break; }
++		if (su.host.failed) { return error; }
++		if (explicit_lun) { return error; }
++		if (error != EIO && error != EAGAIN && error != ENOENT) { found_error = error; }
++	}
++	if (found_error) { return found_error; }
++	su.secsize = DEV_BSIZE;
  	su.bmajor = bdevsw_add(-1, &sweet_ufs_bdevsw);
 -	if (su.bmajor < 0) {
 -		return ENXIO;
@@ -761,7 +821,7 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	return 0;
  }
  
-@@ -756,7 +513,10 @@
+@@ -756,7 +560,10 @@ int
  sweet_ufs_rootdev(dev_t *dev)
  {
  	if (!su.ready) {
@@ -777,7 +837,7 @@ new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/metroid_ufs.h
 @@ -0,0 +1,15 @@
-+/* Metroid UFS v4. Nothing SM8735 kernel031e8669 is the platform/protocol
++/* Metroid UFS v5. Nothing SM8735 kernel031e8669 is the platform/protocol
 + * reference. Caller provides serialized access, permanent contiguous memory,
 + * MMIO/cache/time hooks, and the firmware-supplied external power contract.
 + * Files are ordered by dependency; no global Linux reset/driver state is used.
@@ -796,7 +856,7 @@ diff --git a/bsd/dev/metroid_ufs_base.h b/bsd/dev/metroid_ufs_base.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/metroid_ufs_base.h
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,164 @@
 +/* UFSHCI v4 legacy-queue definitions, DMA ownership and diagnostics. */
 +#define MU_POOL_SIZE 0x104000u
 +#define MU_DATA      0x4000u
@@ -807,6 +867,7 @@ new file mode 100644
 +#define MU_IOVA      0x40000000ull
 +#define MU_SID       0x60u
 +#define MU_ADDR_MASK 0x0000fffffffff000ull
++#define MU_DEFAULT_HS_GEAR 3u /* capability-capped; ufshs=0 retains PWM */
 +#define MU_TIMEOUT_US 5000000u
 +#define MU_DEVICE_WLUN 0xd0u
 +#define MU_DEVICE_ACTIVE_TIMEOUT_US 10000000u /* Nothing START STOP: 10 * HZ */
@@ -839,6 +900,9 @@ new file mode 100644
 +_Static_assert(offsetof(struct mu_ucd, response) == 512, "response offset");
 +_Static_assert(offsetof(struct mu_ucd, prdt) == 1024, "PRDT offset");
 +
++enum mu_io_kind { MU_IO_READ, MU_IO_WRITE, MU_IO_SYNC, MU_IO_OTHER, MU_IO_KINDS };
++struct mu_io_stats { uint64_t calls, errors, bytes, us, max_us; };
++
 +enum mu_state { MU_OFF, MU_DMA_READY, MU_LINK_READY, MU_DEVICE_READY, MU_IO_FAILED };
 +struct mu_host {
 +	uintptr_t regs, smmu, phy, gcc, reset;
@@ -853,6 +917,8 @@ new file mode 100644
 +	uint16_t device_spec, manufacturer;
 +	uint32_t target_gear;
 +	uint64_t commands, read_bytes, write_bytes, service_us, max_us, sleeps;
++	uint64_t scsi_calls, slow_calls, lock_wait_us, lock_max_us;
++	struct mu_io_stats io[MU_IO_KINDS];
 +	enum mu_state state;
 +	bool mapped, failed, configured, poll_only, stats;
 +};
@@ -1072,7 +1138,7 @@ diff --git a/bsd/dev/metroid_ufs_hci.h b/bsd/dev/metroid_ufs_hci.h
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/metroid_ufs_hci.h
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,177 @@
 +/* Serialized legacy UTP queue with explicit DMA/cache ownership.
 + * v4 supports this transport when CAP.LSDBRemoved=0; MCQ is not required. */
 +/* No timeout retries: a late DMA must never land in a reused command buffer. */
@@ -1154,12 +1220,7 @@ new file mode 100644
 +	uint64_t service = MU_NOW_US() - service_start;
 +	h->service_us += service;
 +	if (service > h->max_us) { h->max_us = service; }
-+	if (h->stats && !(h->commands % 1024)) {
-+		MU_LOG("METROID UFS stats: transport completions=%llu read-bytes=%llu write-bytes=%llu service-us=%llu max-us=%llu sleeps=%llu\n",
-+		    (unsigned long long)h->commands, (unsigned long long)h->read_bytes,
-+		    (unsigned long long)h->write_bytes, (unsigned long long)h->service_us,
-+		    (unsigned long long)h->max_us, (unsigned long long)h->sleeps);
-+	}
++
 +	return 0;
 +}
 +
@@ -1176,7 +1237,7 @@ new file mode 100644
 +}
 +
 +static int
-+mu_scsi(struct mu_host *h, uint8_t lun, const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++mu_scsi_exec(struct mu_host *h, uint8_t lun, const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
 +{
 +	if (h->failed) { return EIO; }
 +	if (!cdb || cdb_len > 16 || !cdb_len || len > MU_BOUNCE) { return EINVAL; }
@@ -1215,6 +1276,45 @@ new file mode 100644
 +	/* Refuse short/overflowed reads; stale bounce bytes must not reach BSD. */
 +	if (c->response[1] & 0x60) { return EIO; }
 +	return 0;
++}
++
++/* Record SCSI outcomes after status/residual validation, separately from
++ * transport completions. Slow writes and zero-byte syncs must be distinguishable. */
++static int
++mu_scsi(struct mu_host *h, uint8_t lun, const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++{
++	uint64_t start = MU_NOW_US();
++	int error = mu_scsi_exec(h, lun, cdb, cdb_len, len, write);
++	uint8_t op = cdb && cdb_len ? cdb[0] : 0xff;
++	unsigned kind = op == 0x88 ? MU_IO_READ : op == 0x8a ? MU_IO_WRITE :
++	    op == 0x91 ? MU_IO_SYNC : MU_IO_OTHER;
++	struct mu_io_stats *io = &h->io[kind];
++	uint64_t us = MU_NOW_US() - start;
++	io->calls++; io->errors += error != 0; io->us += us;
++	if (!error) { io->bytes += len; }
++	if (us > io->max_us) { io->max_us = us; }
++	h->scsi_calls++;
++	if (h->stats && us >= 100000) {
++		h->slow_calls++;
++		/* Bound framebuffer logging even when every request is slow. */
++		if (h->slow_calls <= 4 || !(h->slow_calls & (h->slow_calls - 1))) {
++			MU_LOG("METROID UFS slow: cdb=%02x bytes=%u us=%llu error=%d slow-count=%llu\n",
++			    op, len, (unsigned long long)us, error, (unsigned long long)h->slow_calls);
++		}
++	}
++	if (h->stats && !(h->scsi_calls % 1024)) {
++		MU_LOG("METROID UFS stats: lock-wait-us=%llu lock-max-us=%llu sleeps=%llu\n",
++		    (unsigned long long)h->lock_wait_us, (unsigned long long)h->lock_max_us,
++		    (unsigned long long)h->sleeps);
++		for (unsigned i = 0; i < MU_IO_KINDS; i++) {
++			const struct mu_io_stats *v = &h->io[i];
++			MU_LOG("METROID UFS stats %s: calls=%llu errors=%llu ok-bytes=%llu service-us=%llu max-us=%llu\n",
++			    i == MU_IO_READ ? "read" : i == MU_IO_WRITE ? "write" : i == MU_IO_SYNC ? "sync" : "other",
++			    (unsigned long long)v->calls, (unsigned long long)v->errors,
++			    (unsigned long long)v->bytes, (unsigned long long)v->us, (unsigned long long)v->max_us);
++		}
++	}
++	return error;
 +}
 diff --git a/bsd/dev/metroid_ufs_niobe.h b/bsd/dev/metroid_ufs_niobe.h
 new file mode 100644
@@ -1604,7 +1704,7 @@ new file mode 100644
 +	MU_LOG("METROID UFS: link ready PCS=%08x HCS=%08x lanes=%u\n", MU_READ32(h->phy + 0x5a8), mu_r(h, 0x30), connected);
 +	return 0;
 +}
-+/* Explicit bring-up option only: external supplies and interconnect votes are
++/* High-speed G1..G3: external supplies and interconnect votes are
 + * still inherited. Linux's ufshcd_change_power_mode + QCOM PRE/POST_CHANGE,
 + * capped at G3; G4/G5 adaptation and device tuning remain unimplemented.
 + * No fallback after mutation: an uncertain link must never service disk I/O. */
