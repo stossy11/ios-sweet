@@ -1,3 +1,10 @@
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -12,3 +12,4 @@
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
++iokit/Kernel/arm/MetroidUSBEthernet.cpp                          optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
 @@ -108,6 +108,7 @@
@@ -21,7 +28,7 @@
  
 --- /dev/null
 +++ b/bsd/dev/metroid_usb.c
-@@ -0,0 +1,926 @@
+@@ -0,0 +1,942 @@
 +/* Metroid/Nothing Phone (3) CDC-ECM USB Ethernet.
 + * Reuses the repository's Redmi DWC3/ECM implementation (0072-0076,0081),
 + * adapted to Tuna clocks, inherited eUSB2 PHY and stream0x40 SMMUv2 DMA.
@@ -60,6 +67,8 @@
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern kern_return_t thread_terminate(thread_t);
 +void metroid_usb_init(void);
++extern void metroid_usb_iokit_publish(const uint8_t *mac);
++extern void metroid_usb_iokit_link(bool up);
 +static void metroid_usb_gadget_start(vm_offset_t dwc);
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +
@@ -546,6 +555,7 @@
 +{
 +	if (ud.ifp != NULL) {
 +		ifnet_set_flags(ud.ifp, up ? IFF_RUNNING : 0, IFF_RUNNING);
++		metroid_usb_iokit_link(up);
 +		dlil_post_msg(ud.ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
 +	}
 +}
@@ -554,6 +564,18 @@
 +ud_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
 +{
 +	switch (cmd) {
++	case SIOCGIFDEVMTU: {
++		struct ifreq *ifr = (struct ifreq *)data;
++		ifr->ifr_devmtu.ifdm_current = (int)ifnet_mtu(ifp);
++		ifr->ifr_devmtu.ifdm_min = 68;
++		ifr->ifr_devmtu.ifdm_max = ETHERMTU;
++		return 0;
++	}
++	case SIOCSIFMTU: {
++		int mtu = ((struct ifreq *)data)->ifr_mtu;
++		if (mtu < 68 || mtu > ETHERMTU) return EINVAL;
++		return ifnet_set_mtu(ifp, (uint32_t)mtu);
++	}
 +	case SIOCGIFMEDIA32:
 +	case SIOCGIFMEDIA64: {
 +		struct ifmediareq *ifmr = (struct ifmediareq *)data;
@@ -666,6 +688,7 @@
 +	ifnet_set_flags(ud.ifp, IFF_UP, IFF_UP | IFF_RUNNING);
 +	printf("METROID USB: en0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
 +	if (err) ud.dead = true;
++	else metroid_usb_iokit_publish(ud_phone_mac);
 +}
 +
 +static void
@@ -1229,4 +1252,200 @@
 +}
 +static inline bool mu_event_count(uint32_t count, uint32_t capacity)
 +{ return !(count&3) && count<=capacity; }
++#endif
+--- /dev/null
++++ b/iokit/Kernel/arm/MetroidUSBEthernet.cpp
+@@ -0,0 +1,193 @@
++/*
++ * IOKit discovery bridge for the already-attached Metroid BSD Ethernet ifnet.
++ * This is NOT Apple's IONetworkingFamily ABI or a second packet driver.
++ * These minimal class names implement the discovery contract consumed by
++ * configd-1241.140.6 SCNetworkInterface.c and Plugins/InterfaceNamer/ifnamer.c.
++ * Do not load IONetworkingFamily alongside this built-in implementation.
++ *
++ * InterfaceNamer requires an openable IONetworkStack even for SelfNamed
++ * interfaces. Its naming commands are never needed for our fixed en0; all
++ * user-client methods/property writes are explicitly unsupported. Packet I/O,
++ * addressing, flags, multicast and media continue through the real BSD ifnet.
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSUnserialize.h>
++#include <pexpert/pexpert.h>
++
++class IONetworkInterface : public IOService {
++    OSDeclareDefaultStructors(IONetworkInterface);
++public:
++    IOReturn setProperties(OSObject *) APPLE_KEXT_OVERRIDE { return kIOReturnUnsupported; }
++};
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++class IOEthernetInterface : public IONetworkInterface {
++    OSDeclareDefaultStructors(IOEthernetInterface);
++};
++OSDefineMetaClassAndStructors(IOEthernetInterface, IONetworkInterface);
++
++class IONetworkStackUserClient : public IOUserClient {
++    OSDeclareDefaultStructors(IONetworkStackUserClient);
++public:
++    IOReturn clientClose(void) APPLE_KEXT_OVERRIDE {
++        terminate();
++        return kIOReturnSuccess;
++    }
++    IOReturn setProperties(OSObject *) APPLE_KEXT_OVERRIDE { return kIOReturnUnsupported; }
++    IOReturn externalMethod(uint32_t, IOExternalMethodArguments *,
++        IOExternalMethodDispatch *, OSObject *, void *) APPLE_KEXT_OVERRIDE {
++        return kIOReturnUnsupported;
++    }
++};
++OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
++
++class IONetworkStack : public IOService {
++    OSDeclareDefaultStructors(IONetworkStack);
++public:
++    IOReturn setProperties(OSObject *) APPLE_KEXT_OVERRIDE { return kIOReturnUnsupported; }
++    IOReturn newUserClient(task_t task, void *security, UInt32 type,
++        OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(IONetworkStack, IOService);
++
++IOReturn IONetworkStack::newUserClient(task_t task, void *security, UInt32 type,
++    OSDictionary *properties, IOUserClient **handler)
++{
++    if (!handler) return kIOReturnBadArgument;
++    *handler = nullptr;
++    if (type != 0) return kIOReturnUnsupported;
++    if (IOUserClient::clientHasPrivilege(task, kIOClientPrivilegeAdministrator)
++        != kIOReturnSuccess) return kIOReturnNotPrivileged;
++    auto client = new IONetworkStackUserClient;
++    if (!client) return kIOReturnNoMemory;
++    if (!client->initWithTask(task, security, type, properties)) {
++        client->release();
++        return kIOReturnNoMemory;
++    }
++    if (!client->attach(this)) {
++        client->release();
++        return kIOReturnError;
++    }
++    if (!client->start(this)) {
++        client->detach(this);
++        client->release();
++        return kIOReturnError;
++    }
++    *handler = client;
++    IOLog("METROID USB IOKIT: IONetworkStack connection opened\n");
++    return kIOReturnSuccess;
++}
++
++/* Retained for the boot lifetime, like the underlying non-detachable ifnet.
++ * The driver's one USB polling thread is the only writer after publication. */
++static IOService *usb_controller;
++static IOEthernetInterface *usb_interface;
++static IONetworkStack *network_stack;
++
++/* Defaults for native SCNetworkService creation; Settings can override them.
++ * Unlike the old helper this never writes configd's dynamic store. */
++static OSDictionary *network_defaults(void)
++{
++    static const char xml[] =
++        "<dict><key>IPv4</key><dict>"
++        "<key>ConfigMethod</key><string>Manual</string>"
++        "<key>Addresses</key><array><string>192.168.7.2</string></array>"
++        "<key>SubnetMasks</key><array><string>255.255.255.0</string></array>"
++        "<key>Router</key><string>192.168.7.1</string>"
++        "</dict><key>DNS</key><dict>"
++        "<key>ServerAddresses</key><array><string>1.1.1.1</string><string>8.8.8.8</string></array>"
++        "</dict></dict>";
++    OSObject *object = OSUnserializeXML(xml);
++    auto result = OSDynamicCast(OSDictionary, object);
++    if (!result && object) object->release();
++    return result;
++}
++
++extern "C" void metroid_usb_iokit_publish(const uint8_t *mac)
++{
++    int enabled = 1;
++    (void)PE_parse_boot_argn("metroidusb_iokit", &enabled, sizeof(enabled));
++    if (!enabled || usb_interface || !mac) return;
++
++    /* IOResources supplies a real IOService-plane ancestor for discovery. */
++    IOService *resources = IOService::getResourceService();
++    if (!resources) {
++        IOLog("METROID USB IOKIT: IOResources unavailable\n");
++        return;
++    }
++    auto controller = new IOService;
++    auto interface = new IOEthernetInterface;
++    auto stack = new IONetworkStack;
++    auto defaults = network_defaults();
++    auto address = OSData::withBytes(mac, 6);
++    bool controller_attached = false, interface_attached = false, stack_attached = false;
++    bool controller_started = false, interface_started = false, stack_started = false;
++    if (!controller || !interface || !stack || !defaults || !address) goto fail;
++    if (!controller->init() || !interface->init() || !stack->init()) goto fail;
++    controller->setName("MetroidUSBEthernetController");
++    interface->setName("en0");
++    stack->setName("IONetworkStack");
++    if (!controller->setProperty("SelfNamed", kOSBooleanTrue) ||
++        !controller->setProperty("IOMACAddress", address) ||
++        !controller->setProperty("IOFeatures", 0ULL, 32) ||
++        !controller->setProperty("IOLinkStatus", 1ULL, 32) ||
++        !controller->setProperty("IOLinkSpeed", 0ULL, 64) ||
++        !controller->setProperty("MetroidDiscoveryBridge", kOSBooleanTrue) ||
++        !interface->setProperty("IOBSDName", "en0") ||
++        !interface->setProperty("IOInterfaceNamePrefix", "en") ||
++        !interface->setProperty("IOInterfaceUnit", 0ULL, 32) ||
++        !interface->setProperty("IOInterfaceType", 6ULL, 32) || /* IFT_ETHER */
++        !interface->setProperty("IOInterfaceState", 1ULL, 32) || /* registered */
++        !interface->setProperty("IOBuiltin", kOSBooleanFalse) ||
++        !interface->setProperty("IOPrimaryInterface", kOSBooleanFalse) ||
++        !interface->setProperty("NetworkConfigurationOverrides", defaults)) goto fail;
++    if (!(controller_attached = controller->attach(resources))) goto fail;
++    if (!(controller_started = controller->start(resources))) goto fail;
++    if (!(interface_attached = interface->attach(controller))) goto fail;
++    if (!(interface_started = interface->start(controller))) goto fail;
++    if (!(stack_attached = stack->attach(resources))) goto fail;
++    if (!(stack_started = stack->start(resources))) goto fail;
++    usb_controller = controller;
++    usb_interface = interface;
++    network_stack = stack;
++    defaults->release();
++    address->release();
++    /* Publish only once the complete hierarchy/properties are available. */
++    controller->registerService();
++    interface->registerService();
++    stack->registerService();
++    IOLog("METROID USB IOKIT: en0 IOEthernetInterface + IONetworkStack published; native configd adoption unverified\n");
++    return;
++fail:
++    if (stack_started) stack->stop(resources);
++    if (stack_attached) stack->detach(resources);
++    if (interface_started) interface->stop(controller);
++    if (interface_attached) interface->detach(controller);
++    if (controller_started) controller->stop(resources);
++    if (controller_attached) controller->detach(resources);
++    if (stack) stack->release();
++    if (interface) interface->release();
++    if (controller) controller->release();
++    if (defaults) defaults->release();
++    if (address) address->release();
++    IOLog("METROID USB IOKIT: publication failed; BSD Ethernet remains available\n");
++}
++
++extern "C" void metroid_usb_iokit_link(bool up)
++{
++    if (!usb_controller) return;
++    usb_controller->setProperty("IOLinkStatus", up ? 3ULL : 1ULL, 32);
++    usb_controller->setProperty("IOLinkSpeed", up ? 480000000ULL : 0ULL, 64);
++    /* configd receives the real KEV_DL_LINK_ON/OFF posted by the BSD driver. */
++}
 +#endif
