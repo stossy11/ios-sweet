@@ -27,11 +27,11 @@
  
  #include "metroid_touch_protocol.h"
 -static vm_offset_t mt_se, mt_gcc, mt_gpio;
-+static vm_offset_t mt_se, mt_gcc, mt_gpio, mt_gpi, mt_qup;
++static vm_offset_t mt_se, mt_gcc, mt_gpio, mt_gpi;
  static unsigned mt_started;
  static uint32_t
  mt_read(vm_offset_t base, unsigned off)
-@@ -36,6 +41,89 @@
+@@ -36,6 +41,87 @@
  #define MT_RD(off) mt_read(mt_se, (off))
  #define MT_WR(off, value) mt_write(mt_se, (off), (value))
  #define MT_DELAY(us) delay(us)
@@ -72,19 +72,20 @@
 +    return false;
 +}
 +static bool mt_dma_init(void) {
-+    /* Both streams are shared across QUP1. Require every inherited GPI
-+     * ring unallocated and every SE idle before replacing translations. */
++    /* Only SE4 is clocked/owned here. Do not probe unrelated SE banks.
++     * A limited apps-ring audit cannot establish shared-domain ownership:
++     * preflight BOTH SIDs before allowing any SMMU writes. */
 +    bool ok=false; metroid_smmu_lock();
-+    if (!mg_select()) goto out;
-+    for (unsigned i=0;i<8;i++) {
-+        uint32_t status=mt_read(mt_qup,i*0x4000+0x40);
-+        uint32_t interface=mt_read(mt_qup,i*0x4000+0x64);
-+        uint32_t mode=mt_read(mt_qup,i*0x4000+0x258);
-+        /* GPI rings are proven quiescent; an unrelated internal SE-DMA
-+         * channel is not owned by this transport, even if GENI is idle.
-+         * Programmed length registers are not an outstanding-DMA counter. */
-+        if ((status&0x1001) || (!(interface&1) && (mode&1))) {
-+            printf("METROID TOUCH DMA: inherited SE%u busy/unowned status=%#x interface=%#x DMA-mode=%#x; stopped\n",i,status,interface,mode);
++    if (!mg_select() || (MT_RD(0x40)&0x1001)) goto out;
++    printf("METROID TOUCH DMA: preflight shared streams\n");
++    vm_offset_t smmu=ml_io_map(0x15000000,0x100000);
++    if (!smmu) goto out;
++    for (unsigned i=0;i<2;i++) {
++        struct md_domain *h=&mt_domains[i];
++        h->smmu=smmu; h->sid=i?0xa3:0xb6;
++        int err=md_choose_context(h);
++        if (err) {
++            printf("METROID TOUCH DMA: SID=%#x preflight failed errno=%d; shared mappings preserved; stopped\n",h->sid,err);
 +            goto out;
 +        }
 +    }
@@ -101,11 +102,8 @@
 +    }
 +    mg.pool=(uint8_t *)mem;
 +    MG_CLEAN(mg.pool,MG_POOL_SIZE);
-+    vm_offset_t smmu=ml_io_map(0x15000000,0x100000);
-+    if (!smmu) goto out;
 +    for (unsigned i=0;i<2;i++) {
 +        struct md_domain *h=&mt_domains[i];
-+        h->smmu=smmu; h->sid=i?0xa3:0xb6;
 +        h->pool=mg.pool; h->pool_pa=pa;
 +        h->tables=(uint64_t *)(mem+MG_POOL_SIZE+i*0x4000);
 +        h->tables_pa=pa+MG_POOL_SIZE+i*0x4000;
@@ -121,19 +119,36 @@
  #include "metroid_touch_spi.h"
  #include "metroid_touch_power.h"
  
-@@ -159,14 +247,17 @@
+@@ -65,7 +151,14 @@
+ 	mt_write(mt_gcc, 0x52008, v | vote);
+ 	if ((mt_read(mt_gcc, 0x52008) & vote) != vote) return false;
+ 	if (!mt_clear(mt_gcc, 0x23000, 1u << 31) ||
+-	    !mt_clear(mt_gcc, 0x23004, 1u << 31) || (MT_RD(0x40) & 0x1001)) return false;
++	    !mt_clear(mt_gcc, 0x23004, 1u << 31) ||
++	    !mt_clear(mt_gcc, 0x183cc, 1u << 31)) {
++		printf("METROID TOUCH: wrapper/SE4 clock halted; stopped\n");
++		return false;
++	}
++	/* Vote readback alone does not mean the SE clock is running. Never
++	 * access SE4 registers before all three branch halt checks complete. */
++	if (MT_RD(0x40) & 0x1001) return false;
+ 
+ 	uint32_t dfs = mt_read(mt_gcc, 0x183f0);
+ 	if (dfs & 1) {
+@@ -159,14 +252,18 @@
  	mt_sleep(delay_s * 1000);
  	mt_gcc = ml_io_map(0x100000, 0x60000);
  	mt_se = ml_io_map(0xa90000, 0x4000);
-+	/* DT GPI reg a00000 minus EE offset10000, per msm_gpi.c. */
-+	mt_gpi = ml_io_map(0x9f0000, 0x70000);
-+	mt_qup = ml_io_map(0xa80000, 0x20000);
++	/* Map exactly the DT resource; register macros use its EE-adjusted base. */
++	mt_gpi = ml_io_map(0xa00000, 0x60000);
++	if (mt_gpi) mt_gpi -= 0x10000;
  	mt_gpio = ml_io_map(0xf100000, 0xc0000);
 -	if (!mt_gcc || !mt_se || !mt_gpio) {
-+	if (!mt_gcc || !mt_se || !mt_gpio || !mt_gpi || !mt_qup) {
++	if (!mt_gcc || !mt_se || !mt_gpio || !mt_gpi) {
  		printf("METROID TOUCH: MMIO mapping failed\n"); goto out;
  	}
  	if (!mt_clocks()) { printf("METROID TOUCH: clock setup failed\n"); goto out; }
++	printf("METROID TOUCH: wrapper/SE4 clocks ready; GENI probe\n");
  	printf("METROID TOUCH: GENI fw=%#x interface=%#x status=%#x\n", MT_RD(0x68), MT_RD(0x64), MT_RD(0x40));
  	if (!mt_spi_init()) {
 -		printf("METROID TOUCH: need idle GENI SPI firmware and FIFO access; stopped\n"); goto out;
@@ -141,7 +156,7 @@
  	}
  	/* Rails first; reset pulse only after both acknowledged power votes. */
  	if (metroid_touch_power_enable("ldob22", 3200) ||
-@@ -188,13 +279,13 @@
+@@ -188,13 +285,13 @@
  	if (!mt_write_register(0xa5, 0) || !mt_write_register(0xd0, 0)) {
  		printf("METROID TOUCH: normal scan setup failed\n"); goto out;
  	}
@@ -218,7 +233,7 @@
  	MT_WR(0x618, 0xffffffffu);
 --- /dev/null
 +++ b/bsd/dev/metroid_touch_gpi.h
-@@ -0,0 +1,260 @@
+@@ -0,0 +1,270 @@
 +/* Polled QUP1 GPI SPI. Register/TRE reference: NothingOSS 031e8669,
 + * msm_gpi{,_mmio.h}, msm_gpi.h, spi-msm-geni.c. No GSI firmware upload.
 + * Only app dynamic GPIIs 1..4; static GPII0 and other EEs are never reset.
@@ -226,6 +241,11 @@
 + */
 +#ifndef METROID_TOUCH_GPI_H
 +#define METROID_TOUCH_GPI_H
++/* Nothing DT: max-num-gpii=12 is capacity, not an access mask.
++ * Apps dynamic1..4, static0; contexts5..11 are never accessed. */
++#define MG_APP_DYNAMIC_MASK 0x1eu
++#define MG_APP_STATIC_MASK 0x1u
++#define MG_APP_ACCESS_MASK (MG_APP_DYNAMIC_MASK | MG_APP_STATIC_MASK)
 +#define MG_RING_SIZE 1024u
 +#define MG_EVENT_SIZE 2048u
 +#define MG_POOL_SIZE 0x4000u
@@ -292,14 +312,16 @@
 +{
 +	unsigned inherited = 12;
 +	/* Reclaim only an app pair explicitly identifying this touchscreen.
-+	 * Audit every other ring before changing even that pair. */
++	 * Audit only DT-authorized apps contexts before changing that pair. */
 +	for (unsigned i = 0; i < 12; i++) {
++		if (!(MG_APP_ACCESS_MASK & (1u << i))) continue;
 +		mg.instance = i;
++		MG_LOG("METROID TOUCH GPI: inspect GPII%u\n", i);
 +		uint32_t a = mg_r(0x20000), b = mg_r(0x20080), e = mg_r(0x21000);
 +		if (a == UINT32_MAX || b == UINT32_MAX || e == UINT32_MAX) return false;
 +		if (!((a | b | e) & 0xf00000u)) continue;
 +		uint32_t sa = mg_r(0x20060), sb = mg_r(0x200e0);
-+		if (i < 1 || i > 4 || inherited != 12 ||
++		if (!(MG_APP_DYNAMIC_MASK & (1u << i)) || inherited != 12 ||
 +		    (sa & 0x1f80ff) != 0x10014 || (sb & 0x1f80ff) != 0x14 ||
 +		    mg_state(0x20000) > 3 || mg_state(0x20080) > 3 || mg_state(0x21000) != 1) {
 +			MG_LOG("METROID TOUCH GPI: inherited GPII%u not an owned SE4 SPI pair; stopped\n", i);
@@ -328,9 +350,10 @@
 +mg_select(void)
 +{
 +	unsigned candidate = 12;
-+	/* These streams are wrapper-wide. Do not replace translations under
-+	 * any inherited ring, even one belonging to a different serial engine. */
++	/* Only inspect apps-owned rings. This cannot prove wrapper-wide idle;
++	 * DMA setup separately refuses to replace inherited live translations. */
 +	for (unsigned i = 0; i < 12; i++) {
++		if (!(MG_APP_ACCESS_MASK & (1u << i))) continue;
 +		mg.instance = i;
 +		uint32_t a = mg_r(0x20000), b = mg_r(0x20080), e = mg_r(0x21000);
 +		if (a == UINT32_MAX || b == UINT32_MAX || e == UINT32_MAX) {
@@ -341,7 +364,7 @@
 +			MG_LOG("METROID TOUCH GPI: inherited GPII%u ch=%#x/%#x ev=%#x; shared DMA stream busy\n", i, a, b, e);
 +			return false;
 +		}
-+		if (i >= 1 && i <= 4 && candidate == 12) candidate = i;
++		if ((MG_APP_DYNAMIC_MASK & (1u << i)) && candidate == 12) candidate = i;
 +	}
 +	mg.instance = candidate;
 +	return candidate < 12;
@@ -385,8 +408,10 @@
 +mg_init(void)
 +{
 +	if (mg.dead || mg.ready) return mg.ready;
++	MG_LOG("METROID TOUCH GPI: inspect apps mask=%#x (dynamic=%#x)\n",
++	    MG_APP_ACCESS_MASK, MG_APP_DYNAMIC_MASK);
 +	if (!mg_quiesce() || !mg_select() || !MG_DMA_INIT()) return false;
-+	/* DMA setup rechecks all rings before attaching either shared stream. */
++	/* DMA setup rechecks apps rings and both shared stream routes. */
 +	mg.owned = true;
 +	mg_w(0x23088, 0); /* poll raw sources; never enable this GIC interrupt */
 +	mg_w(0x23098, 3); mg_w(0x2309c, 1); mg_w(0x230b8, 1);
@@ -481,10 +506,10 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_touch_dma.h
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,248 @@
 +/* Private domains for QUP1 GPI SID b6 and SE SID a3. Based on the
 + * existing Metroid UFS SMMUv2 mapper; caller holds shared attachment lock.
-+ * Only our 16KiB permanent DMA pool is mapped. Firmware contexts remain reserved.
++ * Only our 16KiB permanent DMA pool is mapped. Inherited translating/bypass routes are never replaced.
 + */
 +#define MD_POOL_SIZE MG_POOL_SIZE
 +#define MD_TABLE_SIZE 0x3000u
@@ -524,7 +549,7 @@
 +	return (smr & (1u << 31)) && !(((smr & 0xffff) ^ h->sid) & ~mask);
 +}
 +
-+/* Find the exact touch stream, then allocate a fresh stage-1 context bank.
++/* Find a faulting/unmatched-fault stream, then allocate a fresh context bank.
 + * Every context referenced by firmware, including touch, remains reserved.
 + * No global reset, CLIENTPD change or unrelated-stream TLB invalidation. */
 +static int
@@ -576,8 +601,18 @@
 +		h->old_smr = md_sr(h, 0x800 + 4 * h->smr);
 +		h->old_s2cr = md_sr(h, 0xc00 + 4 * h->smr);
 +		if (h->old_smr != ((1u << 31) | h->sid)) { return EBUSY; }
++		/* TRANS (even a disabled CB) and BYPASS can serve other QUP1
++		 * clients. Apps-only ring checks do not authorize replacing them. */
++		if (((h->old_s2cr >> 16) & 3) != 2) {
++			MD_LOG("METROID TOUCH SMMU: SID=%#x inherited shared S2CR=%08x; need domain reuse, preserving route\n",
++			    h->sid, h->old_s2cr);
++			return EBUSY;
++		}
 +
 +	} else {
++		/* sCR0.USFCFG=1 faults unmatched streams; otherwise they bypass.
++		 * Do not change the behavior of an inherited bypass stream. */
++		if (!(scr0 & (1u << 10))) { return EBUSY; }
 +		if (free_smr == UINT32_MAX) { return ENOSPC; }
 +		h->smr = free_smr;
 +		h->old_smr = md_sr(h, 0x800 + 4 * h->smr);
