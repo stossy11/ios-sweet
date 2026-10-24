@@ -7,8 +7,10 @@ on:
         description: macOS release whose xnu to build (13.5 = xnu-8796, iOS 16 era)
         default: "13.5"
       kernel_config:
-        description: RELEASE / DEVELOPMENT / DEBUG
-        default: DEVELOPMENT
+        description: Kernel configuration (RELEASE is optimized and stripped)
+        type: choice
+        options: [RELEASE, DEVELOPMENT, DEBUG]
+        default: RELEASE
       machine_config:
         description: xnu MACHINE_CONFIG
         default: SWEET
@@ -28,7 +30,7 @@ env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
-  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'RELEASE' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
   METROID_EARLY: ${{ (github.event_name != 'workflow_dispatch' || inputs.metroid_early) && 'true' || 'false' }}
 
@@ -89,7 +91,7 @@ jobs:
           cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
           tar czf buildtree.tgz \
             --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
-            --exclude='kernel.development.*' --exclude='.git' \
+            --exclude='kernel.development.*' --exclude='kernel.release.*' --exclude='kernel.debug.*' --exclude='.git' \
             -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
             -C .. sdk-kernel-platform
           ls -la buildtree.tgz
@@ -121,8 +123,108 @@ jobs:
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
+      - name: Verify optimized RELEASE and strip boot kernel
+        id: release_kernel
+        if: ${{ success() && env.KERNEL_CONFIG == 'RELEASE' }}
+        run: |
+          python3 - <<'PYVERIFY'
+          from pathlib import Path
+          import hashlib, os, shlex, shutil, struct, subprocess, sys
+          sys.path.insert(0, 'tools')
+          from mkpayload import parse_macho
+
+          machine = os.environ['MACHINE_CONFIG'].lower()
+          name = 'kernel.release.' + machine
+          kernel = Path('out') / name
+          if not kernel.is_file():
+              raise SystemExit('Missing RELEASE kernel: ' + str(kernel))
+          configs = list(Path('dxb/build/xnu.obj').glob('RELEASE_ARM64_*/*/RELEASE/.CFLAGS'))
+          if not configs:
+              raise SystemExit('No RELEASE arm64 compiler flags found')
+          for config in configs:
+              flags = shlex.split(config.read_text().strip('\0\n'))
+              optimization = [f for f in flags if f.startswith('-O')]
+              if not optimization or optimization[-1] not in ('-O2', '-O3', '-Os', '-Oz'):
+                  raise SystemExit('Unoptimized RELEASE flags: ' + str(config))
+              if '-DRELEASE' not in flags and '-DRELEASE=1' not in flags:
+                  raise SystemExit('Missing RELEASE define: ' + str(config))
+              if any(f in flags for f in ('-DDEBUG', '-DDEBUG=1', '-DDEVELOPMENT', '-DDEVELOPMENT=1')):
+                  raise SystemExit('Debug/development configuration: ' + str(config))
+              print(str(config) + ': RELEASE ' + optimization[-1])
+
+          symbols = Path('out-symbols')
+          symbols.mkdir(exist_ok=True)
+          unstripped = list(Path('dxb/build').rglob(name + '.unstripped'))
+          if len(unstripped) != 1:
+              raise SystemExit('Expected one unstripped RELEASE image, found ' + str(len(unstripped)))
+          shutil.copy2(unstripped[0], symbols / (name + '.unstripped'))
+          for debug in list(Path('out').glob('*.link')) + list(Path('out').glob('*.dSYM')):
+              shutil.move(str(debug), str(symbols / debug.name))
+
+          def executable_sections(data):
+              ncmds = struct.unpack_from('<I', data, 16)[0]
+              offset, sections = 32, []
+              for _ in range(ncmds):
+                  cmd, size = struct.unpack_from('<II', data, offset)
+                  if cmd == 0x19:  # LC_SEGMENT_64
+                      count = struct.unpack_from('<I', data, offset + 64)[0]
+                      for index in range(count):
+                          section = offset + 72 + 80 * index
+                          address, length, fileoff = struct.unpack_from('<QQI', data, section + 32)
+                          flags = struct.unpack_from('<I', data, section + 64)[0]
+                          if flags & 0x80000400:  # instruction section
+                              sections.append((data[section:section + 32], address, length,
+                                  hashlib.sha256(data[fileoff:fileoff + length]).digest()))
+                  offset += size
+              if not sections:
+                  raise SystemExit('No executable kernel sections found')
+              return sections
+
+          before_data = kernel.read_bytes()
+          before = parse_macho(before_data)
+          stripped = kernel.with_name(name + '.stripped')
+          subprocess.run(['xcrun', 'strip', '-S', '-x', str(kernel), '-o', str(stripped)], check=True)
+          after_data = stripped.read_bytes()
+          after = parse_macho(after_data)
+          if executable_sections(before_data) != executable_sections(after_data):
+              raise SystemExit('Stripping changed executable kernel sections')
+          if before['entry'] is None or before['entry'] != after['entry']:
+              raise SystemExit('Stripping lost/changed LC_UNIXTHREAD entry')
+          if before['cputype'] != after['cputype'] or before['cpusub'] != after['cpusub']:
+              raise SystemExit('Stripping changed architecture')
+          if machine == 'sweet' and (after['cputype'] != 0x100000c or after['cpusub'] != 0):
+              raise SystemExit('SWEET requires plain arm64')
+          data = stripped.read_bytes()
+          _, _, _, _, ncmds, _, _, _ = struct.unpack_from('<8I', data)
+          offset = 32
+          for _ in range(ncmds):
+              cmd, size = struct.unpack_from('<II', data, offset)
+              if cmd == 2:  # LC_SYMTAB: no STAB debug or local named symbols.
+                  symoff, count, stroff, strsize = struct.unpack_from('<4I', data, offset + 8)
+                  for index in range(count):
+                      string, kind, section, desc, value = struct.unpack_from('<IBBHQ', data, symoff + index * 16)
+                      if kind & 0xe0 or (string and not (kind & 1)):
+                          raise SystemExit('Debug/local symbol remains after RELEASE strip')
+              offset += size
+          stripped.replace(kernel)
+          with Path('out/SHA256SUMS').open('w') as checksum:
+              for image in sorted(Path('out').glob('kernel.*')):
+                  if image.is_file():
+                      checksum.write(hashlib.sha256(image.read_bytes()).hexdigest() + '  ' + image.name + '\n')
+          print('PASS: optimized RELEASE kernel, local/debug symbols stripped, boot entry retained')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('verified=true\n')
+          PYVERIFY
+
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ success() && env.KERNEL_CONFIG == 'RELEASE' && steps.release_kernel.outputs.verified == 'true' }}
+        with:
+          name: xnu-symbols
+          path: out-symbols/
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ success() && (env.KERNEL_CONFIG != 'RELEASE' || steps.release_kernel.outputs.verified == 'true') }}
         with:
           name: xnu-kernel
           path: out/
