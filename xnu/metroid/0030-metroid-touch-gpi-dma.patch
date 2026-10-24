@@ -135,7 +135,66 @@
  
  	uint32_t dfs = mt_read(mt_gcc, 0x183f0);
  	if (dfs & 1) {
-@@ -159,14 +252,18 @@
+@@ -95,17 +188,49 @@
+ static bool
+ mt_pin(unsigned pin, unsigned mux, unsigned drive, bool output, bool high)
+ {
+-	/* tuna TLMM GPIO registers start at TLMM+0x100000, not the old Redmi tile. */
++	/* tuna: GPIO_CTL = TLMM + 0x100000 + pin*0x1000. */
+ 	unsigned off = pin * 0x1000;
+-	uint32_t cfg = mt_read(mt_gpio, off);
+-	if (cfg == 0xffffffffu) return false;
+-	/* EGPIO ownership belongs to firmware: don't drive a remotely owned pad. */
+-	if ((cfg & (1u << 11)) && !(cfg & (1u << 12))) return false;
+-	if (output) mt_write(mt_gpio, off + 4,
+-	    (mt_read(mt_gpio, off + 4) & ~2u) | (high ? 2u : 0));
+-	cfg = (cfg & ~0x3ffu) | (mux << 2) | (drive << 6) | (output ? 0x200 : 0);
++	uint32_t before = mt_read(mt_gpio, off);
++	if (before == UINT32_MAX) {
++		printf("METROID TOUCH GPIO: pin%u unreadable CTL=%#x\n", pin, before);
++		return false;
++	}
++	/* Nothing pinctrl-msm.c claims EGPIO-capable pads when selecting a
++	 * local mux. EGPIO_PRESENT is capability, not a prohibition on claim.
++	 * Keep output disabled until local ownership and the latch are verified. */
++	uint32_t cfg = (before & ~0x3ffu) | (mux << 2) | (drive << 6);
++	uint32_t mask = 0x3ffu;
++	if (before & (1u << 11)) { cfg |= 1u << 12; mask |= 1u << 12; }
+ 	mt_write(mt_gpio, off, cfg);
+-	return (mt_read(mt_gpio, off) & 0x3ff) == (cfg & 0x3ff);
++	uint32_t got = mt_read(mt_gpio, off);
++	if (got == UINT32_MAX || ((got ^ cfg) & mask)) {
++		printf("METROID TOUCH GPIO: pin%u mux/ownership failed CTL before=%#x want=%#x got=%#x mask=%#x\n",
++		    pin, before, cfg, got, mask);
++		return false;
++	}
++	if (output) {
++		uint32_t io = mt_read(mt_gpio, off + 4);
++		if (io == UINT32_MAX) {
++			printf("METROID TOUCH GPIO: pin%u unreadable IN_OUT=%#x\n", pin, io);
++			return false;
++		}
++		uint32_t latch = (io & ~2u) | (high ? 2u : 0);
++		mt_write(mt_gpio, off + 4, latch);
++		io = mt_read(mt_gpio, off + 4);
++		if (io == UINT32_MAX || ((io ^ latch) & 2)) {
++			printf("METROID TOUCH GPIO: pin%u output latch failed want=%#x got=%#x\n", pin, latch, io);
++			return false;
++		}
++		cfg |= 1u << 9;
++		mt_write(mt_gpio, off, cfg);
++		got = mt_read(mt_gpio, off);
++		if (got == UINT32_MAX || ((got ^ cfg) & mask)) {
++			printf("METROID TOUCH GPIO: pin%u output enable failed want=%#x got=%#x mask=%#x\n",
++			    pin, cfg, got, mask);
++			return false;
++		}
++	}
++	return true;
+ }
+ static bool
+ mt_read_register(uint8_t reg, uint8_t *data, unsigned n)
+@@ -159,14 +284,18 @@
  	mt_sleep(delay_s * 1000);
  	mt_gcc = ml_io_map(0x100000, 0x60000);
  	mt_se = ml_io_map(0xa90000, 0x4000);
@@ -156,7 +215,7 @@
  	}
  	/* Rails first; reset pulse only after both acknowledged power votes. */
  	if (metroid_touch_power_enable("ldob22", 3200) ||
-@@ -188,13 +285,13 @@
+@@ -188,13 +317,13 @@
  	if (!mt_write_register(0xa5, 0) || !mt_write_register(0xd0, 0)) {
  		printf("METROID TOUCH: normal scan setup failed\n"); goto out;
  	}
