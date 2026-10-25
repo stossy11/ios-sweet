@@ -15,19 +15,24 @@
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
---- a/bsd/kern/bsd_init.c
-+++ b/bsd/kern/bsd_init.c
-@@ -871,5 +871,10 @@
- #endif
- #endif /* NETWORKING */
-+#if defined(ARM64_BOARD_CONFIG_SWEET)
-+	extern void metroid_gpu_init(void);
-+	metroid_gpu_init();
-+#endif
-+
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -30,5 +30,6 @@
+ extern "C" uint64_t mach_absolute_time(void);
+ extern "C" void metroid_touch_init(void);
++extern "C" void metroid_gpu_init(void);
  
- 	bsd_init_kprintf("calling inittodr\n");
- 	inittodr(0);
+ /* One open client: the user client and its event callback. */
+ class IOHIDEventServiceClient : public OSObject {
+@@ -431,6 +432,8 @@
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("METROID HID: touch registered 1260x2800\n");
++	/* Complete GPU diagnostics before touch starts using the shared RPMh owner. */
++	metroid_gpu_init();
+ 	metroid_touch_init();
+ 	return true;
+ }
 --- a/bsd/dev/metroid_touch_power.h
 +++ b/bsd/dev/metroid_touch_power.h
 @@ -334,3 +334,5 @@
@@ -38,7 +43,7 @@
 +#include "metroid_gpu_rpmh.h"
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu.c
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,155 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Metroid Adreno825 hardware bring-up entry point. metroidgpu=1 reads ONLY
 + * the GPU clock-controller registers below. metroidgpu=2 attempts a cold
@@ -58,6 +63,7 @@
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern void ml_io_unmap(vm_offset_t, vm_size_t);
 +void metroid_gpu_init(void);
++static unsigned mg_started;
 +
 +struct mg_hardware { vm_offset_t cc, gcc; };
 +static uint32_t mg_read(void *context, enum mg_bus bus, uint32_t offset)
@@ -135,6 +141,8 @@
 +        printf("METROID GPU: unsupported mode/platform; disabled\n");
 +        return;
 +    }
++    /* IOKit can retry service startup. Never repeat a partial hardware test. */
++    if (__atomic_exchange_n(&mg_started, 1, __ATOMIC_ACQUIRE)) return;
 +    if (mode == 3) { mg_payload_check(); return; }
 +    /* Each offset is from Nothing's drivers/clk/qcom/gpucc-tuna.c.
 +     * Do not probe GX, CM3, TCM or SMMU registers before power/clock bring-up:
