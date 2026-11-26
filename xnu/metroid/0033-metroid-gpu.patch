@@ -4674,7 +4674,7 @@
 +{ return mg_smmu_attach_stream(io, s, t, 5); }
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_start.c
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,135 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Cold Gen8.6.0 GMU startup through HFI controller ready, from Nothing
 + * 031e8669eb19 adreno_gen8_gmu.c / adreno-gpulist.h / qcom_scm.c.
@@ -4684,6 +4684,9 @@
 +#define RESET 0x1f800u
 +#define RESULT 0x1f81cu
 +#define HFI_STATUS 0x1f980u
++/* Gen8.6.0 device readback exposes AO interrupt mask bits 0..6. Keep the
++ * vendor all-ones write, but do not require reserved upper bits to latch. */
++#define AO_HOST_INTERRUPT_MASK_BITS 0x7fu
 +
 +int mg_secure_cx_init(mg_scm_call call, void *context, struct mg_scm_result *result)
 +{
@@ -4779,8 +4782,9 @@
 +    io->write(io->context, 0x1f993, UINT32_MAX);
 +    if (rd(io,s,0x1f993) != UINT32_MAX) { ret = MG_IO; goto fail; }
 +    io->write(io->context, 0x1f991, UINT32_MAX);
-+    io->write(io->context, 0x23b06, UINT32_MAX); /* AO mask: 1 masks */
-+    if (rd(io,s,0x23b06) != UINT32_MAX) { ret = MG_IO; goto fail; }
++    /* AO mask: 1 masks; all-ones readback is inaccessible, not a valid mask. */
++    ret = write_check(io,s,0x23b06,UINT32_MAX,AO_HOST_INTERRUPT_MASK_BITS);
++    if (ret) goto fail;
 +    io->write(io->context, 0x23b04, UINT32_MAX); /* AO pending W1C */
 +    WRITE(0x27833, 0); /* CX_MISC mask: 1 enables */
 +    io->write(io->context, 0x27831, UINT32_MAX);
