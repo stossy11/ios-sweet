@@ -44,6 +44,22 @@
  	metroid_touch_init();
  	return true;
  }
+--- a/osfmk/arm/io_map.c
++++ b/osfmk/arm/io_map.c
+@@ -62,7 +62,13 @@
+ 
+ extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* Shared permanent device apertures: UFS, GPU, touch, USB and clocks.
++ * Reserve virtual address space; physical device pages are mapped on demand. */
++#define IO_MAP_SIZE            (32ul << 20)
++#else
+ #define IO_MAP_SIZE            (8ul << 20)
++#endif
+ 
+ __startup_data static struct mach_vm_range io_range;
+ static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
 @@ -6881,7 +6881,7 @@
