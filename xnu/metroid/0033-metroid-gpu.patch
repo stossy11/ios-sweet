@@ -1321,7 +1321,7 @@
 +    uint32_t b = d->cb_base+(d->cb << d->page_shift);
 +    uint64_t ttbr = pt | ((uint64_t)asid << 48);
 +    uint32_t ctl = io->read(io->context,b), fsr = io->read(io->context,b+0x58);
-+    return ctl != UINT32_MAX && (ctl & 0x10e7) == 0x1027 && fsr != UINT32_MAX && !(fsr & 0xc00001fe) &&
++    return ctl != UINT32_MAX && (ctl & 0xe7) == 0x27 && fsr != UINT32_MAX && !(fsr & 0xc00001fe) &&
 +        io->read(io->context,0x800+d->smr*4) == 0x80000000 && io->read(io->context,0xc00+d->smr*4) == cb &&
 +        io->read(io->context,b+0x20) == (uint32_t)ttbr && io->read(io->context,b+0x24) == (uint32_t)(ttbr >> 32);
 +}
@@ -4461,7 +4461,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_smmu.c
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,210 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * SMMUv2 stage-1 stream-5 setup. Register ABI: Nothing 031e8669eb19
 + * drivers/iommu/arm/arm-smmu/{arm-smmu.h,arm-smmu.c}, io-pgtable-arm.c.
@@ -4652,9 +4652,11 @@
 +    io->write(io->context,b + 0x58,fsr & 0xc00001feu); /* W1C */
 +    ret = check(io,s,b + 0x58,0,0xc00001feu); if (ret) goto fail;
 +    ret = sync(io, s, s->asid); if (ret) goto fail;
-+    /* Fault abort, no stall and no unhandled context interrupt. */
++    /* Fault abort, no stall and no unhandled context interrupt. ASIDPNE
++     * (bit12) is only a broadcast-invalidation hint and may read as zero.
++     * Keep requesting it like Linux, but validate the functional controls. */
 +    SET(b, BIT(12) | BIT(5) | BIT(2) | BIT(1) | 1,
-+        BIT(12) | BIT(7) | BIT(6) | BIT(5) | BIT(2) | BIT(1) | 1);
++        BIT(7) | BIT(6) | BIT(5) | BIT(2) | BIT(1) | 1);
 +    SET(0xc00 + s->smr * 4, s->cb, (3u << 16) | (3u << 24) | 255);
 +    SET(0x800 + s->smr * 4, BIT(31) | stream, UINT32_MAX);
 +    s->attached = true;
@@ -5487,7 +5489,7 @@
 +    uint32_t b = s->cb_base + (s->cb << s->page_shift);
 +    uint64_t ttbr = v->tables.pa | ((uint64_t)s->asid << 48);
 +    uint32_t ctl = io->read(io->context,b);
-+    if (ctl == UINT32_MAX || (ctl & 0x10e7u) != 0x1027u ||
++    if (ctl == UINT32_MAX || (ctl & 0xe7u) != 0x27u ||
 +        io->read(io->context,0x800 + s->smr*4) != (BIT(31) | s->stream) ||
 +        io->read(io->context,0xc00 + s->smr*4) != s->cb ||
 +        io->read(io->context,b + 0x20) != (uint32_t)ttbr ||
