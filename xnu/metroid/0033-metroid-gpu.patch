@@ -1136,7 +1136,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_accel.c
-@@ -0,0 +1,271 @@
+@@ -0,0 +1,363 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_accel.h"
 +#ifdef MG_HOST_TEST
@@ -1148,6 +1148,7 @@
 +{ a->error = error; a->quarantined = true; return error; }
 +static void trace(struct mg_accel *a, const char *phase)
 +{ if (a->live->io.trace) a->live->io.trace(a->live->io.context,phase); }
++static void hardware_trace(void *p, const char *phase) { trace(p,phase); }
 +static bool powered(void *p)
 +{
 +    struct mg_accel *a = p;
@@ -1161,7 +1162,8 @@
 +    struct mg_accel *a = p;
 +    return powered(a) && a->gpu.domain.attached && a->gmu.domain.attached &&
 +        !a->gpu.quarantined && !a->gmu.quarantined &&
-+        mg_vm_validate(&a->gpu) == MG_OK && mg_vm_validate(&a->gmu) == MG_OK;
++        mg_vm_validate(&a->gpu) == MG_OK && mg_vm_validate(&a->gmu) == MG_OK &&
++        (!a->secure.initialized || mg_vm_validate(&a->secure) == MG_OK);
 +}
 +static bool running(void *p)
 +{
@@ -1205,8 +1207,9 @@
 +static int map_block(struct mg_accel *a, struct mg_accel_block *b,
 +    struct mg_vm *vm, unsigned access, uint32_t alignment, bool cache)
 +{
-+    uint64_t start = vm == &a->gpu ? 0x80000000ull : cache ? 0x4000 : 0x60000000;
-+    uint64_t end = vm == &a->gpu ? 0xb0000000ull : cache ? 0x1000000 : 0x80000000;
++    bool gpu = vm == &a->gpu || vm == &a->secure;
++    uint64_t start = vm == &a->secure ? 0xf0000000ull : gpu ? 0x80000000ull : cache ? 0x4000 : 0x60000000;
++    uint64_t end = vm == &a->secure ? 0x100000000ull : gpu ? 0xb0000000ull : cache ? 0x1000000 : 0x80000000;
 +    /* Walk retained boot and newly allocated mappings. Align VA, not PA: the
 +     * GMU protocol's alignment exponent is a virtual-address requirement. */
 +    for (;;) {
@@ -1221,7 +1224,7 @@
 +        }
 +        if (!moved) for (unsigned i = 0; i < a->block_count; i++) {
 +            const struct mg_accel_block *r = &a->blocks[i];
-+            uint32_t va = vm == &a->gpu ? r->gpu : r->gmu;
++            uint32_t va = gpu ? r->gpu : r->gmu;
 +            if (va && start < (uint64_t)va+r->memory.bytes+4096 && va < start+b->memory.bytes+4096) {
 +                start = (uint64_t)va+r->memory.bytes+4096; moved = true; break;
 +            }
@@ -1229,9 +1232,81 @@
 +        if (!moved) break;
 +    }
 +    /* Assign before posting any PTE: all failures retain backing. */
-+    if (vm == &a->gpu) { b->gpu = (uint32_t)start; b->gpu_access = access; }
++    if (gpu) { b->gpu = (uint32_t)start; b->gpu_access = access; }
 +    else { b->gmu = (uint32_t)start; b->gmu_access = access; }
 +    return mg_vm_map(vm,(uint32_t)start,b->pages,(unsigned)(b->memory.bytes/4096),access);
++}
++static void put32(unsigned char *p, uint32_t v)
++{ for (unsigned i = 0; i < 4; i++) p[i] = (unsigned char)(v >> (8*i)); }
++static void put64(unsigned char *p, uint64_t v)
++{ for (unsigned i = 0; i < 8; i++) p[i] = (unsigned char)(v >> (8*i)); }
++static bool physical_overlap(const struct mg_memory_block *x, const struct mg_memory_block *y)
++{
++    return x->pa && y->pa && x->pa < y->pa+y->bytes && y->pa < x->pa+x->bytes;
++}
++static bool private_extent(struct mg_accel *a, struct mg_accel_block *b)
++{
++    const struct mg_memory_block *m = &b->memory;
++    if (!m->pa || !m->bytes || ((m->pa | m->bytes) & (MG_MEMORY_PAGE-1)) ||
++        m->pa >= (1ull << 48) || m->bytes > (1ull << 48)-m->pa ||
++        physical_overlap(m,&a->table) || physical_overlap(m,&a->live->memory.table_block)) return false;
++    for (unsigned i = 0; i < a->block_count; i++) {
++        const struct mg_accel_block *other = &a->blocks[i];
++        if ((other != b && physical_overlap(m,&other->memory)) ||
++            physical_overlap(m,&other->page_storage)) return false;
++    }
++    for (unsigned i = 0; i < a->live->memory.count; i++)
++        if (physical_overlap(m,&a->live->memory.blocks[i])) return false;
++    return true;
++}
++/* Exact vendor MP.ASSIGN wire structs. Metadata stays HLOS-owned and pinned:
++ * source VMID3; memory extent at64; 24-byte destination records at128;
++ * SMC64 extended args[3..9] at192. Never grant execute to protected data. */
++static int protect(struct mg_accel *a, struct mg_accel_block *b, bool tables)
++{
++    struct mg_accel_block *ctl = a->secure_control;
++    if (!a->io.secure || !ctl || !ctl->memory.cpu || !b->memory.cpu ||
++        b == ctl || b->protected_attempted || !private_extent(a,b) ||
++        !private_extent(a,ctl)) return MG_UNBACKED;
++    unsigned char *p = ctl->memory.cpu;
++    memset(p,0,256);
++    put32(p,3); put64(p+64,b->memory.pa); put64(p+72,b->memory.bytes);
++    put32(p+128,tables ? 3 : 10); put32(p+132,6); /* HLOS RW or CP_PIXEL RW */
++    if (tables) { put32(p+152,10); put32(p+156,4); } /* CP_PIXEL read-only walk */
++    put64(p+192,4); put64(p+200,ctl->memory.pa+128);
++    put64(p+208,tables ? 48 : 24);
++    publish(a,b->memory.cpu,b->memory.bytes);
++    publish(a,p,256);
++    b->protected_attempted = true;
++    /* Even an error may have changed ownership. Drop the data CPU pointer
++     * before the call; token/PA/pages are retained, never reclaimed/reused. */
++    if (!tables) b->memory.cpu = NULL;
++    a->secure_result = a->io.secure(a->io.context,ctl->memory.pa);
++    return a->secure_result.status || a->secure_result.value ? MG_IO : MG_OK;
++}
++static int secure_domain(struct mg_accel *a)
++{
++    if (a->secure_stage == 4) return mg_vm_validate(&a->secure);
++    if (a->secure_stage || !a->io.secure) return MG_UNSUPPORTED;
++    a->secure_stage = 1;
++    trace(a,"query secure GPU MP.ASSIGN");
++    a->secure_result = a->io.secure(a->io.context,0);
++    if (a->secure_result.status) return MG_IO;
++    if (!a->secure_result.value) return MG_UNSUPPORTED;
++    int error = allocate(a,4096,&a->secure_control);
++    if (!error) error = allocate(a,MG_PT_MAX_PAGES*4096,&a->secure_tables);
++    if (error) return error;
++    struct mg_memory_block *t = &a->secure_tables->memory;
++    error = mg_vm_init(&a->secure,t->cpu,t->pa,t->bytes,&a->live->io.smmu,a,powered,idle);
++    if (error) return error;
++    a->secure_stage = 2;
++    trace(a,"share secure page tables with CP_PIXEL");
++    error = protect(a,a->secure_tables,true); if (error) return error;
++    a->secure_stage = 3;
++    trace(a,"attach protected GPU stream2");
++    error = mg_vm_attach(&a->secure,2); if (error) return error;
++    a->secure_stage = 4;
++    return MG_OK;
 +}
 +static int firmware_allocation(void *p, struct mg_sched_allocation *request)
 +{
@@ -1241,9 +1316,24 @@
 +    uint32_t alignment = 1u << (va_shift < 12 ? 12 : va_shift);
 +    uint64_t unit = 1ull << (size_shift < 14 ? 14 : size_shift);
 +    uint64_t bytes = ((uint64_t)request->bytes+unit-1) & ~(unit-1);
++    bool secure = (request->flags & 0x1000) != 0;
++    if (secure) {
++        if (request->kind != 5 || request->flags != 0x1007) return MG_UNSUPPORTED;
++        int error = secure_domain(a); if (error) return error;
++    }
 +    struct mg_accel_block *b = NULL;
 +    int error = allocate(a,(size_t)bytes,&b); if (error) return error;
 +    unsigned f = request->flags;
++    if (secure) {
++        trace(a,"protect secure context-switch buffer");
++        error = protect(a,b,false); if (error) return error;
++        error = map_block(a,b,&a->secure,MG_VM_READ|MG_VM_WRITE|MG_VM_PRIV,alignment,false);
++        if (error) return error;
++        request->bytes = (uint32_t)b->memory.bytes;
++        request->gpu = b->gpu; request->gmu = 0;
++        trace(a,"secure context-switch buffer mapped");
++        return MG_OK;
++    }
 +    if (f & 1) {
 +        unsigned access = MG_VM_READ | MG_VM_EXEC | (f & 2 ? MG_VM_PRIV : 0) | (f & 4 ? MG_VM_WRITE : 0);
 +        error = map_block(a,b,&a->gpu,access,alignment,false); if (error) return error;
@@ -1272,10 +1362,12 @@
 +{
 +    struct mg_accel *a = p;
 +    trace(a,"start GX and CP firmware");
++    trace(a,"request GPU/DDR operating point");
 +    int error = mg_scheduler_vote(&a->scheduler,1,1); if (error) return error;
++    trace(a,"GPU/DDR vote acknowledged");
 +    const struct mg_hw_config config = {a->sqe->gpu,a->aqe->gpu,a->restore->gpu,
 +        a->restore->memory.cpu,a->restore->memory.bytes};
-+    const struct mg_hw_io io = {a,domains,read_reg,write_reg,delay,publish,authenticate_zap};
++    const struct mg_hw_io io = {a,domains,read_reg,write_reg,delay,publish,authenticate_zap,hardware_trace};
 +    return mg_hardware_boot(&a->hardware,&io,&config,&a->scheduler);
 +}
 +static bool mapped(void *p, const void *cpu, uint64_t gpu, size_t bytes, unsigned access)
@@ -1410,7 +1502,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_accel.h
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,64 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_ACCEL_H
 +#define METROID_GPU_ACCEL_H
@@ -1431,12 +1523,17 @@
 +    uint64_t zap_pa;
 +    size_t zap_bytes;
 +    struct mg_scm_result (*pas)(void *, unsigned, uint64_t, uint64_t);
++    /* control_pa=0 queries MP.ASSIGN availability. Otherwise the pinned
++     * control page holds the typed HLOS->CP_PIXEL assignment request. */
++    struct mg_scm_result (*secure)(void *, uint64_t control_pa);
 +};
++struct mg_scm_result mg_scm_secure_native(void *, uint64_t control_pa);
 +#define MG_ACCEL_BLOCKS 96u
 +struct mg_accel_block {
 +    struct mg_memory_block memory, page_storage;
 +    uint64_t *pages;
 +    uint32_t gpu, gmu, gpu_access, gmu_access;
++    bool protected_attempted;
 +};
 +enum mg_accel_stage { MG_ACCEL_OFF, MG_ACCEL_DOMAINS, MG_ACCEL_BUFFERS,
 +    MG_ACCEL_SCHEDULER, MG_ACCEL_CONTEXT, MG_ACCEL_PROOF };
@@ -1444,13 +1541,16 @@
 +    struct mg_live *live;
 +    struct mg_accel_io io;
 +    struct mg_accel_images images;
-+    struct mg_vm gpu, gmu;
++    struct mg_vm gpu, gmu, secure;
 +    struct mg_memory_block table;
 +    struct mg_accel_block blocks[MG_ACCEL_BLOCKS];
 +    unsigned block_count;
 +    size_t allocated;
 +    struct mg_accel_block *sqe, *aqe, *restore, *metadata, *context, *timestamps;
 +    struct mg_accel_block *commands, *output;
++    struct mg_accel_block *secure_tables, *secure_control;
++    unsigned secure_stage;
++    struct mg_scm_result secure_result;
 +    struct mg_scheduler scheduler;
 +    struct mg_hardware hardware;
 +    struct mg_zap_status zap;
@@ -1640,7 +1740,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_hardware.c
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,198 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Cold A825 GX/CP initialization, Nothing031e8669 adreno_gen8{,_hwsched}.c.
 + */
@@ -1653,6 +1753,8 @@
 +
 +static int fail(struct mg_hardware *h, int error)
 +{ h->error = error; h->quarantined = true; return error; }
++static void trace(struct mg_hardware *h, const char *phase)
++{ if (h->io.trace) h->io.trace(h->io.context,phase); }
 +static void write_reg(struct mg_hardware *h, uint32_t reg, uint32_t value)
 +{ h->reg = reg; h->value = value; h->io.write(h->io.context,reg,value); }
 +static uint32_t read_reg(struct mg_hardware *h, uint32_t reg)
@@ -1714,6 +1816,7 @@
 +}
 +static int registers(struct mg_hardware *h)
 +{
++    trace(h,"GX registers: aperture and GMEM");
 +    aperture(h,0);
 +    write_reg(h,GEN8_RBBM_PERFCTR_GPU_BUSY_MASKED,UINT32_MAX);
 +    /* GMEM=0x260000, UCHE alignment=64MiB, highest bank bit16, MAL32, UBWC5. */
@@ -1736,6 +1839,7 @@
 +    for (unsigned i = 0; i < COUNT(gen8_0_0_bicubic_regs); i++)
 +        write_reg(h,gen8_0_0_bicubic_regs[i].reg,gen8_0_0_bicubic_regs[i].value);
 +    write_reg(h,GEN8_UCHE_CLIENT_PF,0x81);
++    trace(h,"GX registers: non-context setup");
 +    for (unsigned i = 0; gen8_6_0_nonctxt_regs[i].reg; i++) {
 +        const struct mg_hw_nonctxt *r = &gen8_6_0_nonctxt_regs[i];
 +        for (unsigned pipe = PIPE_NONE; pipe <= PIPE_DDE_BV; pipe++)
@@ -1749,6 +1853,7 @@
 +    if (select == UINT32_MAX) return fail(h,MG_IO);
 +    write_reg(h,GEN8_GMUCX_POWER_COUNTER_SELECT_XOCLK_0,(select & ~255u) | 0x20);
 +    write_reg(h,GEN8_GMUCX_POWER_COUNTER_ENABLE,1);
++    trace(h,"GX registers: protection masks");
 +    for (unsigned pipe = PIPE_BR; pipe <= PIPE_BV; pipe++)
 +        pipe_write(h,pipe,GEN8_CP_PROTECT_CNTL_PIPE,0xffff000b);
 +    aperture(h,0);
@@ -1767,14 +1872,16 @@
 +    }
 +    aperture(h,0);
 +    write_reg(h,GEN8_CP_INTERRUPT_STATUS_MASK_GLOBAL,0x007f007f);
++    trace(h,"GX registers: trusted VA range");
 +    write_reg(h,GEN8_RBBM_SECVID_TSB_CNTL,0);
 +    write_reg(h,GEN8_RBBM_SECVID_TSB_TRUSTED_BASE_LO,0xf0000000);
 +    write_reg(h,GEN8_RBBM_SECVID_TSB_TRUSTED_BASE_HI,0);
 +    /* A 32-bit IOVA domain reserves [f0000000,100000000) for secure memory;
-+     * this driver never maps it or exposes secure-buffer allocation. */
++     * protected context-switch allocations use only stream2 in this range. */
 +    write_reg(h,GEN8_RBBM_SECVID_TSB_TRUSTED_SIZE,0x10000000);
 +    /* Disable host IRQ delivery: faults/completion are polled, never claimed. */
 +    write_reg(h,GEN8_RBBM_INT_0_MASK,0);
++    trace(h,"GX registers: clock gating");
 +    for (unsigned i = 0; i < COUNT(gen8_ao_hwcg_regs); i++)
 +        write_reg(h,gen8_ao_hwcg_regs[i].reg,gen8_ao_hwcg_regs[i].value);
 +    write_reg(h,GEN8_RBBM_CLOCK_CNTL_GLOBAL,1);
@@ -1782,6 +1889,7 @@
 +    write_reg(h,GEN8_RBBM_CGC_P2S_TRIG_CMD,1);
 +    int error = poll(h,GEN8_RBBM_CGC_P2S_STATUS,1,1,3);
 +    if (!error) write_reg(h,GEN8_RBBM_CLOCK_CNTL_GLOBAL,0);
++    if (!error) trace(h,"GX clock gating synchronized");
 +    return error;
 +}
 +int mg_hardware_boot(struct mg_hardware *h, const struct mg_hw_io *io,
@@ -1797,27 +1905,35 @@
 +    h->attempted = true; h->io = *io;
 +    if (!io->ready(io->context)) return fail(h,MG_UNBACKED);
 +    h->exposed = true;
++    trace(h,"request GX OOB power");
 +    write_reg(h,GEN8_GMUCX_HOST2GMU_INTR_SET,BIT(30));
 +    int error = poll(h,GEN8_GMUCX_GMU2HOST_INTR_INFO,BIT(31),BIT(31),100000);
 +    if (error) return error;
 +    write_reg(h,GEN8_GMUCX_GMU2HOST_INTR_CLR,BIT(31));
 +    h->stage = MG_HW_OOB;
++    trace(h,"GX OOB acknowledged");
 +    error = registers(h); if (error) return error;
 +    h->stage = MG_HW_REGISTERS;
++    trace(h,"set SQE/AQE firmware bases");
 +    write_reg(h,GEN8_CP_SQE_INSTR_BASE_LO,(uint32_t)c->sqe);
 +    write_reg(h,GEN8_CP_SQE_INSTR_BASE_HI,0);
 +    write_reg(h,GEN8_CP_AQE_INSTR_BASE_LO_0,(uint32_t)c->aqe);
 +    write_reg(h,GEN8_CP_AQE_INSTR_BASE_HI_0,0);
++    trace(h,"build power-up restore list");
 +    error = restore(h,c); if (error) return error;
 +    h->stage = MG_HW_RESTORE;
++    trace(h,"submit CP_ME_INIT");
 +    const uint32_t cp[] = {packet7(0x17,1),BIT(27),packet7(0x48,7),
 +        0x14b,3,0x20000000,2,(uint32_t)c->restore,0,BIT(31)};
 +    error = mg_scheduler_raw(s,cp,COUNT(cp)); if (error) return fail(h,error);
++    trace(h,"CP_ME_INIT acknowledged");
 +    error = poll(h,GEN8_GMUAO_GPU_CX_BUSY_STATUS,BIT(23),0,200000); if (error) return error;
 +    h->stage = MG_HW_CP;
++    trace(h,"CP initialization idle");
 +    error = io->authenticate_zap(io->context); if (error) return fail(h,error);
 +    h->stage = MG_HW_ZAP;
 +    const uint32_t nonsecure[] = {packet7(0x66,1),0};
++    trace(h,"submit non-secure transition");
 +    error = mg_scheduler_raw(s,nonsecure,COUNT(nonsecure)); if (error) return fail(h,error);
 +    error = poll(h,GEN8_GMUAO_GPU_CX_BUSY_STATUS,BIT(23),0,200000); if (error) return error;
 +    h->stage = MG_HW_NONSECURE;
@@ -1825,7 +1941,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_hardware.h
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,36 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_HARDWARE_H
 +#define METROID_GPU_HARDWARE_H
@@ -1843,6 +1959,7 @@
 +    void (*delay)(void *, unsigned);
 +    void (*publish)(void *, const void *, size_t);
 +    int (*authenticate_zap)(void *);
++    void (*trace)(void *, const char *); /* optional phase checkpoints */
 +};
 +enum mg_hw_stage { MG_HW_OFF, MG_HW_OOB, MG_HW_REGISTERS, MG_HW_RESTORE,
 +    MG_HW_CP, MG_HW_ZAP, MG_HW_NONSECURE };
@@ -2551,7 +2668,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_platform.c
-@@ -0,0 +1,326 @@
+@@ -0,0 +1,330 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * XNU adapter for the retained GMU owner. No inherited bandwidth assumption.
 + * Register sequences: Nothing 031e8669, gpucc-tuna.c/adreno_gen8.c.
@@ -2827,8 +2944,12 @@
 +    if (images && platform.live.stage == MG_LIVE_HFI) {
 +        void *zap = metroid_gpu_zap_reserved_map(0x94e9a000,0x2000);
 +        const struct mg_accel_io accelerator_io = {NULL,accelerator_powered,synchronize,
-+            scheduler_tables,zap,0x94e9a000,0x2000,mg_scm_pas_native};
++            scheduler_tables,zap,0x94e9a000,0x2000,mg_scm_pas_native,mg_scm_secure_native};
 +        int error = zap ? mg_accel_boot(&platform.accelerator,&platform.live,&accelerator_io,images) : MG_UNBACKED;
++        printf("METROID GPU: secure stage=%u CB=%u SCM=%lld/%#llx\n",
++            platform.accelerator.secure_stage,platform.accelerator.secure.domain.cb,
++            (long long)platform.accelerator.secure_result.status,
++            (unsigned long long)platform.accelerator.secure_result.value);
 +        if (!error) error = metroid_gpu_gem_install(&platform.accelerator.render.ops);
 +        if (error) {
 +            platform.accelerator.error = error; platform.accelerator.quarantined = true;
@@ -4130,7 +4251,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_scheduler.c
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,266 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Nothing 031e8669 adreno_gen8_hwsched_hfi.c's cold, polling control path.
 + * No warmboot, IFPC, preemption, LPAC, HW fences or interrupt ownership.
@@ -4206,11 +4327,12 @@
 +    };
 +    s->last_kind = a.kind; s->last_flags = a.flags;
 +    s->last_bytes = a.bytes; s->last_align = a.align;
++    bool secure = a.kind == 5 && a.flags == 0x1007;
 +    /* Reject secure and fixed MMIO kinds rather than answering with RAM. */
 +    if (!a.bytes || a.bytes > 64u * 1024u * 1024u || a.kind >= 27 ||
-+        a.kind == 5 || a.kind == 11 || a.kind == 12 || a.kind == 13 ||
++        (a.kind == 5 && !secure) || a.kind == 11 || a.kind == 12 || a.kind == 13 ||
 +        a.kind == 19 || a.kind == 20 || a.kind == 23 || a.kind == 26 ||
-+        (a.flags & SECURE) || (a.flags & ~0x3ffu) || a.gpu || a.gmu || a.host_handle ||
++        ((a.flags & SECURE) && !secure) || (a.flags & ~(secure ? 0x1007u : 0x3ffu)) || a.gpu || a.gmu || a.host_handle ||
 +        !(a.flags & (GFX_ACCESS | GMU_ACCESS)) ||
 +        (a.align & 0xffff0000u) || (a.align & 255) > 26 || ((a.align >> 8) & 255) > 26)
 +        return MG_UNSUPPORTED;
@@ -4239,6 +4361,8 @@
 +                    (uint64_t)a.gmu+a.bytes > 0x1000000) :
 +                    (a.gmu < 0x60000000 || (uint64_t)a.gmu+a.bytes > 0x80000000)))) )
 +            return MG_UNBACKED;
++        if (secure && (a.gmu || a.gpu < 0xf0000000ull ||
++            a.gpu + a.bytes > 0x100000000ull)) return MG_UNBACKED;
 +        for (unsigned i = 0; i < s->allocation_count; i++) {
 +            const struct mg_sched_allocation *old = &s->allocations[i];
 +            if ((a.gpu && old->gpu && a.gpu < old->gpu+old->bytes && old->gpu < a.gpu+a.bytes) ||
@@ -4453,19 +4577,19 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_scm.c
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,73 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * SCM SMC64 transport for one-argument GPU/availability calls.
 + * ABI: Nothing 031e8669eb19 drivers/firmware/qcom_scm{-smc.c,.c,.h}.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <kern/locks.h>
-+#include "metroid_gpu_zap.h"
++#include "metroid_gpu_accel.h"
 +static LCK_GRP_DECLARE(mg_scm_group, "metroid-gpu-scm");
 +static LCK_MTX_DECLARE(mg_scm_lock, &mg_scm_group);
 +static bool mg_scm_poisoned;
 +
-+static struct mg_scm_result invoke(uint32_t fn, uint32_t info, uint64_t arg, uint64_t b, uint64_t c)
++static struct mg_scm_result invoke(uint32_t fn, uint32_t info, uint64_t arg, uint64_t b, uint64_t c, uint64_t d)
 +{
 +    lck_mtx_lock(&mg_scm_lock);
 +    if (mg_scm_poisoned) {
@@ -4480,7 +4604,7 @@
 +        register uint64_t x2 __asm__("x2") = arg;
 +        register uint64_t x3 __asm__("x3") = b;
 +        register uint64_t x4 __asm__("x4") = c;
-+        register uint64_t x5 __asm__("x5") = 0;
++        register uint64_t x5 __asm__("x5") = d;
 +        register uint64_t x6 __asm__("x6") = quirk;
 +        register uint64_t x7 __asm__("x7") = 0;
 +        __asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3),
@@ -4492,7 +4616,7 @@
 +    }
 +    /* In particular, an interrupted/WAITQ call may still own secure state.
 +     * Do not permit another GPU request after an uncertain result. */
-+    if (result.status || ((fn & 0xffffff00u) == 0x42000200u && result.value)) mg_scm_poisoned = true;
++    if (result.status || (((fn & 0xffffff00u) == 0x42000200u || fn == 0x42000c16u) && result.value)) mg_scm_poisoned = true;
 +    lck_mtx_unlock(&mg_scm_lock);
 +    return result;
 +}
@@ -4501,7 +4625,7 @@
 +    (void)unused;
 +    if (info != 1 || !((fn == 0x42000601 && arg == 0x02002801) ||
 +        (fn == 0x42002801 && arg == 0xb))) return (struct mg_scm_result){.status = -1};
-+    return invoke(fn,info,arg,0,0);
++    return invoke(fn,info,arg,0,0,0);
 +}
 +/* PIL commands for GPU PAS13 only. Same serialized transport as CX setup;
 + * no general SMC gateway, no PAS shutdown/reuse after ambiguous failure. */
@@ -4509,12 +4633,22 @@
 +{
 +    (void)unused;
 +    if (command == 1 && pa && !(pa & 4095) && pa < (1ull << 48) && !bytes)
-+        return invoke(0x42000201,0x82,13,pa,0);
++        return invoke(0x42000201,0x82,13,pa,0,0);
 +    if (command == 2 && pa && !(pa & 4095) && bytes && !(bytes & 4095) &&
 +        bytes <= 0x100000 && pa < (1ull << 48) && bytes <= (1ull << 48)-pa)
-+        return invoke(0x42000202,3,13,pa,bytes);
-+    if (command == 5 && !pa && !bytes) return invoke(0x42000205,1,13,0,0);
++        return invoke(0x42000202,3,13,pa,bytes,0);
++    if (command == 5 && !pa && !bytes) return invoke(0x42000205,1,13,0,0,0);
 +    return (struct mg_scm_result){.status = -1};
++}
++/* MP.ASSIGN uses seven arguments: x2=mem-list, x3=16, x4=source-list,
++ * x5 points to args[3..9]. No general SCM gateway or reclaim operation. */
++struct mg_scm_result mg_scm_secure_native(void *unused, uint64_t pa)
++{
++    (void)unused;
++    if (!pa) return invoke(0x42000601,1,0x02000c16,0,0,0);
++    if ((pa & 4095) || pa >= (1ull << 48) - 4096)
++        return (struct mg_scm_result){.status = -1};
++    return invoke(0x42000c16,0x1117,pa+64,16,pa,pa+192);
 +}
 +#endif
 --- /dev/null
@@ -4622,7 +4756,7 @@
 +int mg_smmu_attach_stream(const struct mg_smmu_io *io, struct mg_smmu_domain *s,
 +    const struct mg_page_tables *t, uint32_t stream)
 +{
-+    if ((stream != 0 && stream != 5) || !s || !io || !io->read || !io->write || !io->write64 ||
++    if ((stream != 0 && stream != 2 && stream != 5) || !s || !io || !io->read || !io->write || !io->write64 ||
 +        !io->delay || !io->publish || !t || !t->built || !t->memory ||
 +        !t->used || t->used > MG_PT_MAX_PAGES || t->used * 4096u > t->bytes)
 +        return MG_INVALID;
@@ -4892,7 +5026,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_start.h
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,118 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_START_H
 +#define METROID_GPU_START_H
@@ -4934,7 +5068,9 @@
 +int mg_smmu_tables(struct mg_page_tables *, const struct mg_dma_range *, size_t);
 +int mg_smmu_attach(const struct mg_smmu_io *, struct mg_smmu_domain *,
 +    const struct mg_page_tables *);
-+/* Separate stream-0 GPU and stream-5 GMU domains. Never retarget a live route. */
++/* Stream0 GPU, stream2 protected GPU, stream5 GMU. Stream2 callers must share
++ * page tables with CP_PIXEL and protect all mapped data before exposing it.
++ * Never retarget a live route or use stream2 as a normal-RAM fallback. */
 +int mg_smmu_attach_stream(const struct mg_smmu_io *, struct mg_smmu_domain *,
 +    const struct mg_page_tables *, uint32_t stream);
 +
@@ -5632,7 +5768,7 @@
 +}
 +int mg_vm_attach(struct mg_vm *v, unsigned stream)
 +{
-+    if (!v || !v->initialized || (stream != 0 && stream != 5)) return MG_INVALID;
++    if (!v || !v->initialized || (stream != 0 && stream != 2 && stream != 5)) return MG_INVALID;
 +    if (v->exposed) return MG_BUSY;
 +    if (!v->powered(v->context) || !v->idle(v->context)) return MG_UNBACKED;
 +    v->exposed = true;
@@ -5752,7 +5888,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_vm.h
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,52 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_VM_H
 +#define METROID_GPU_VM_H
@@ -5784,6 +5920,8 @@
 +int mg_vm_init(struct mg_vm *, void *cpu, uint64_t pa, size_t bytes,
 +    const struct mg_smmu_io *, void *, bool (*powered)(void *), bool (*idle)(void *));
 +int mg_vm_attach(struct mg_vm *, unsigned stream);
++/* Stream2 is reserved for the protected owner: table pool must already be
++ * shared HLOS RW/CP_PIXEL R; data must be CP_PIXEL-only before mapping. */
 +/* Extend a domain already attached by the cold GMU owner. Never zeros,
 + * reattaches or changes the existing routes, ASID or boot mappings. */
 +int mg_vm_adopt(struct mg_vm *, const struct mg_page_tables *,
