@@ -2806,11 +2806,12 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_power.c
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,180 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Cold CX/GMU clock bring-up from Nothing 031e8669eb19 gpucc-tuna.c,
 + * gcc-tuna.c, gdsc.c, clk-alpha-pll.c (Lucid OLE/EVO) and clk-rcg2.c.
-+ * Requires a powered apps fabric/GCC XO. Deliberately refuses live handoff.
++ * Requires a powered apps fabric/GCC XO. Refuses live handoff; tolerates
++ * inherited enable requests only on halted branches with CX collapsed.
 + */
 +#include "metroid_gpu.h"
 +#define BIT(n) (1u << (n))
@@ -2878,14 +2879,28 @@
 +     * or taking its reset would destroy unknown command/buffer ownership.
 +     */
 +    const uint32_t idle[] = {0x90d4, 0x9060, 0x90e8, 0x93e8};
++    uint32_t inherited = 0;
 +    for (unsigned i = 0; i < sizeof(idle)/sizeof(idle[0]); i++) {
 +        uint32_t v = rd(io, s, MG_CC, idle[i]);
 +        if (v == UINT32_MAX) return MG_IO;
-+        if (v & BIT(0)) return MG_BUSY;
++        if (v & BIT(0)) {
++            /* An enable request is not proof of a running clock. ABL can
++             * leave e.g. CX_GMU=0x80002001 (requested, but halted). */
++            if (!(v & BIT(31))) return MG_BUSY;
++            inherited |= BIT(i);
++        }
 +    }
 +    uint32_t v = rd(io, s, MG_CC, 0x9080);
 +    if (v == UINT32_MAX) return MG_IO;
 +    if (v & (BIT(31) | BIT(1) | BIT(2))) return MG_BUSY;
++    if (inherited) {
++        /* Software collapse AND hardware power-off are required. A halted
++         * branch alone does not establish that firmware has lost power. */
++        if (!(v & BIT(0))) return MG_BUSY;
++        v = rd(io, s, MG_CC, 0x9094);
++        if (v == UINT32_MAX) return MG_IO;
++        if (v & BIT(31)) return MG_BUSY;
++    }
 +    v = rd(io, s, MG_CC, 0);
 +    if (v == UINT32_MAX) return MG_IO;
 +    if (v & BIT(0)) return MG_BUSY;
@@ -2912,6 +2927,15 @@
 +#define TRY(expr) do { int error = (expr); if (error) return error; } while (0)
 +    /* Hold GMU's clock-controller reset before enabling any GMU clock. */
 +    TRY(change(io, s, MG_CC, 0x9314, BIT(0), BIT(0)));
++    /* Normalize only proven dormant requests, with reset acknowledged and
++     * before enabling CX or changing PLL/RCG parents. Preserve other bits.
++     * All initial ownership/PLL/shared-source checks have passed first. */
++    for (unsigned i = 0; i < sizeof(idle)/sizeof(idle[0]); i++) {
++        if (!(inherited & BIT(i))) continue;
++        TRY(poll(io, s, MG_CC, idle[i], BIT(31), BIT(31)));
++        TRY(change(io, s, MG_CC, idle[i], BIT(0), 0));
++        TRY(poll(io, s, MG_CC, idle[i], BIT(31), BIT(31)));
++    }
 +    /* GDSC wait fields 2/2/8 and retention follow gpu_cc_cx_gdsc. */
 +    TRY(change(io, s, MG_CC, 0x9080,
 +        0xfff000u | BIT(11) | 7u, 0x228000u | BIT(11)));
