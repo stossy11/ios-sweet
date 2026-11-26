@@ -215,22 +215,52 @@
  	}
  	/* Rails first; reset pulse only after both acknowledged power votes. */
  	if (metroid_touch_power_enable("ldob22", 3200) ||
-@@ -188,13 +317,13 @@
+@@ -188,23 +317,38 @@
  	if (!mt_write_register(0xa5, 0) || !mt_write_register(0xd0, 0)) {
  		printf("METROID TOUCH: normal scan setup failed\n"); goto out;
  	}
 -	printf("METROID TOUCH: ready 1260x2800, 10 fingers, SPI 9.6MHz, poll 8ms\n");
 +	printf("METROID TOUCH: ready 1260x2800, 10 fingers, SPI 9.6MHz, %s, poll 8ms\n", mt_use_gpi ? "GPI DMA" : "FIFO");
  	for (;;) {
- 		mt_sleep(8);
+-		mt_sleep(8);
++		/* Keep recovering from bad reports without spinning or flooding logs. */
++		mt_sleep(errors >= 50 ? 250 : 8);
  		/* Poll while touching. Idle IRQ is a hint; 104ms watchdog catches lost edges. */
- 		if (!frame.mask && (mt_read(mt_gpio, 176 * 0x1000 + 4) & 1) && ++idle_ticks < 13) continue;
+-		if (!frame.mask && (mt_read(mt_gpio, 176 * 0x1000 + 4) & 1) && ++idle_ticks < 13) continue;
++		if (errors < 50 && !frame.mask && (mt_read(mt_gpio, 176 * 0x1000 + 4) & 1) && ++idle_ticks < 13) continue;
  		idle_ticks = 0;
 -		struct mt_frame next;
+-		int decoded = mt_read_register(1, report, sizeof(report)) ? mt_decode(report, sizeof(report), &next) : -1;
 +		struct mt_frame next = {0};
- 		int decoded = mt_read_register(1, report, sizeof(report)) ? mt_decode(report, sizeof(report), &next) : -1;
++		int decoded = -1;
++		/* Retry fresh reports only while transport ownership is still certain.
++		 * Firmware reset releases contacts immediately; never hide it by retrying. */
++		for (unsigned attempt = 0; attempt < 20 && !mt_dead; attempt++) {
++			decoded = mt_read_register(1, report, sizeof(report)) ?
++			    mt_decode(report, sizeof(report), &next) : -1;
++			if (decoded >= 0 || mt_dead) break;
++			if (attempt < 2) mt_sleep(2);
++		}
  		if (decoded <= 0) {
- 			if (++errors == 1) printf("METROID TOUCH: report rejected kind=%d dead=%d\n", decoded, mt_dead);
+-			if (++errors == 1) printf("METROID TOUCH: report rejected kind=%d dead=%d\n", decoded, mt_dead);
++			if (errors < 50) errors++;
++			if (errors == 1) printf("METROID TOUCH: report rejected kind=%d dead=%d\n", decoded, mt_dead);
+ 			if (!decoded || errors >= 5 || mt_dead) {
+ 				frame.mask = 0;
+ 				sweet_hid_touch_frame(0, frame.x, frame.y);
+ 			}
+-			if (mt_dead || errors >= 50) { printf("METROID TOUCH: persistent transport/report failure; stopped\n"); break; }
++			if (mt_dead) { printf("METROID TOUCH: transport quarantined; stopped (reboot required)\n"); break; }
++			if (errors == 50) {
++				printf("METROID TOUCH: persistent report failure; retrying every 250ms\n");
++				errors = 51; /* Saturate and announce the recovery loop only once. */
++			}
+ 			continue;
+ 		}
++		if (errors) printf("METROID TOUCH: reports recovered (rejected polls=%u, capped)\n", errors);
+ 		errors = 0;
+ 		frame = next;
+ 		sweet_hid_touch_frame(frame.mask, frame.x, frame.y);
 --- a/bsd/dev/metroid_touch_spi.h
 +++ b/bsd/dev/metroid_touch_spi.h
 @@ -7,24 +7,28 @@

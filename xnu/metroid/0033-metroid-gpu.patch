@@ -1,6 +1,6 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,14 @@
+@@ -109,6 +109,15 @@
  bsd/dev/metroid_touch.c			standard
  bsd/dev/metroid_wifi.c			standard
  bsd/dev/metroid_usb.c			standard
@@ -12,6 +12,7 @@
 +bsd/dev/metroid_gpu_start.c		standard
 +bsd/dev/metroid_gpu_scm.c			standard
 +bsd/dev/metroid_gpu_load.c		standard
++bsd/dev/metroid_gpu_queue.c		standard
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
@@ -855,6 +856,120 @@
 +    return MG_OK;
 +#undef TRY
 +}
+--- /dev/null
++++ b/bsd/dev/metroid_gpu_queue.c
+@@ -0,0 +1,67 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include "metroid_gpu_queue.h"
++
++#define MG_QUEUE_POLL_US 10u
++
++int
++mg_queue_submit(struct mg_queue *queue, const struct mg_queue_io *io,
++    void *job, uint64_t *fence)
++{
++    if (!fence)
++        return MG_INVALID;
++    *fence = 0;
++    if (!queue || !io || !io->ready || !io->dispatch || !io->complete ||
++        !io->retire || !io->delay || !job)
++        return MG_INVALID;
++    if (queue->quarantined)
++        return MG_IO;
++    if (queue->job)
++        return MG_BUSY;
++    if (queue->issued == UINT64_MAX)
++        return MG_LIMIT;
++    if (!io->ready(io->context))
++        return MG_UNSUPPORTED;
++
++    /* Once dispatch begins, an error cannot prove the device missed the job. */
++    queue->job = job;
++    *fence = ++queue->issued;
++    int result = io->dispatch(io->context, job, queue->issued);
++    if (result != MG_OK) {
++        queue->quarantined = true;
++        return result;
++    }
++    return MG_OK;
++}
++
++int
++mg_queue_wait(struct mg_queue *queue, const struct mg_queue_io *io,
++    uint64_t fence, unsigned timeout_us)
++{
++    if (!queue || !io || !io->complete || !io->retire || !io->delay ||
++        !fence || fence > queue->issued || timeout_us > MG_QUEUE_MAX_WAIT_US)
++        return MG_INVALID;
++    if (fence <= queue->completed)
++        return MG_OK;
++    if (queue->quarantined)
++        return MG_IO;
++
++    for (;;) {
++        int result = io->complete(io->context, fence);
++        if (result == MG_OK) {
++            io->retire(io->context, queue->job);
++            queue->job = NULL;
++            queue->completed = fence;
++            return MG_OK;
++        }
++        if (result != MG_EMPTY) {
++            queue->quarantined = true;
++            return result;
++        }
++        /* Timeout leaves the job in flight. A later wait can still retire it. */
++        if (!timeout_us)
++            return MG_TIMEOUT;
++        unsigned delay = timeout_us < MG_QUEUE_POLL_US ? timeout_us : MG_QUEUE_POLL_US;
++        io->delay(io->context, delay);
++        timeout_us -= delay;
++    }
++}
+--- /dev/null
++++ b/bsd/dev/metroid_gpu_queue.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef METROID_GPU_QUEUE_H
++#define METROID_GPU_QUEUE_H
++
++#include "metroid_gpu.h"
++
++#define MG_QUEUE_MAX_WAIT_US 100000u
++
++/* Single in-flight kernel job. Zero-initialize once per hardware lifetime.
++ * The caller serializes submit/wait and uses the same immutable backend for
++ * the life of the queue. Callbacks must never re-enter the queue. Jobs must be validated, pinned and retained before
++ * submission. Once dispatch is called the queue owns that reference, even
++ * on error. A nonzero output fence indicates that ownership transferred.
++ * Quarantined jobs remain pinned until hardware DMA is drained.
++ * This interface must only receive trusted kernel-generated jobs.
++ */
++struct mg_queue {
++    void *job;
++    uint64_t issued, completed;
++    bool quarantined;
++};
++
++struct mg_queue_io {
++    void *context;
++    bool (*ready)(void *);
++    /* Publish command/data buffers, then enqueue with this fence value. */
++    int (*dispatch)(void *, void *job, uint64_t fence);
++    /* Nonblocking. MG_EMPTY if pending. MG_OK only after all job DMA is
++     * complete and device writes are CPU-visible. Other results quarantine.
++     */
++    int (*complete)(void *, uint64_t fence);
++    void (*retire)(void *, void *job);
++    void (*delay)(void *, unsigned microseconds);
++};
++
++int mg_queue_submit(struct mg_queue *, const struct mg_queue_io *, void *job,
++    uint64_t *fence);
++int mg_queue_wait(struct mg_queue *, const struct mg_queue_io *, uint64_t fence,
++    unsigned timeout_us);
++
++#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_rpmh.h
 @@ -0,0 +1,144 @@

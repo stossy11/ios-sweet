@@ -1,0 +1,158 @@
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -8581,6 +8581,72 @@
+  * Helper function for doing clones. The caller is expected to provide an
+  * iocounted source vnode and release it.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: the iOS root is HFS+, which has no VNOP_CLONEFILE. installd
++ * stages every app with clonefile() (MIFileManager), so on HFS+ all app
++ * installs failed with ENOTSUP ("Waiting..." placeholders). For a regular
++ * file, emulate the clone with a create and a full data copy; the caller's
++ * success path then applies the remaining attributes as usual.
++ */
++extern bool metroid_install_compat_enabled(void);
++
++#define SWEET_CLONE_COPY_CHUNK  (64 * 1024)
++
++static int
++sweet_clone_by_copy(vnode_t fvp, vnode_t tdvp, vnode_t *tvpp,
++    struct componentname *cnp, struct vnode_attr *nva, vfs_context_t ctx)
++{
++	struct vnode_attr sva;
++	kauth_cred_t cred = vfs_context_ucred(ctx);
++	proc_t p = vfs_context_proc(ctx);
++	char *buf;
++	off_t off;
++	int error, resid;
++
++	VATTR_INIT(&sva);
++	VATTR_WANTED(&sva, va_data_size);
++	if ((error = vnode_getattr(fvp, &sva, ctx)) != 0) {
++		return error;
++	}
++	if ((error = VNOP_CREATE(tdvp, tvpp, cnp, nva, ctx)) != 0) {
++		return error;
++	}
++	/* opt-in byte-copy staging, not an atomic copy-on-write snapshot. */
++	buf = kalloc_data(SWEET_CLONE_COPY_CHUNK, Z_WAITOK);
++	if (buf == NULL) {
++		error = ENOMEM;
++		goto fail;
++	}
++	for (off = 0; off < (off_t)sva.va_data_size; off += SWEET_CLONE_COPY_CHUNK) {
++		int len = (int)MIN((off_t)SWEET_CLONE_COPY_CHUNK, (off_t)sva.va_data_size - off);
++		error = vn_rdwr(UIO_READ, fvp, buf, len, off, UIO_SYSSPACE, 0, cred, &resid, p);
++		if (error == 0 && resid != 0) {
++			error = EIO;
++		}
++		if (error == 0) {
++			error = vn_rdwr(UIO_WRITE, *tvpp, buf, len, off, UIO_SYSSPACE, 0, cred, &resid, p);
++		}
++		if (error == 0 && resid != 0) {
++			error = EIO;
++		}
++		if (error) {
++			break;
++		}
++	}
++	kfree_data(buf, SWEET_CLONE_COPY_CHUNK);
++	if (error == 0) {
++		return 0;
++	}
++fail:
++	/* Do not leave a truncated "clone" behind: installd retries. */
++	(void)VNOP_REMOVE(tdvp, *tvpp, cnp, 0, ctx);
++	vnode_put(*tvpp);
++	*tvpp = NULLVP;
++	return error;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ static int
+ clonefile_internal(vnode_t fvp, boolean_t data_read_authorised, int dst_dirfd,
+     user_addr_t dst, uint32_t flags, vfs_context_t ctx)
+@@ -8731,6 +8797,13 @@
+ #endif
+ 
+ 	error = VNOP_CLONEFILE(fvp, tdvp, &tvp, cnp, &nva, vnop_flags, ctx);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (error == ENOTSUP && v_type == VREG && tvp == NULLVP &&
++	    metroid_install_compat_enabled() &&
++	    !strcmp(vfs_statfs(vnode_mount(fvp))->f_fstypename, "hfs")) {
++		error = sweet_clone_by_copy(fvp, tdvp, &tvp, cnp, &nva, ctx);
++	}
++#endif
+ 
+ 	if (!error && tvp) {
+ 		int     update_flags = 0;
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -32,6 +32,7 @@
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+ #include <sys/systm.h>
++#include <pexpert/pexpert.h>
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
+@@ -367,17 +368,58 @@
+ 
+ static mac_policy_handle_t sweet_amfi_mac_handle;
+ 
++/* Native app staging compatibility, adapted from frokfrdk/ios-sweet
++ * sunfish 0091/0092 (889149803008aab9166747eaf84ea39e62c57ee6).
++ * Explicit opt-in: this relaxes userspace installation checks only. Kernel
++ * code-directory and page-hash validation above are unchanged. Query 0x60
++ * is the sole implemented AMFI syscall; unsupported operations still fail.
++ */
++static bool metroid_install_compat;
++bool metroid_install_compat_enabled(void);
++bool
++metroid_install_compat_enabled(void)
++{
++	return metroid_install_compat;
++}
++
++static int
++metroid_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	if (call != 0x60) return ENOPOLICY;
++	uint64_t state = metroid_install_compat ? 0x4ULL : 0;
++	return copyout(&state, arg, sizeof(state));
++}
++
++static const struct mac_policy_ops metroid_amfi_syscall_ops = {
++	.mpo_policy_syscall = metroid_amfi_syscall,
++};
++static struct mac_policy_conf metroid_amfi_syscall_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = "Metroid installation compatibility query",
++	.mpc_ops = &metroid_amfi_syscall_ops,
++};
++static mac_policy_handle_t metroid_amfi_syscall_handle;
++
+ /* Called from bsd_init once MAC policies can register, before any exec. */
+ void sweet_amfi_policy_register(void);
+ 
+ void
+ sweet_amfi_policy_register(void)
+ {
++	int enabled = 0;
++	PE_parse_boot_argn("metroid_install_compat", &enabled, sizeof(enabled));
++	metroid_install_compat = enabled == 1;
+ 	int error = mac_policy_register(&sweet_amfi_mac_conf, &sweet_amfi_mac_handle, NULL);
+ 	printf("SWEET AMFI: platform binary policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	error = mac_policy_register(&metroid_amfi_syscall_conf, &metroid_amfi_syscall_handle, NULL);
++	printf("METROID INSTALL: compatibility %s; AMFI query registration %d\n",
++	    metroid_install_compat ? "enabled" : "disabled", error);
++	if (metroid_install_compat) {
++		printf("METROID INSTALL: HFS+ clonefile copy fallback enabled\n");
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

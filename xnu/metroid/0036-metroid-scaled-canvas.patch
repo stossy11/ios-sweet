@@ -1,0 +1,254 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -50,6 +50,7 @@
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#include "metroid_canvas_scale.h"
+ 
+ /* Updated by bounded /dev/null diagnostic records and process exit hooks.
+  * Try-lock only: diagnostics must never stall a dying compositor. */
+@@ -128,6 +129,10 @@
+ public:
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
++	uint32_t      fCanvasW, fCanvasH;
++	uint16_t     *fXMap;
++	uint32_t     *fScaledRow;
++	SweetSurface *fScanout;         /* physical panel; fSurface may be logical */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -141,6 +146,7 @@
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
++	void free(void) APPLE_KEXT_OVERRIDE;
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+@@ -173,6 +179,14 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++void
++AppleCLCD::free(void)
++{
++	if (fXMap) IOFreeData(fXMap, fWidth * sizeof(uint16_t));
++	if (fScaledRow) IOFreeData(fScaledRow, fWidth * sizeof(uint32_t));
++	IOMobileFramebuffer::free();
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -190,12 +204,46 @@
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+ 	}
++	fCanvasW = fWidth;
++	fCanvasH = fHeight;
++	OSData *cw = OSDynamicCast(OSData, provider->getProperty("canvas-width"));
++	OSData *ch = OSDynamicCast(OSData, provider->getProperty("canvas-height"));
++	if (cw != NULL && ch != NULL && cw->getLength() == 4 && ch->getLength() == 4) {
++		memcpy(&fCanvasW, cw->getBytesNoCopy(), 4);
++		memcpy(&fCanvasH, ch->getBytesNoCopy(), 4);
++	}
++	/* Both the ADT's discovery geometry and GetDisplaySize must agree.
++	 * Fail instead of publishing a native fallback with mismatched geometry. */
++	if (!fCanvasW || !fCanvasH || fWidth > 16384 || fHeight > 16384 ||
++	    fCanvasW > fWidth || fCanvasH > fHeight) {
++		IOLog("METROID CANVAS: invalid canvas %ux%u for panel %ux%u\n",
++		    fCanvasW, fCanvasH, fWidth, fHeight);
++		return false;
++	}
++	if (fCanvasW != fWidth || fCanvasH != fHeight) {
++		fXMap = (uint16_t *)IOMallocData(fWidth * sizeof(uint16_t));
++		fScaledRow = (uint32_t *)IOMallocData(fWidth * sizeof(uint32_t));
++		if (fXMap == NULL || fScaledRow == NULL) {
++			if (fXMap) IOFreeData(fXMap, fWidth * sizeof(uint16_t));
++			if (fScaledRow) IOFreeData(fScaledRow, fWidth * sizeof(uint32_t));
++			fXMap = NULL;
++			fScaledRow = NULL;
++			return false;
++		}
++		for (uint32_t x = 0; x < fWidth; x++) {
++			fXMap[x] = (uint16_t)((uint64_t)x * fCanvasW / fWidth);
++		}
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+-	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++	fScanout = fSurface;
++	fPixels = fScanout != NULL ? fScanout->kernelAddress() : 0;
++	if (fXMap != NULL) {
++		fSurface = sweet_surface_create_canvas(fCanvasW, fCanvasH);
++	}
+ 	fWorkLoop = IOWorkLoop::workLoop();
+-	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
++	if (fLock == NULL || fClients == NULL || fSurface == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+ 		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
+ 		OSSafeReleaseNULL(fWorkLoop);
+@@ -217,6 +265,8 @@
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id);
++	IOLog("METROID CANVAS: %ux%u -> %ux%u%s\n", fCanvasW, fCanvasH,
++	    fWidth, fHeight, fXMap ? " (nearest neighbour)" : " (native)");
+ 	return true;
+ }
+ 
+@@ -358,12 +408,23 @@
+ 			    s ? s->pixelFormat : 0, s ? s->bytesPerRow : 0, sx, sy, get32(a, 8),
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
+-		if (s == NULL || s == fSurface) {
++		if (s == NULL || s == fScanout) {
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		if (fXMap != NULL) {
++			if (src && bpe == 4 && s->pixelFormat == SWEET_FB_FORMAT_BGRA &&
++			    s->elementWidth == 1 && s->elementHeight == 1 && s->memory) {
++				(void)metroid_canvas_present((uint8_t *)fPixels, fScanout->memory->getLength(),
++				    fWidth, fHeight, fRowBytes, (const uint8_t *)src, s->memory->getLength(),
++				    s->width, s->height, s->bytesPerRow, s->offset, fCanvasW, fCanvasH,
++				    sx, sy, dx, dy, w, h, fXMap, fScaledRow);
++			}
++			s->release();
++			continue;
++		}
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+ 			h = (int32_t)s->height;
+@@ -509,8 +570,8 @@
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBGetDisplaySize:
+-		out[0] = fFB->fWidth;
+-		out[1] = fFB->fHeight;
++		out[0] = fFB->fCanvasW;
++		out[1] = fFB->fCanvasH;
+ 		outCount = 2;
+ 		break;
+ 	case kSweetFBIsMainDisplay:
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -242,6 +242,43 @@
+ 	s->memory = IOMemoryDescriptor::withPhysicalAddress(phys, s->allocSize, kIODirectionInOut);
+ 	s->mapCache = kIOMapWriteCombineCache;
+ 	if (s->memory == NULL || !sweet_surface_publish(s)) {
++		s->release();
++		return NULL;
++	}
++	return s;
++}
++
++/* A logical default framebuffer must not expose full-resolution panel
++ * memory as a smaller surface. Account and zero its cached backing exactly
++ * like ordinary userspace-created surfaces. */
++SweetSurface *
++sweet_surface_create_canvas(uint32_t width, uint32_t height)
++{
++	if (!width || !height || width > 16384 || height > 16384) return NULL;
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) return NULL;
++	s->width = width;
++	s->height = height;
++	s->bytesPerRow = (width * 4 + 63) & ~63u;
++	s->bytesPerElement = 4;
++	s->elementWidth = s->elementHeight = 1;
++	s->pixelFormat = 0x42475241;
++	s->allocSize = (uint32_t)round_page((uint64_t)s->bytesPerRow * height);
++	uint64_t previous = (uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++	IOBufferMemoryDescriptor *mem = NULL;
++	if (previous + s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
++		mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++	}
++	if (mem == NULL) {
++		OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++		s->release();
++		return NULL;
++	}
++	s->memory = mem;
++	s->mapCache = kIOMapDefaultCache;
++	bzero(mem->getBytesNoCopy(), s->allocSize);
++	if (!sweet_surface_publish(s)) {
+ 		s->release();
+ 		return NULL;
+ 	}
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -58,6 +58,8 @@
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
++SweetSurface *sweet_surface_create_canvas(uint32_t width, uint32_t height);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
+--- /dev/null
++++ b/iokit/Kernel/arm/metroid_canvas_scale.h
+@@ -0,0 +1,56 @@
++/* SPDX-License-Identifier: MIT
++ * Metroid CPU canvas presentation. Coordinates are logical canvas pixels;
++ * scanout addresses/stride always remain those validated at firmware handoff.
++ * Nearest neighbour, with one cached row per source row. No allocation here.
++ */
++#ifndef METROID_CANVAS_SCALE_H
++#define METROID_CANVAS_SCALE_H
++
++static inline int64_t mc_max(int64_t a, int64_t b) { return a > b ? a : b; }
++static inline int64_t mc_min(int64_t a, int64_t b) { return a < b ? a : b; }
++
++static bool
++metroid_canvas_present(uint8_t *dst, uint64_t dst_size, uint32_t pw, uint32_t ph,
++    uint32_t dst_stride, const uint8_t *src, uint64_t src_size,
++    uint32_t sw, uint32_t sh, uint32_t src_stride, uint32_t offset,
++    uint32_t cw, uint32_t ch, int32_t sx, int32_t sy, int32_t dx, int32_t dy,
++    int32_t w, int32_t h, const uint16_t *xmap, uint32_t *row)
++{
++    if (!dst || !src || !xmap || !row || !pw || !ph || !cw || !ch || !sw || !sh ||
++        pw > 16384 || ph > 16384 || cw > pw || ch > ph ||
++        (uint64_t)pw * 4 > dst_stride || (uint64_t)sw * 4 > src_stride ||
++        (offset & 3) || (src_stride & 3) || (dst_stride & 3) ||
++        (uint64_t)dst_stride * ph > dst_size ||
++        (uint64_t)offset + (uint64_t)(sh - 1) * src_stride + (uint64_t)sw * 4 > src_size)
++        return false;
++    if (w <= 0 || h <= 0) {
++        if (sw > INT32_MAX || sh > INT32_MAX) return false;
++        w = (int32_t)sw;
++        h = (int32_t)sh;
++    }
++    int64_t left = mc_max(0, mc_max(dx, (int64_t)dx - sx));
++    int64_t top = mc_max(0, mc_max(dy, (int64_t)dy - sy));
++    int64_t right = mc_min(cw, mc_min((int64_t)dx + w, (int64_t)dx + sw - sx));
++    int64_t bottom = mc_min(ch, mc_min((int64_t)dy + h, (int64_t)dy + sh - sy));
++    if (left >= right || top >= bottom) return false;
++    uint32_t x0 = (uint32_t)((left * pw + cw - 1) / cw);
++    uint32_t x1 = (uint32_t)((right * pw + cw - 1) / cw);
++    uint32_t y0 = (uint32_t)((top * ph + ch - 1) / ch);
++    uint32_t y1 = (uint32_t)((bottom * ph + ch - 1) / ch);
++    uint32_t last = UINT32_MAX;
++    for (uint32_t y = y0; y < y1; y++) {
++        uint32_t source_y = (uint32_t)((int64_t)((uint64_t)y * ch / ph) - dy + sy);
++        if (source_y != last) {
++            const uint32_t *srow = (const uint32_t *)(src + offset + (uint64_t)source_y * src_stride);
++            for (uint32_t x = x0; x < x1; x++) {
++                uint32_t source_x = (uint32_t)((int64_t)xmap[x] - dx + sx);
++                row[x] = srow[source_x];
++            }
++            last = source_y;
++        }
++        memcpy(dst + (uint64_t)y * dst_stride + (uint64_t)x0 * 4,
++            row + x0, (size_t)(x1 - x0) * 4);
++    }
++    return true;
++}
++#endif

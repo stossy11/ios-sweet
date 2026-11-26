@@ -1,0 +1,159 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -51,6 +51,42 @@
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
++/* Updated by bounded /dev/null diagnostic records and process exit hooks.
++ * Try-lock only: diagnostics must never stall a dying compositor. */
++#include "metroid_gles_error_panel.h"
++extern "C" unsigned char iso_font[];
++static struct metroid_gles_panel gles_panel;
++static unsigned gles_panel_lock;
++static void gles_panel_record(int process, const char *text, size_t length)
++{
++    if (__atomic_exchange_n(&gles_panel_lock, 1u, __ATOMIC_ACQUIRE)) return;
++    metroid_gles_panel_store(&gles_panel, process, text, length);
++    __atomic_store_n(&gles_panel_lock, 0u, __ATOMIC_RELEASE);
++}
++extern "C" void sweet_fb_gles_error_log(const char *name, const char *text, size_t length)
++{
++    static const char prefix[] = "SOFTGLES ERROR: ";
++    if (strcmp(name, "backboardd") && strcmp(name, "softgles-probe")) return;
++    if (length <= sizeof(prefix) - 1 || memcmp(text, prefix, sizeof(prefix) - 1)) return;
++    gles_panel_record(0, text + sizeof(prefix) - 1, length - (sizeof(prefix) - 1));
++}
++extern "C" void sweet_fb_gles_process_exit(const char *name, int pid, int signal, int status)
++{
++    if (strcmp(name, "backboardd") && strcmp(name, "SpringBoard") &&
++        strcmp(name, "softgles-probe")) return;
++    if (!strcmp(name, "softgles-probe") && !signal && !status) return;
++    char text[96];
++    snprintf(text, sizeof(text), "%s pid %d exited: signal %d status %d", name, pid, signal, status);
++    gles_panel_record(1, text, strlen(text));
++}
++static void gles_panel_draw(uintptr_t pixels, uint32_t width, uint32_t height, uint32_t stride)
++{
++    if (__atomic_exchange_n(&gles_panel_lock, 1u, __ATOMIC_ACQUIRE)) return;
++    struct metroid_gles_panel snapshot = gles_panel;
++    __atomic_store_n(&gles_panel_lock, 0u, __ATOMIC_RELEASE);
++    metroid_gles_panel_draw(&snapshot, (volatile uint32_t *)pixels, width, height, stride, iso_font);
++}
++
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -256,6 +292,7 @@
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
++	gles_panel_draw(fb->fPixels, fb->fWidth, fb->fHeight, fb->fRowBytes);
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -257,14 +257,17 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 			{
+ 				char name[32];
+-				if (sweet_null_tee(name, sizeof(name))) {
++                bool tee = sweet_null_tee(name, sizeof(name));
++                if (tee || !strcmp(name, "backboardd") || !strcmp(name, "softgles-probe")) {
+ 					char buf[256];
+ 					c = MIN(uio_curriovlen(uio), sizeof(buf));
+ 					error = uiomove(buf, (int)c, uio);
+ 					if (error) {
+ 						break;
+ 					}
+-					printf("|%s| %.*s%s", name, (int)c, buf,
++                    extern void sweet_fb_gles_error_log(const char *, const char *, size_t);
++                    sweet_fb_gles_error_log(name, buf, c);
++                    if (tee) printf("|%s| %.*s%s", name, (int)c, buf,
+ 					    (c > 0 && buf[c - 1] == '\n') ? "" : "\n");
+ 					continue;
+ 				}
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1845,6 +1845,11 @@
+ 	int kr = 0;
+ 	int create_corpse = FALSE;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++    extern void sweet_fb_gles_process_exit(const char *, int, int, int);
++    sweet_fb_gles_process_exit(p->p_comm, proc_getpid(p), WTERMSIG(rv), WEXITSTATUS(rv));
++#endif
++
+ 	if (p->p_crash_behavior != 0 || p == initproc) {
+ 		proc_handle_critical_exit(p, rv);
+ 	}
+--- /dev/null
++++ b/iokit/Kernel/arm/metroid_gles_error_panel.h
+@@ -0,0 +1,67 @@
++/* Bounded CPU-only diagnostic overlay; shared by the kernel and host checks. */
++#ifndef METROID_GLES_ERROR_PANEL_H
++#define METROID_GLES_ERROR_PANEL_H
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++
++struct metroid_gles_panel {
++    char renderer[96];
++    char process[96];
++};
++
++static inline void
++metroid_gles_panel_store(struct metroid_gles_panel *panel, int process,
++    const char *text, size_t length)
++{
++    char *out = process ? panel->process : panel->renderer;
++    size_t n = length < 95 ? length : 95;
++    for (size_t i = 0; i < n; i++) {
++        unsigned char ch = (unsigned char)text[i];
++        if (!ch) { n = i; break; }
++        out[i] = ch >= 32 && ch <= 126 ? (char)ch : ' ';
++    }
++    out[n] = 0;
++}
++
++static inline void
++metroid_gles_panel_draw(const struct metroid_gles_panel *panel,
++    volatile uint32_t *pixels, uint32_t width, uint32_t height,
++    uint32_t stride, const unsigned char *font)
++{
++    if ((!panel->renderer[0] && !panel->process[0]) || !pixels || !font ||
++        width < 88 || height < 80 || width > 16384 || height > 16384 ||
++        (uint64_t)stride < (uint64_t)width * 4 || (stride & 3)) return;
++    unsigned cols = (width - 40) / 16;
++    if (cols > 60) cols = 60;
++    const char *lines[] = {"GLES / PROCESS FAILURE", panel->renderer, panel->process};
++    unsigned rows = 1;
++    for (unsigned i = 1; i < 3; i++)
++        rows += (unsigned)(strlen(lines[i]) + cols - 1) / cols;
++    unsigned boxw = cols * 16 + 16, boxh = rows * 32 + 16;
++    if (boxh + 24 > height) return;
++    unsigned x0 = width - boxw - 12, y0 = height - boxh - 12;
++    for (unsigned y = 0; y < boxh; y++) {
++        volatile uint32_t *row = pixels + (size_t)(y0 + y) * (stride / 4) + x0;
++        for (unsigned x = 0; x < boxw; x++)
++            row[x] = (y < 2 || y >= boxh - 2 || x < 2 || x >= boxw - 2) ? 0xffff4040 : 0xff101010;
++    }
++    unsigned row = 0;
++    for (unsigned i = 0; i < 3; i++) {
++        size_t length = strlen(lines[i]);
++        if (!i && length > cols) length = cols;
++        for (size_t k = 0; k < length; k++) {
++            unsigned ch = (unsigned char)lines[i][k];
++            for (unsigned y = 0; y < 32; y++) {
++                unsigned bits = font[ch * 16 + y / 2];
++                volatile uint32_t *dst = pixels +
++                    (size_t)(y0 + 8 + row * 32 + (k / cols) * 32 + y) * (stride / 4) +
++                    x0 + 8 + (k % cols) * 16;
++                for (unsigned x = 0; x < 16; x++)
++                    if (bits & (1u << (x / 2))) dst[x] = i ? 0xffffffff : 0xffff8080;
++            }
++        }
++        row += i ? (unsigned)(length + cols - 1) / cols : 1;
++    }
++}
++#endif
