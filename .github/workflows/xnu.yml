@@ -33,12 +33,13 @@ env:
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'RELEASE' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
   METROID_EARLY: ${{ (github.event_name != 'workflow_dispatch' || inputs.metroid_early) && 'true' || 'false' }}
+  # macos-15 ships Xcode 16.4; pair its iig with the kernelContent backport.
+  DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
 
 jobs:
   build:
-    # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
-    # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-14
+    # macos-14 retired on 2026-11-02. Metroid overlay 0037 supports Xcode 16 iig.
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +55,11 @@ jobs:
             python3 tools/stage-metroid-patches.py dxb/patches
           else
             cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+            # This compiler compatibility backport also applies to the original
+            # xnu-8796 build without the Metroid hardware overlays.
+            if [[ "$MACOS_VERSION" == 13.5 ]]; then
+              cp xnu/metroid/0037-metroid-xcode16-iig.patch dxb/patches/9000-0037-metroid-xcode16-iig.patch
+            fi
           fi
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
@@ -63,14 +69,16 @@ jobs:
       - name: Deps
         run: |
           brew install jq gum bash cmake ninja
-          # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
-          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
-          sudo chmod +x /usr/local/bin/xcodes
           sw_vers
-          ls -d /Applications/Xcode*.app
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
-          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
-          sudo xcode-select -s "$XC"
+          # Do not silently select a different major toolchain as images change.
+          [[ -x "$DEVELOPER_DIR/usr/bin/xcodebuild" ]] || {
+            echo "::error::Pinned Xcode is unavailable: $DEVELOPER_DIR"
+            exit 1
+          }
+          # xcodes is already installed on macos-15; the pinned build script
+          # only uses it to install Xcode when no Xcode app is present.
+          command -v xcodes
+          sudo xcode-select -s "$DEVELOPER_DIR"
           xcodebuild -version
           xcrun --find iig
 
