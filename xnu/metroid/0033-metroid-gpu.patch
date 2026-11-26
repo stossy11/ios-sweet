@@ -2013,7 +2013,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_live.c
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,144 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_live.h"
 +
@@ -2030,7 +2030,12 @@
 +static uint32_t read_reg(void *context, uint32_t reg)
 +{ struct mg_live *s = context; return s->io.read(s->io.context, reg); }
 +static void write_reg(void *context, uint32_t reg, uint32_t value)
-+{ struct mg_live *s = context; s->io.write(s->io.context, reg, value); }
++{
++    struct mg_live *s = context;
++    if (reg == 0x1f800 && value == 0) trace(s,"release CM3; wait FW ready");
++    if (reg == 0x1f986 && value == 1) trace(s,"FW ready; start HFI");
++    s->io.write(s->io.context, reg, value);
++}
 +static void delay_us(void *context, unsigned us)
 +{ struct mg_live *s = context; s->io.delay(s->io.context, us); }
 +static void publish(void *context, const void *p, size_t bytes)
@@ -2045,6 +2050,31 @@
 +        s->memory.backing, s->memory.firmware_count};
 +    int error = mg_gmu_load(s->image, s->image_bytes, &s->memory.firmware, &loader);
 +    if (error) return error;
++    trace(s,"verify loaded ITCM/DTCM");
++    /* Version words alone cannot prove CM3 instructions were loaded. Read
++     * every supplied TCM word while reset is held; reject the first mismatch.
++     * Firmware payload records are aligned LE32 and non-overlapping. */
++    for (unsigned i = 0; i < s->memory.firmware.count; i++) {
++        const struct mg_fw_block *b = &s->memory.firmware.blocks[i];
++        if (b->region != MG_ITCM && b->region != MG_DTCM) continue;
++        uint32_t reg = b->region == MG_ITCM ? 0x1b400 : 0x1c400;
++        uint32_t base = b->region == MG_ITCM ? 0 : 0x10004000;
++        const unsigned char *p = (const unsigned char *)s->image + b->offset;
++        for (unsigned j = 0; j < b->size; j += 4) {
++            uint32_t expected = (uint32_t)p[j] | (uint32_t)p[j+1] << 8 |
++                (uint32_t)p[j+2] << 16 | (uint32_t)p[j+3] << 24;
++            uint32_t index = reg + (b->address - base + j)/4;
++            uint32_t got = s->io.read(s->io.context,index);
++            if (got != expected) {
++                s->start.reg = index; s->start.value = got;
++                s->start.firmware_expected = expected;
++                s->start.firmware_mismatch = true;
++                return MG_IO;
++            }
++            s->start.firmware_words++;
++        }
++    }
++    trace(s,"TCM verified; publish transport");
 +    /* The loader must not zero HFI/VRB. Publish the separately initialized
 +     * transport, log and VRB after the firmware's external reservations. */
 +    for (unsigned i = s->memory.firmware_count; i < s->memory.count; i++)
@@ -2098,6 +2128,14 @@
 +    return MG_OK;
 +fail:
 +    s->error = error;
++    if (s->start.released && s->domain.attached) {
++        uint32_t cb = s->domain.cb_base + (s->domain.cb << s->domain.page_shift);
++        const uint32_t offsets[] = {0x48,0x50,0x54,cb+0x58,cb+0x60,
++            cb+0x64,cb+0x68,cb+0x6c};
++        for (unsigned i = 0; i < 8; i++)
++            s->fault_snapshot[i] = io->smmu.read(io->smmu.context,offsets[i]);
++        s->fault_snapshot_valid = true;
++    }
 +    s->quarantined = s->fabric_attempted || s->power.touched || s->memory.exposed;
 +    /* Unexposed RAM can be freed, including after a rail/clock failure;
 +     * this never withdraws fabric/rail votes or resets someone else's GPU. */
@@ -2122,7 +2160,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_live.h
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,87 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_LIVE_H
 +#define METROID_GPU_LIVE_H
@@ -2166,6 +2204,10 @@
 +    enum mg_live_stage stage;
 +    int error;
 +    bool attempted, fabric_attempted, quarantined;
++    /* Post-failure read-only SMMU snapshot; CM3 has already been reset.
++     * Offsets: global48/50/54, selected CB58/60/64/68/6c. No W1C writes. */
++    bool fault_snapshot_valid;
++    uint32_t fault_snapshot[8];
 +};
 +
 +int mg_live_boot(struct mg_live *, const struct mg_live_io *, const void *, size_t);
@@ -2509,7 +2551,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_platform.c
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,326 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * XNU adapter for the retained GMU owner. No inherited bandwidth assumption.
 + * Register sequences: Nothing 031e8669, gpucc-tuna.c/adreno_gen8.c.
@@ -2768,6 +2810,16 @@
 +        .delay = wait_us, .publish = publish, .scm = mg_scm_native, .trace = checkpoint,
 +    };
 +    (void)mg_live_boot(&platform.live, &io, image, bytes);
++    printf("METROID GPU: TCM verified=%u expected=%#x poll reads=%u first=%#x\n",
++        platform.live.start.firmware_words,platform.live.start.firmware_expected,
++        platform.live.start.poll_reads,platform.live.start.poll_first);
++    if (platform.live.start.snapshot_valid)
++        for (unsigned i = 0; i < MG_START_SNAPSHOT_WORDS; i++)
++            printf("METROID GPU: pre-reset [%#x]=%#x\n",
++                mg_start_snapshot_registers[i],platform.live.start.snapshot[i]);
++    if (platform.live.fault_snapshot_valid)
++        for (unsigned i = 0; i < 8; i++)
++            printf("METROID GPU: post-reset SMMU fault[%u]=%#x\n",i,platform.live.fault_snapshot[i]);
 +    if (platform.live.error) printf("METROID GPU: GMU failure=%d stage=%u power=%u bus=%u offset=%#x value=%#x SMMU=%#x/%#x start=%#x/%#x\n",
 +        platform.live.error,platform.live.stage,platform.live.power.stage,platform.live.power.bus,
 +        platform.live.power.offset,platform.live.power.value,platform.live.domain.offset,platform.live.domain.value,
@@ -4461,7 +4513,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_smmu.c
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,216 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * SMMUv2 stage-1 stream-5 setup. Register ABI: Nothing 031e8669eb19
 + * drivers/iommu/arm/arm-smmu/{arm-smmu.h,arm-smmu.c}, io-pgtable-arm.c.
@@ -4518,8 +4570,14 @@
 +            uint64_t *mid = (uint64_t *)((uint8_t *)t->memory + ((root[a] & ADDR) - t->pa));
 +            if (!mid[b]) mid[b] = (t->pa + 4096ull * used++) | 3;
 +            uint64_t *last = (uint64_t *)((uint8_t *)t->memory + ((mid[b] & ADDR) - t->pa));
-+            /* Normal WB, RW/unprivileged, inner-shareable, AF, nG. */
-+            last[c] = pa | 3 | BIT(6) | (3u << 8) | BIT(10) | BIT(11) |
++            /* GMU kernel buffers match vendor IOMMU_READ|WRITE|PRIV:
++             * AP[2:1]=00, privileged RW. In AArch64 stage-1, a page writable
++             * at EL0 is implicitly PXN for a privileged instruction fetch,
++             * even with descriptor PXN=0. Setting AP_UNPRIV (bit6) here
++             * faults CM3's first external fetch at 0x4000 (FSR408).
++             * GPU user mappings use the separate VM permission builder.
++             * Normal WB, inner-shareable, AF, nG; data remains PXN+UXN. */
++            last[c] = pa | 3 | (3u << 8) | BIT(10) | BIT(11) |
 +                (r[i].executable ? 0 : (3ull << 53));
 +        }
 +    }
@@ -4674,7 +4732,7 @@
 +{ return mg_smmu_attach_stream(io, s, t, 5); }
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_start.c
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,151 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Cold Gen8.6.0 GMU startup through HFI controller ready, from Nothing
 + * 031e8669eb19 adreno_gen8_gmu.c / adreno-gpulist.h / qcom_scm.c.
@@ -4687,6 +4745,14 @@
 +/* Gen8.6.0 device readback exposes AO interrupt mask bits 0..6. Keep the
 + * vendor all-ones write, but do not require reserved upper bits to latch. */
 +#define AO_HOST_INTERRUPT_MASK_BITS 0x7fu
++
++/* Named CX/AO, GBIF and TCM registers from vendor gen8_reg.h. No GX access,
++ * NMI injection, fault clearing or debug-bus programming. */
++const uint32_t mg_start_snapshot_registers[MG_START_SNAPSHOT_WORDS] = {
++    RESET, RESULT, 0x1f801, 0x1f82d, 0x1f980, 0x1f992, 0x1f996,
++    0x23b05, 0x23b13, 0x3c45, 0x3c46, 0x1f9c9,
++    0x1f840, 0x1f841, 0x1b400, 0x1b401,
++};
 +
 +int mg_secure_cx_init(mg_scm_call call, void *context, struct mg_scm_result *result)
 +{
@@ -4716,8 +4782,11 @@
 +static int poll(const struct mg_start_io *io, struct mg_start_status *s,
 +    uint32_t reg, uint32_t mask, uint32_t want)
 +{
++    s->poll_reads = 0;
 +    for (unsigned i = 0; i < 10000; i++) {
 +        uint32_t v = rd(io, s, reg);
++        if (!i) s->poll_first = v;
++        s->poll_reads++;
 +        if (v == UINT32_MAX) return MG_IO;
 +        if ((v & mask) == want) return MG_OK;
 +        io->delay(io->context, 10);
@@ -4796,8 +4865,8 @@
 +        ret = MG_UNSUPPORTED; goto fail;
 +    }
 +    s->stage = MG_START_CONFIG;
-+    io->write(io->context, RESET, 0);
 +    s->released = true;
++    ret = write_check(io,s,RESET,0,UINT32_MAX); if (ret) goto fail;
 +    ret = poll(io,s,RESULT,0x1ff,0x100); if (ret) goto fail;
 +    s->stage = MG_START_CM3;
 +    io->write(io->context, 0x1f986, 1);
@@ -4805,6 +4874,11 @@
 +    s->stage = MG_START_HFI;
 +    return MG_OK;
 +fail:
++    if (s->released) {
++        for (unsigned i = 0; i < MG_START_SNAPSHOT_WORDS; i++)
++            s->snapshot[i] = io->read(io->context,mg_start_snapshot_registers[i]);
++        s->snapshot_valid = true;
++    }
 +    io->write(io->context, RESET, 1);
 +    s->quarantined = true;
 +    return ret;
@@ -4812,7 +4886,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_start.h
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,116 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_START_H
 +#define METROID_GPU_START_H
@@ -4888,11 +4962,20 @@
 +
 +enum mg_start_stage { MG_START_OFF, MG_START_RESET, MG_START_MEMORY,
 +    MG_START_SECURE, MG_START_CONFIG, MG_START_CM3, MG_START_HFI };
++#define MG_START_SNAPSHOT_WORDS 16u
++extern const uint32_t mg_start_snapshot_registers[MG_START_SNAPSHOT_WORDS];
 +struct mg_start_status {
 +    enum mg_start_stage stage;
 +    uint32_t reg, value;
 +    struct mg_scm_result scm;
 +    bool attempted, released, quarantined;
++    uint32_t poll_reads, poll_first;
++    /* Read-only failure snapshot taken BEFORE reasserting CM3 reset.
++     * Never replaces the primary failing register/value or error. */
++    bool snapshot_valid;
++    uint32_t snapshot[MG_START_SNAPSHOT_WORDS];
++    uint32_t firmware_words, firmware_expected;
++    bool firmware_mismatch;
 +};
 +/* Register callbacks take GPU-relative DWORD indices (gen8_reg.h), including
 + * CX_MISC registers beyond MG_GMU_SIZE. The caller maps the actual apertures.

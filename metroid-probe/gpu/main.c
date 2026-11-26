@@ -152,12 +152,35 @@ void probe_exception(uint64_t slot)
 }
 static void report(int result)
 {
+    if(live.start.firmware_mismatch)
+        printf("TCM expected=%#x\n",live.start.firmware_expected);
+    printf("HFI=%#x log=%#x\n",live.memory.config.hfi,live.memory.config.log);
+    printf("tables PA=%#llx CB=%u\n",(unsigned long long)live.memory.tables.pa,live.domain.cb);
+    if(live.start.snapshot_valid) {
+        printf("GMU snapshot BEFORE reset\n");
+        for(unsigned i=0;i<MG_START_SNAPSHOT_WORDS;i++)
+            printf("gmu[%#x]=%#x\n",mg_start_snapshot_registers[i],live.start.snapshot[i]);
+    }
+    if(live.fault_snapshot_valid) {
+        const char *names[]={"GFSR","GFSYNR0","GFSYNR1","FSR","FARlo","FARhi","FSYNR0","FSYNR1"};
+        printf("SMMU faults AFTER reset\n");
+        for(unsigned i=0;i<8;i++) printf("%s=%#x\n",names[i],live.fault_snapshot[i]);
+    }
+    if(live.start.released) for(unsigned i=0;i<live.memory.count;i++) {
+        const struct mg_gmu_backing *b=&live.memory.backing[i];
+        if(b->iova!=live.memory.config.log || b->bytes<32) continue;
+        const volatile uint32_t *log=b->cpu;
+        printf("GMU log raw first 8 words\n");
+        for(unsigned j=0;j<8;j++) printf("log[%u]=%#x\n",j,log[j]);
+    }
     printf("RESULT err=%d live=%u power=%u start=%u\n",result,live.stage,live.power.stage,live.start.stage);
     printf("power-reg=%#x/%#x\n",live.power.offset,live.power.value);
     printf("SMMU=%#x/%#x start-reg=%#x/%#x\n",live.domain.offset,live.domain.value,live.start.reg,live.start.value);
     printf("accel=%u sched=%u hw=%u zap=%u\n",accelerator.stage,accelerator.scheduler.stage,accelerator.hardware.stage,accelerator.zap.stage);
     printf("hw-reg=%#x/%#x submit-reg=%#x/%#x\n",accelerator.hardware.reg,accelerator.hardware.value,accelerator.backend.fault_register,accelerator.backend.fault_value);
     printf("sched-reg=%#x/%#x\n",accelerator.scheduler.fault_register,accelerator.scheduler.fault_value);
+    printf("TCM verified words=%u\n",live.start.firmware_words);
+    printf("poll reads=%u first=%#x\n",live.start.poll_reads,live.start.poll_first);
     printf("pixels verified frames=%u\n",frames);
     printf("Held until manual restart. No storage accessed.\n");
     gpu_screen_present();
@@ -211,7 +234,7 @@ static int pixels_test(void)
 }
 void probe_main(uint64_t dtb, uint64_t entry_el, uint64_t sctlr)
 {
-    printf("METROID GPU PROBE v4\n");
+    printf("METROID GPU PROBE v6\n");
     printf("Shared driver core; no XNU or storage\n");
     console_ready=true;
     if(!gpu_screen_present()) stop();

@@ -27,7 +27,7 @@ def run():
     assert struct.unpack_from('<I',boot,12)[0] == 0
     assert struct.unpack_from('<I',boot,8)[0] == len(raw) and boot[4096:] == raw
     assert raw[56:60] == b'ARM\x64' and struct.unpack_from('<Q',raw,16)[0] == len(raw)
-    assert b'METROID GPU PROBE v4' in raw
+    assert b'METROID GPU PROBE v6' in raw
     # Validate every actual runtime relocation at multiple physical bases.
     elf = (out/'metroid-gpu.elf').read_bytes()
     shoff = struct.unpack_from('<Q',elf,40)[0]

@@ -32,7 +32,7 @@ RAM/reservation validator succeeds. No allocation or vote is reused/released
 after GPU exposure; manually restart after reading the results. This is a
 single attempt per boot, with existing driver timeouts and quarantine guards.
 
-v4 draws diagnostics and verified GPU pixels directly into the inherited
+v6 draws diagnostics and verified GPU pixels directly into the inherited
 framebuffer, following Metroid XNU's retained-scanout console (overlays0017
 and0019). It discovers and validates active surfaces once, snapshots each
 surface's address/origin/stride, writes framebuffer RAM, and issues a memory
@@ -46,7 +46,48 @@ Record the last `GPU:` checkpoint and all result/exception fields. v1/v2 were
 reported to show only their opening title and description (v2 also the zero
 frames footer). v3 used the older CPU probe's CTL_START and 100 ms delay path.
 Those observations do not locate a GPU failure or establish a timing cause.
-The v4 framebuffer path still needs verification on the device.
+The retained-framebuffer path still needs device verification with an identified
+image version/hash.
+
+For the reported `err=-10 live=5 start=4 start-reg=0x1f81c/0`, v5 adds:
+
+- Full ITCM/DTCM payload readback while CM3 is held in reset. A mismatch fails
+  before reset release and records the register, observed word and expected
+  word. `TCM verified words` counts successful comparisons, not execution.
+- CM3 reset-release readback. A dropped release fails at `0x1f800` rather than
+  being misreported as a firmware-ready timeout.
+- First poll value and poll-read count. The vendor firmware-ready condition
+  remains `(FW_INIT_RESULT & 0x1ff) == 0x100`, with the same 100 ms budget.
+- A read-only GMU snapshot before reasserting CM3 reset: reset/result/config,
+  HFI/interrupt/fence state, GBIF halt/ack, log write pointer, AO counter and
+  the first two ITCM words. The original failure register/value is preserved.
+- Global and selected-context SMMU faults read after CM3 reset, without clearing
+  faults, and the first eight raw words of the probe's owned firmware log.
+
+The exact reported timeout is still a failure: no HFI startup, retry, resource
+reuse or forced-ready path follows it. A host model reproduces that tuple and
+checks the pre-reset snapshot and retained fault details. These changes fix
+missing validation and diagnostics; they do not establish or prove a cure for
+the hardware firmware-ready timeout by themselves.
+
+The v5 device photo supplies a concrete next fix: TCM readback passed139words,
+CM3 reset was released, but the selected SMMU context recorded `FSR=0x408`,
+`FAR=0x4000`, `FSYNR0=0x1a0063`. This is a privileged instruction-read
+permission fault at the first external firmware page. Our GMU page builder set
+AP_UNPRIV, making firmware memory writable by unprivileged accesses. AArch64
+stage-1 treats such pages as implicitly privileged-execute-never, even if the
+descriptor's explicit PXN bit is clear. The vendor GMU allocator requests
+`IOMMU_READ | IOMMU_WRITE | IOMMU_PRIV` instead.
+
+v6 removes AP_UNPRIV from the GMU-only page builder. GMU data remains
+non-executable; the GPU VM builder and its user permissions are unchanged.
+The integrated model now checks the actual GMU PTE permissions before
+signalling firmware-ready, rather than automatically succeeding on reset
+release. Old PTEs reproduce the exact photographed fault tuple under that
+architectural permission model; corrected PTEs permit privileged firmware
+fetches. This is a source/model result, not confirmation of hardware startup.
+Temporary-boot v6 next and capture its final result; all v5 diagnostics and
+firmware-ready/time-limit/quarantine checks remain enabled.
 
 Host validation checks the boot headers, firmware-bearing image, relative PIE
 relocations at three load bases, reuse of the validated surface decoder,
