@@ -4130,7 +4130,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_scheduler.c
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,263 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Nothing 031e8669 adreno_gen8_hwsched_hfi.c's cold, polling control path.
 + * No warmboot, IFPC, preemption, LPAC, HW fences or interrupt ownership.
@@ -4194,6 +4194,11 @@
 +{
 +    if ((words != 10 && words != 11) || in[1] > 1 ||
 +        (in[1] == 1 && words != 11) || (in[1] == 0 && words != 10)) return MG_INVALID;
++    /* Preserve the exact request before validating policy or invoking the
++     * allocator. Unsupported requests must be diagnosable without accepting
++     * secure/MMIO/unknown memory as ordinary RAM. */
++    s->allocation_request_words = words;
++    memcpy(s->allocation_request,in,words * sizeof(*in));
 +    struct mg_sched_allocation a = {
 +        .gpu = in[2] | ((uint64_t)in[3] << 32), .flags = in[4],
 +        .kind = in[5], .host_handle = in[6], .firmware_handle = in[7],
@@ -4391,7 +4396,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_scheduler.h
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,54 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_SCHEDULER_H
 +#define METROID_GPU_SCHEDULER_H
@@ -4434,6 +4439,7 @@
 +    unsigned allocation_count;
 +    uint32_t sequence, waiting, last_header, fault_register, fault_value;
 +    uint32_t last_kind, last_flags, last_bytes, last_align;
++    uint32_t allocation_request[11], allocation_request_words;
 +    enum mg_sched_stage stage;
 +    int error;
 +    bool attempted, exposed, quarantined, booting_gpu;

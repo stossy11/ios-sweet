@@ -95,3 +95,11 @@ split-pipe/padding bounds, cached discovery and absence of display-register
 writes or waits. It runs the actual probe
 pixel commands through the sanitizer-enabled integrated GPU model and verifies
 that corrupted output fails. These checks do not replace device verification.
+
+
+v7 additionally retains and prints the complete10/11word scheduler memory
+request: header/version, GPU address, flags, kind, both handles, GMU address,
+size and alignment. The v6 device report reached live6/start6 (HFI ready), then
+failed MG_UNSUPPORTED at scheduler stage4 during START allocation handling.
+Capture the `START memory request RAW` block to identify the rejected contract.
+No allocation-policy checks have been relaxed for this diagnostic change.

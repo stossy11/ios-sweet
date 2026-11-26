@@ -174,6 +174,13 @@ static void report(int result)
         for(unsigned j=0;j<8;j++) printf("log[%u]=%#x\n",j,log[j]);
     }
     printf("RESULT err=%d live=%u power=%u start=%u\n",result,live.stage,live.power.stage,live.start.stage);
+    if(accelerator.scheduler.allocation_request_words) {
+        printf("START memory request RAW\n");
+        const char *names[]={"header","version","gpu-lo","gpu-hi","flags","kind",
+            "host-handle","fw-handle","gmu","bytes","align"};
+        for(unsigned i=0;i<accelerator.scheduler.allocation_request_words;i++)
+            printf("req %s=%#x\n",names[i],accelerator.scheduler.allocation_request[i]);
+    }
     printf("power-reg=%#x/%#x\n",live.power.offset,live.power.value);
     printf("SMMU=%#x/%#x start-reg=%#x/%#x\n",live.domain.offset,live.domain.value,live.start.reg,live.start.value);
     printf("accel=%u sched=%u hw=%u zap=%u\n",accelerator.stage,accelerator.scheduler.stage,accelerator.hardware.stage,accelerator.zap.stage);
@@ -234,7 +241,7 @@ static int pixels_test(void)
 }
 void probe_main(uint64_t dtb, uint64_t entry_el, uint64_t sctlr)
 {
-    printf("METROID GPU PROBE v6\n");
+    printf("METROID GPU PROBE v7\n");
     printf("Shared driver core; no XNU or storage\n");
     console_ready=true;
     if(!gpu_screen_present()) stop();
