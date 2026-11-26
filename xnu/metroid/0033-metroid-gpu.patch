@@ -78,7 +78,7 @@
 +#include <IOKit/IOBufferMemoryDescriptor.h>
 +#include <pexpert/pexpert.h>
 +#include <libkern/c++/OSNumber.h>
-+#include "metroid_gpu_live.h"
++#include "../../bsd/dev/metroid_gpu_live.h"
 +
 +/* Metal discovers devices by this IOKit metaclass, not the service name.
 + * An explicit experimental boot selects the existing userspace bundle even
