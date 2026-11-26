@@ -1,6 +1,6 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,17 @@
+@@ -109,6 +109,19 @@
  bsd/dev/metroid_touch.c			standard
  bsd/dev/metroid_wifi.c			standard
  bsd/dev/metroid_usb.c			standard
@@ -15,6 +15,8 @@
 +bsd/dev/metroid_gpu_queue.c		standard
 +bsd/dev/metroid_gpu_memory.c		standard
 +bsd/dev/metroid_gpu_submit.c		standard
++bsd/dev/metroid_gpu_live.c		standard
++bsd/dev/metroid_gpu_platform.c		standard
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
@@ -36,6 +38,227 @@
  	metroid_touch_init();
  	return true;
  }
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -47,6 +47,7 @@
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
++extern "C" void metroid_gpu_publish_metal(IOService *);
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+@@ -201,3 +202,4 @@
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	metroid_gpu_publish_metal(this);
+ 	registerService();
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -32,6 +32,7 @@
+ # libIOKit
+ 
+ iokit/Kernel/IOHibernateIO.cpp				optional hibernation
++iokit/Kernel/MetroidGPU.cpp				optional iokitcpp
+ iokit/Kernel/IOHibernateRestoreKernel.c			optional hibernation
+ 
+ iokit/Kernel/IOLib.cpp					optional iokitcpp
+--- /dev/null
++++ b/iokit/Kernel/MetroidGPU.cpp
+@@ -0,0 +1,193 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ * Read-only bring-up service. Deliberately does not match "HakiosGPU": that
++ * name makes the Metal plugin enumerate a usable GEM/submit accelerator.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <pexpert/pexpert.h>
++#include <libkern/c++/OSNumber.h>
++#include "metroid_gpu_live.h"
++
++/* Metal discovers devices by this IOKit metaclass, not the service name.
++ * An explicit experimental boot selects the existing userspace bundle even
++ * before the unfinished GEM backend can render. Do not relabel diagnostics
++ * as HakiosGPU: the bundle's separate backend lookup must fail honestly. */
++class IOAcceleratorES : public IOService {
++    OSDeclareDefaultStructors(IOAcceleratorES);
++};
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++extern "C" void metroid_gpu_publish_metal(IOService *framebuffer)
++{
++    int enabled = 0;
++    if (!PE_parse_boot_argn("metroidmetal", &enabled, sizeof(enabled)) || enabled != 1)
++        return;
++    if (!framebuffer) return;
++    auto accelerator = new IOAcceleratorES;
++    if (!accelerator) return;
++    if (!accelerator->init() || !accelerator->attach(framebuffer)) {
++        accelerator->release();
++        return;
++    }
++    if (!accelerator->start(framebuffer)) {
++        accelerator->detach(framebuffer);
++        accelerator->release();
++        return;
++    }
++    accelerator->setName("sgx");
++    /* Set both before publication: Metal enumerates once per process. */
++    bool properties = accelerator->setProperty("MetalPluginName", "HakiosMetal") &&
++        accelerator->setProperty("MetalPluginClassName", "HakiosMetalDevice") &&
++        accelerator->setProperty("MetroidExperimentalMetal", true) &&
++        accelerator->setProperty("AcceleratorReady", false);
++    if (properties) {
++        IOLog("METROID METAL: metroidmetal=1 selects HakiosMetal/HakiosMetalDevice; "
++            "experimental discovery, GPU rendering not ready\n");
++        accelerator->registerService();
++    } else {
++        accelerator->stop(framebuffer);
++        accelerator->detach(framebuffer);
++        IOLog("METROID METAL: failed to set discovery properties; not published\n");
++    }
++    accelerator->release();
++}
++
++/* Descriptor-owned Normal-NC memory: no WB CPU alias used for HFI polling.
++ * The buffer options select the cache mode at allocation, not by adding an
++ * alias to an IOMallocContiguous allocation. MapperNone keeps this GPU SMMU
++ * separate from the unrelated system IOMapper. */
++extern "C" int metroid_gpu_dma_allocate(void *, size_t bytes, mg_memory_block *out)
++{
++    auto memory = new IOBufferMemoryDescriptor;
++    if (!memory) return MG_LIMIT;
++    if (!memory->initWithPhysicalMask(kernel_task,
++        kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryMapperNone |
++        kIOMapWriteCombineCache, bytes, MG_MEMORY_PAGE, 0)) {
++        memory->release();
++        return MG_LIMIT;
++    }
++    if (memory->prepare() != kIOReturnSuccess) {
++        memory->release();
++        return MG_IO;
++    }
++    IOByteCount span = 0;
++    IOPhysicalAddress pa = memory->getPhysicalSegment(0, &span);
++    void *cpu = memory->getBytesNoCopy();
++    if (!cpu || !pa || span < bytes ||
++        ((reinterpret_cast<uintptr_t>(cpu) | pa) & (MG_MEMORY_PAGE - 1))) {
++        memory->complete();
++        memory->release();
++        return MG_UNBACKED;
++    }
++    bzero(cpu, bytes);
++    *out = {cpu, memory, pa, bytes};
++    return MG_OK;
++}
++extern "C" void metroid_gpu_dma_release(void *, mg_memory_block *block)
++{
++    auto memory = static_cast<IOBufferMemoryDescriptor *>(block->token);
++    memory->complete();
++    memory->release();
++    *block = {};
++}
++
++class MetroidGPUUserClient : public IOUserClient {
++    OSDeclareDefaultStructors(MetroidGPUUserClient);
++public:
++    IOReturn clientClose() override;
++    IOReturn externalMethod(uint32_t, IOExternalMethodArguments *,
++        IOExternalMethodDispatch *, OSObject *, void *) override;
++};
++OSDefineMetaClassAndStructors(MetroidGPUUserClient, IOUserClient);
++
++IOReturn MetroidGPUUserClient::clientClose()
++{
++    terminate();
++    return kIOReturnSuccess;
++}
++IOReturn MetroidGPUUserClient::externalMethod(uint32_t selector,
++    IOExternalMethodArguments *args, IOExternalMethodDispatch *, OSObject *, void *)
++{
++    if (isInactive()) return kIOReturnNotAttached;
++    if (selector != 0) return kIOReturnUnsupported;
++    if (!args || args->scalarInputCount || args->scalarOutputCount ||
++        args->structureInputSize || args->structureInputDescriptor ||
++        args->structureOutputDescriptor || !args->structureOutput ||
++        args->structureOutputSize != sizeof(mg_live_report)) return kIOReturnBadArgument;
++    static_assert(sizeof(mg_live_report) == 64, "status ABI");
++    mg_live_report report;
++    metroid_gpu_copy_report(&report);
++    memcpy(args->structureOutput, &report, sizeof(report));
++    return kIOReturnSuccess;
++}
++
++class MetroidGPU : public IOService {
++    OSDeclareDefaultStructors(MetroidGPU);
++public:
++    bool start(IOService *) override;
++    IOReturn newUserClient(task_t, void *, UInt32, OSDictionary *, IOUserClient **) override;
++};
++OSDefineMetaClassAndStructors(MetroidGPU, IOService);
++
++bool MetroidGPU::start(IOService *provider)
++{
++    if (!IOService::start(provider)) return false;
++    mg_live_report report;
++    metroid_gpu_copy_report(&report);
++    setName("MetroidGPU");
++    setProperty("GPUChipID", MG_CHIP_ID, 32);
++    setProperty("StatusVersion", report.version, 32);
++    setProperty("StartupStage", report.stage, 32);
++    setProperty("StartupError", static_cast<uint32_t>(report.error), 32);
++    setProperty("HFIReady", report.hfi_ready != 0);
++    setProperty("DMAExposed", report.exposed != 0);
++    setProperty("Quarantined", report.quarantined != 0);
++    setProperty("AcceleratorReady", false);
++    setProperty("Interface", "read-only startup status; selector 0, 64-byte ABI v1");
++    registerService();
++    return true;
++}
++IOReturn MetroidGPU::newUserClient(task_t task, void *security, UInt32 type,
++    OSDictionary *properties, IOUserClient **out)
++{
++    if (!out) return kIOReturnBadArgument;
++    *out = nullptr;
++    if (type != 0) return kIOReturnUnsupported;
++    if (isInactive()) return kIOReturnNotAttached;
++    auto client = new MetroidGPUUserClient;
++    if (!client) return kIOReturnNoMemory;
++    if (!client->initWithTask(task, security, type, properties)) {
++        client->release();
++        return kIOReturnNoMemory;
++    }
++    if (!client->attach(this)) {
++        client->release();
++        return kIOReturnError;
++    }
++    if (!client->start(this)) {
++        client->detach(this);
++        client->release();
++        return kIOReturnError;
++    }
++    *out = client;
++    return kIOReturnSuccess;
++}
++
++extern "C" void metroid_gpu_service_start(void)
++{
++    IOService *provider = IOService::getPlatform();
++    if (!provider) return;
++    auto service = new MetroidGPU;
++    if (!service) return;
++    if (!service->init() || !service->attach(provider)) {
++        service->release();
++        return;
++    }
++    if (!service->start(provider)) service->detach(provider);
++    service->release();
++}
++#endif
 --- a/bsd/dev/metroid_touch_power.h
 +++ b/bsd/dev/metroid_touch_power.h
 @@ -334,3 +334,5 @@
@@ -46,12 +269,13 @@
 +#include "metroid_gpu_rpmh.h"
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu.c
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,206 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Metroid Adreno825 hardware bring-up entry point. metroidgpu=1 reads ONLY
 + * the GPU clock-controller registers below. metroidgpu=2 attempts a cold
 + * CX/clock test, retaining high CX/MX votes and holding GMU reset until reboot.
-+ * Default off; no GMU execution, SMMU changes or accelerator service.
++ * Default off. Mode 5 integrates owned GMU startup when a board fabric owner
++ * is installed; its IOKit service reports diagnostics, not acceleration.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -64,6 +288,7 @@
 +#include <IOKit/IOLib.h>
 +#include "metroid_gpu.h"
 +#include "metroid_gpu_memory.h"
++#include "metroid_gpu_live.h"
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern void ml_io_unmap(vm_offset_t, vm_size_t);
@@ -85,7 +310,7 @@
 +    *(volatile uint32_t *)((bus == MG_CC ? h->cc : h->gcc) + offset) = value;
 +    __asm__ volatile("dsb osh" ::: "memory");
 +}
-+static void mg_delay(void *context, unsigned us) { (void)context; delay((int)us); }
++static void mg_delay(void *context, unsigned us) { (void)context; IODelay(us); }
 +static int mg_rails(void *context) { (void)context; return metroid_gpu_rpmh_enable(); }
 +
 +static bool mg_is_metroid(void)
@@ -130,7 +355,7 @@
 +}
 +#pragma clang diagnostic pop
 +
-+static void mg_payload_check(bool prepare_memory)
++static void mg_payload_check(bool prepare_memory, bool live)
 +{
 +    DTEntry node;
 +    const void *property;
@@ -139,6 +364,7 @@
 +    if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &node) != kSuccess ||
 +        SecureDTGetProperty(node, "MetroidGMU", &property, &size) != kSuccess || size != 16) {
 +        printf("METROID GPU: no reserved MetroidGMU image; use metroid-gpu-payload.py\n");
++        if (live) metroid_gpu_live_init(NULL, 0);
 +        return;
 +    }
 +    uint64_t extent[2];
@@ -151,12 +377,17 @@
 +        args->topOfKernelData - args->physBase > args->memSize ||
 +        pa > args->topOfKernelData || bytes > args->topOfKernelData - pa) {
 +        printf("METROID GPU: invalid reserved GMU firmware extent\n");
++        if (live) metroid_gpu_live_init(NULL, 0);
 +        return;
 +    }
 +    const void *image = (const void *)ml_static_ptovirt((vm_offset_t)pa);
 +    int result = mg_fw_parse(image, (size_t)bytes, &plan);
 +    printf("METROID GPU: reserved GMU preflight result=%d bytes=%llu blocks=%u reservations=%u\n",
 +        result, (unsigned long long)bytes, plan.count, plan.reservation_count);
++    if (live) {
++        metroid_gpu_live_init(result ? NULL : image, result ? 0 : (size_t)bytes);
++        return;
++    }
 +    if (!result && prepare_memory) {
 +        /* A deliberately separate preflight mode: allocate actual wired XNU
 +         * backing and construct all stream-5 tables without exposing them to
@@ -183,13 +414,13 @@
 +{
 +    int mode = 0;
 +    if (!PE_parse_boot_argn("metroidgpu", &mode, sizeof(mode)) || !mode) return;
-+    if ((mode < 1 || mode > 4) || !mg_is_metroid()) {
++    if ((mode < 1 || mode > 5) || !mg_is_metroid()) {
 +        printf("METROID GPU: unsupported mode/platform; disabled\n");
 +        return;
 +    }
 +    /* IOKit can retry service startup. Never repeat a partial hardware test. */
 +    if (__atomic_exchange_n(&mg_started, 1, __ATOMIC_ACQUIRE)) return;
-+    if (mode == 3 || mode == 4) { mg_payload_check(mode == 4); return; }
++    if (mode >= 3) { mg_payload_check(mode == 4, mode == 5); return; }
 +    /* Each offset is from Nothing's drivers/clk/qcom/gpucc-tuna.c.
 +     * Do not probe GX, CM3, TCM or SMMU registers before power/clock bring-up:
 +     * reads of a powered-down domain can themselves produce a bus fault.
@@ -247,7 +478,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu.h
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,127 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Metroid Adreno825 / Gen8.6.0 driver foundation.
 + * Wire formats follow Nothing's public KGSL source at 031e8669eb19.
@@ -302,6 +533,8 @@
 +};
 +int mg_power_enable(const struct mg_power_io *, struct mg_power_status *);
 +int metroid_gpu_rpmh_enable(void);
++int metroid_gpu_rpmh_fabric_enable(void);
++bool metroid_gpu_rpmh_fabric_ready(void);
 +
 +enum mg_region { MG_ITCM, MG_CACHE, MG_DTCM, MG_UNCACHED, MG_UNCACHED_EXT };
 +#define MG_FW_MAX_BLOCKS 128u
@@ -654,6 +887,187 @@
 +    return MG_OK;
 +}
 --- /dev/null
++++ b/bsd/dev/metroid_gpu_live.c
+@@ -0,0 +1,97 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include "metroid_gpu_live.h"
++
++static int ready(void *context)
++{
++    struct mg_live *s = context;
++    return s->memory.exposed && s->domain.attached && !s->domain.quarantined &&
++        s->power.stage == MG_POWER_RESET_HELD &&
++        s->io.fabric_ready(s->io.context) ? MG_OK : MG_UNBACKED;
++}
++static uint32_t read_reg(void *context, uint32_t reg)
++{ struct mg_live *s = context; return s->io.read(s->io.context, reg); }
++static void write_reg(void *context, uint32_t reg, uint32_t value)
++{ struct mg_live *s = context; s->io.write(s->io.context, reg, value); }
++static void delay_us(void *context, unsigned us)
++{ struct mg_live *s = context; s->io.delay(s->io.context, us); }
++static void publish(void *context, const void *p, size_t bytes)
++{ struct mg_live *s = context; s->io.publish(s->io.context, p, bytes); }
++static struct mg_scm_result scm(void *context, uint32_t fn, uint32_t info, uint64_t arg)
++{ struct mg_live *s = context; return s->io.scm(s->io.context, fn, info, arg); }
++static int prepare(void *context)
++{
++    struct mg_live *s = context;
++    if (ready(s)) return MG_UNBACKED;
++    struct mg_gmu_loader loader = {s, write_reg, publish,
++        s->memory.backing, s->memory.firmware_count};
++    int error = mg_gmu_load(s->image, s->image_bytes, &s->memory.firmware, &loader);
++    if (error) return error;
++    /* The loader must not zero HFI/VRB. Publish the separately initialized
++     * transport, log and VRB after the firmware's external reservations. */
++    for (unsigned i = s->memory.firmware_count; i < s->memory.count; i++)
++        publish(s, s->memory.backing[i].cpu, s->memory.backing[i].bytes);
++    return MG_OK;
++}
++
++int mg_live_boot(struct mg_live *s, const struct mg_live_io *io,
++    const void *image, size_t bytes)
++{
++    if (!s || !io || !image || !bytes || !io->retain_fabric ||
++        !io->fabric_ready || !io->configure || !io->read || !io->write ||
++        !io->delay || !io->publish || !io->scm ||
++        !io->memory.allocate || !io->memory.release ||
++        !io->power.read || !io->power.write || !io->power.delay || !io->power.rails ||
++        !io->smmu.read || !io->smmu.write || !io->smmu.write64 ||
++        !io->smmu.delay || !io->smmu.publish) return MG_INVALID;
++    if (s->attempted) return MG_BUSY;
++    s->attempted = true;
++    s->io = *io; s->image = image; s->image_bytes = bytes;
++    int error = mg_gmu_memory_prepare(&s->memory, &io->memory, image, bytes);
++    if (error) goto fail;
++    s->stage = MG_LIVE_MEMORY;
++    s->fabric_attempted = true;
++    error = io->retain_fabric(io->context);
++    if (error) goto fail;
++    if (!io->fabric_ready(io->context)) { error = MG_UNBACKED; goto fail; }
++    s->stage = MG_LIVE_FABRIC;
++    error = mg_power_enable(&io->power, &s->power);
++    if (error) goto fail;
++    s->stage = MG_LIVE_POWER;
++    error = io->configure(io->context);
++    if (error) goto fail;
++    s->stage = MG_LIVE_PLATFORM;
++    if (!io->fabric_ready(io->context)) { error = MG_UNBACKED; goto fail; }
++    /* Must precede even the first possibly-posted SMMU write. */
++    s->memory.exposed = true;
++    error = mg_smmu_attach(&io->smmu, &s->domain, &s->memory.tables);
++    if (error) goto fail;
++    s->stage = MG_LIVE_SMMU;
++    const struct mg_start_io start = {s, read_reg, write_reg, delay_us, ready, prepare, scm};
++    error = mg_gmu_start(&start, &s->memory.config, &s->start);
++    if (error) goto fail;
++    s->stage = MG_LIVE_HFI;
++    return MG_OK;
++fail:
++    s->error = error;
++    s->quarantined = s->fabric_attempted || s->power.touched || s->memory.exposed;
++    /* Unexposed RAM can be freed, including after a rail/clock failure;
++     * this never withdraws fabric/rail votes or resets someone else's GPU. */
++    if (!s->memory.exposed) (void)mg_gmu_memory_release(&s->memory, &io->memory);
++    return error;
++}
++
++bool mg_live_gmu_mapped(const struct mg_live *s, const void *cpu, uint32_t gpu, size_t bytes)
++{
++    if (!s || !cpu || !bytes || s->stage != MG_LIVE_HFI || s->quarantined ||
++        !s->domain.attached || s->domain.quarantined || !s->memory.exposed ||
++        !s->io.fabric_ready(s->io.context)) return false;
++    for (unsigned i = 0; i < s->memory.count; i++) {
++        const struct mg_gmu_backing *b = &s->memory.backing[i];
++        if (gpu < b->iova) continue;
++        uint64_t offset = (uint64_t)gpu - b->iova;
++        if (offset < b->bytes && bytes <= b->bytes - offset &&
++            (uintptr_t)cpu >= (uintptr_t)b->cpu &&
++            (uintptr_t)cpu - (uintptr_t)b->cpu == offset) return true;
++    }
++    return false;
++}
+--- /dev/null
++++ b/bsd/dev/metroid_gpu_live.h
+@@ -0,0 +1,78 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef METROID_GPU_LIVE_H
++#define METROID_GPU_LIVE_H
++#include "metroid_gpu_memory.h"
++
++/* The caller serializes boot and all access to this owner. Once exposed, its
++ * memory, mappings, fabric votes and clocks have reboot lifetime, even on a
++ * timeout. No stop/retry API exists until DMA drain can be demonstrated.
++ * Every allocation must be CPU/GMU coherent or CPU Normal-NC (not merely
++ * clean at boot), with device access ordered by the supplied barriers.
++ */
++enum mg_live_stage { MG_LIVE_OFF, MG_LIVE_MEMORY, MG_LIVE_FABRIC,
++    MG_LIVE_POWER, MG_LIVE_PLATFORM, MG_LIVE_SMMU, MG_LIVE_HFI };
++struct mg_live_io {
++    void *context;
++    struct mg_memory_io memory;
++    struct mg_power_io power;
++    struct mg_smmu_io smmu;
++    /* Retain acknowledged DDR/CNOC/TCU votes until reboot. An ambiguous
++     * failure retains votes too. Never implement this as unconditional OK. */
++    int (*retain_fabric)(void *);
++    bool (*fabric_ready)(void *);
++    /* After power-enable, safely deassert GPUCC reset with CM3 reset held,
++     * enable the GPU SMMU clock, initialize AHB timeout and CX timer. */
++    int (*configure)(void *);
++    uint32_t (*read)(void *, uint32_t); /* GPU-relative dwords */
++    void (*write)(void *, uint32_t, uint32_t);
++    void (*delay)(void *, unsigned);
++    void (*publish)(void *, const void *, size_t);
++    mg_scm_call scm;
++};
++struct mg_live {
++    struct mg_gmu_memory memory;
++    struct mg_smmu_domain domain;
++    struct mg_power_status power;
++    struct mg_start_status start;
++    struct mg_live_io io;
++    const void *image;
++    size_t image_bytes;
++    enum mg_live_stage stage;
++    int error;
++    bool attempted, fabric_attempted, quarantined;
++};
++
++int mg_live_boot(struct mg_live *, const struct mg_live_io *, const void *, size_t);
++/* Validates an exact CPU/IOVA relationship inside owned, mapped backing.
++ * A subrange must fit in a single range; padding and tables are not data. */
++bool mg_live_gmu_mapped(const struct mg_live *, const void *, uint32_t, size_t);
++
++/* Board code may replace the built-in retained BCM owner before init. There
++ * is no success stub or boot-argument bypass of fabric ownership. */
++struct mg_fabric_owner {
++    void *context;
++    int (*retain)(void *);
++    bool (*ready)(void *);
++    uint32_t ahb_timeout; /* board-derived 1..31 field, before NOC timeout */
++};
++#ifdef __cplusplus
++extern "C" {
++#endif
++int metroid_gpu_install_fabric_owner(const struct mg_fabric_owner *);
++/* Fixed-width status ABI v1. Diagnostic only: HFI-ready != GPU-ready. */
++struct mg_live_report {
++    uint32_t version, mode, stage;
++    int32_t error;
++    uint32_t power_stage, start_stage, smmu_offset, smmu_value;
++    uint32_t start_register, start_value, ranges, table_pages;
++    uint32_t exposed, quarantined, hfi_ready, accelerator_ready;
++};
++void metroid_gpu_copy_report(struct mg_live_report *);
++void metroid_gpu_service_start(void);
++void metroid_gpu_live_init(const void *, size_t);
++int metroid_gpu_dma_allocate(void *, size_t, struct mg_memory_block *);
++void metroid_gpu_dma_release(void *, struct mg_memory_block *);
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
 +++ b/bsd/dev/metroid_gpu_load.c
 @@ -0,0 +1,86 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
@@ -955,6 +1369,214 @@
 +
 +#endif
 --- /dev/null
++++ b/bsd/dev/metroid_gpu_platform.c
+@@ -0,0 +1,205 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ * XNU adapter for the retained GMU owner. No inherited bandwidth assumption.
++ * Register sequences: Nothing 031e8669, gpucc-tuna.c/adreno_gen8.c.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <IOKit/IOLib.h>
++#include "metroid_gpu_live.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
++/* One mapping includes GPU, TCM, GMUCX, AO, GPUCC and CX_MISC. Do not map
++ * overlapping Device aliases separately. The next aperture is the SMMU. */
++#define MG_REGISTER_BYTES 0xa0000u
++static struct {
++    vm_offset_t gpu, gcc, smmu;
++    struct mg_live live;
++    struct mg_fabric_owner fabric;
++    unsigned phase, report_ready;
++    struct mg_live_report report;
++} platform;
++
++int metroid_gpu_install_fabric_owner(const struct mg_fabric_owner *owner)
++{
++    if (!owner || !owner->retain || !owner->ready ||
++        !owner->ahb_timeout || owner->ahb_timeout > 31) return MG_INVALID;
++    unsigned expected = 0;
++    if (!__atomic_compare_exchange_n(&platform.phase, &expected, 1, false,
++        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return MG_BUSY;
++    platform.fabric = *owner;
++    __atomic_store_n(&platform.phase, 2, __ATOMIC_RELEASE);
++    return MG_OK;
++}
++void metroid_gpu_copy_report(struct mg_live_report *out)
++{
++    if (!out) return;
++    *out = (struct mg_live_report){.version = 1};
++    /* Published exactly once, after all mutable boot state is finalized. */
++    if (__atomic_load_n(&platform.report_ready, __ATOMIC_ACQUIRE))
++        *out = platform.report;
++}
++static uint32_t rd(vm_offset_t base, uint32_t offset)
++{
++    uint32_t value = *(volatile uint32_t *)(base + offset);
++    __asm__ volatile("dmb oshld" ::: "memory");
++    return value;
++}
++static void wr(vm_offset_t base, uint32_t offset, uint32_t value)
++{
++    __asm__ volatile("dmb oshst" ::: "memory");
++    *(volatile uint32_t *)(base + offset) = value;
++    __asm__ volatile("dsb osh" ::: "memory");
++}
++static uint32_t gpu_read(void *p, uint32_t reg)
++{ (void)p; return reg < MG_REGISTER_BYTES / 4 ? rd(platform.gpu, reg * 4) : UINT32_MAX; }
++static void gpu_write(void *p, uint32_t reg, uint32_t value)
++{ (void)p; if (reg < MG_REGISTER_BYTES / 4) wr(platform.gpu, reg * 4, value); }
++static uint32_t power_read(void *p, enum mg_bus bus, uint32_t offset)
++{ (void)p; return rd(bus == MG_CC ? platform.gpu + MG_GPUCC_PA - MG_GPU_PA : platform.gcc, offset); }
++static void power_write(void *p, enum mg_bus bus, uint32_t offset, uint32_t value)
++{ (void)p; wr(bus == MG_CC ? platform.gpu + MG_GPUCC_PA - MG_GPU_PA : platform.gcc, offset, value); }
++static uint32_t smmu_read(void *p, uint32_t offset)
++{ (void)p; return offset <= MG_SMMU_SIZE - 4 ? rd(platform.smmu, offset) : UINT32_MAX; }
++static void smmu_write(void *p, uint32_t offset, uint32_t value)
++{ (void)p; if (offset <= MG_SMMU_SIZE - 4) wr(platform.smmu, offset, value); }
++static void smmu_write64(void *p, uint32_t offset, uint64_t value)
++{
++    (void)p;
++    if (offset > MG_SMMU_SIZE - 8 || (offset & 7)) return;
++    __asm__ volatile("dmb oshst" ::: "memory");
++    *(volatile uint64_t *)(platform.smmu + offset) = value;
++    __asm__ volatile("dsb osh" ::: "memory");
++}
++static void wait_us(void *p, unsigned us) { (void)p; IODelay(us); }
++static int rails(void *p) { (void)p; return metroid_gpu_rpmh_enable() ? MG_IO : MG_OK; }
++static int retain_fabric(void *p) { (void)p; return platform.fabric.retain(platform.fabric.context); }
++static bool fabric_ready(void *p) { (void)p; return platform.fabric.ready(platform.fabric.context); }
++static int board_retain(void *p)
++{ (void)p; return metroid_gpu_rpmh_fabric_enable() ? MG_IO : MG_OK; }
++static bool board_ready(void *p)
++{ (void)p; return metroid_gpu_rpmh_fabric_ready(); }
++static void publish(void *p, const void *cpu, size_t bytes)
++{
++    (void)p;
++    uint64_t ctr;
++    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
++    uintptr_t line = (uintptr_t)4 << ((ctr >> 16) & 15);
++    uintptr_t end = (uintptr_t)cpu + bytes;
++    for (uintptr_t va = (uintptr_t)cpu & ~(line - 1); va < end; va += line)
++        __asm__ volatile("dc cvac, %0" :: "r"(va) : "memory");
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++static uint64_t counter(void)
++{ uint64_t value; __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(value)); return value; }
++static int configure(void *p)
++{
++    (void)p;
++    /* Never inspect the GMU while GPUCC holds its block in reset. Once
++     * deasserted, the CM3 reset default must still be asserted. */
++    uint32_t reset = power_read(NULL, MG_CC, 0x9314);
++    if (reset == UINT32_MAX || !(reset & 1)) return MG_STALE;
++    power_write(NULL, MG_CC, 0x9314, reset & ~1u);
++    wait_us(NULL, 10);
++    if ((power_read(NULL, MG_CC, 0x9314) & 1) || gpu_read(NULL, 0x1f800) != 1)
++        return MG_STALE;
++    uint32_t vote = power_read(NULL, MG_CC, 0x7000);
++    if (vote == UINT32_MAX) return MG_IO;
++    power_write(NULL, MG_CC, 0x7000, vote | 1);
++    unsigned us;
++    for (us = 0; us < 1000; us++) {
++        vote = power_read(NULL, MG_CC, 0x7000);
++        if (vote == UINT32_MAX) return MG_IO;
++        if ((vote & 0x80000001u) == 1) break;
++        wait_us(NULL, 1);
++    }
++    if (us == 1000) return MG_TIMEOUT;
++    for (uint32_t reg = 0x27810; reg <= 0x27814; reg++) {
++        uint32_t value = 0x1b00u | platform.fabric.ahb_timeout;
++        gpu_write(NULL, reg, value);
++        if (gpu_read(NULL, reg) != value) return MG_IO;
++    }
++    /* Source's 16-sample CX timer calibration, bounded with interrupts off.
++     * Clamp unsigned timing noise rather than wrapping to an enormous skew. */
++    uint64_t skew = 0;
++    boolean_t interrupts = ml_set_interrupts_enabled(FALSE);
++    for (unsigned i = 0; i < 16; i++) {
++        uint64_t a = counter(), b = counter();
++        gpu_write(NULL, 0x27880, (uint32_t)b);
++        gpu_write(NULL, 0x27881, (uint32_t)(b >> 32));
++        uint64_t c = counter();
++        if (c - b > b - a) skew += (c - b) - (b - a);
++    }
++    uint64_t seed = counter() + (skew + 8) / 16;
++    gpu_write(NULL, 0x27880, (uint32_t)seed);
++    gpu_write(NULL, 0x27881, (uint32_t)(seed >> 32));
++    ml_set_interrupts_enabled(interrupts);
++    return MG_OK;
++}
++
++void metroid_gpu_live_init(const void *image, size_t bytes)
++{
++    /* Gen8.6.0 source profile: HUB=200MHz, NOC timeout=6800us.
++     * ilog2(200*6800)-1 = 19; AHB expires after 2^20 cycles = 5242.88us.
++     * A previously installed board owner takes precedence. */
++    const struct mg_fabric_owner board = {NULL,board_retain,board_ready,19};
++    if (__atomic_load_n(&platform.phase,__ATOMIC_ACQUIRE) == 0)
++        (void)metroid_gpu_install_fabric_owner(&board);
++    unsigned expected = 2;
++    if (!__atomic_compare_exchange_n(&platform.phase, &expected, 3, false,
++        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++        if (expected == 3) return;
++        /* Freeze installation even when the provider was missing at boot. */
++        expected = 0;
++        if (!__atomic_compare_exchange_n(&platform.phase, &expected, 3, false,
++            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
++        platform.live.error = image && bytes ? MG_UNBACKED : MG_INVALID;
++        printf("METROID GPU: live startup refused: no retained DDR/CNOC/TCU fabric owner\n");
++        goto report;
++    }
++    if (!image || !bytes) {
++        platform.live.error = MG_INVALID;
++        goto report;
++    }
++    platform.gpu = ml_io_map(MG_GPU_PA, MG_REGISTER_BYTES);
++    platform.gcc = ml_io_map(0x00100000, 0x80000);
++    platform.smmu = ml_io_map(MG_SMMU_PA, MG_SMMU_SIZE);
++    if (!platform.gpu || !platform.gcc || !platform.smmu) {
++        platform.live.error = MG_IO;
++        if (platform.gpu) ml_io_unmap(platform.gpu, MG_REGISTER_BYTES);
++        if (platform.gcc) ml_io_unmap(platform.gcc, 0x80000);
++        if (platform.smmu) ml_io_unmap(platform.smmu, MG_SMMU_SIZE);
++        platform.gpu = platform.gcc = platform.smmu = 0;
++        goto report;
++    }
++    const struct mg_live_io io = {
++        .memory = {NULL, metroid_gpu_dma_allocate, metroid_gpu_dma_release},
++        .power = {NULL, power_read, power_write, wait_us, rails},
++        .smmu = {NULL, smmu_read, smmu_write, smmu_write64, wait_us, publish},
++        .retain_fabric = retain_fabric, .fabric_ready = fabric_ready,
++        .configure = configure, .read = gpu_read, .write = gpu_write,
++        .delay = wait_us, .publish = publish, .scm = mg_scm_native,
++    };
++    (void)mg_live_boot(&platform.live, &io, image, bytes);
++report:
++    platform.report = (struct mg_live_report){
++        .version = 1, .mode = 5, .stage = platform.live.stage,
++        .error = platform.live.error, .power_stage = platform.live.power.stage,
++        .start_stage = platform.live.start.stage,
++        .smmu_offset = platform.live.domain.offset, .smmu_value = platform.live.domain.value,
++        .start_register = platform.live.start.reg, .start_value = platform.live.start.value,
++        .ranges = platform.live.memory.count, .table_pages = platform.live.memory.tables.used,
++        .exposed = platform.live.memory.exposed, .quarantined = platform.live.quarantined,
++        .hfi_ready = platform.live.stage == MG_LIVE_HFI,
++        .accelerator_ready = 0, /* scheduler/SQE/AQE/ZAP + render proof absent */
++    };
++    __atomic_store_n(&platform.report_ready, 1, __ATOMIC_RELEASE);
++    printf("METROID GPU: live result=%d stage=%u exposed=%u quarantine=%u HFI=%u; accelerator unavailable\n",
++        platform.report.error, platform.report.stage, platform.report.exposed,
++        platform.report.quarantined, platform.report.hfi_ready);
++    metroid_gpu_service_start();
++}
++#endif
+--- /dev/null
 +++ b/bsd/dev/metroid_gpu_power.c
 @@ -0,0 +1,156 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
@@ -1229,7 +1851,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_rpmh.h
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,222 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Included ONLY at the end of metroid_touch_power.h by overlay 0033.
 + * Reuses its sole apps-DRV2 owner, lock, geometry and timeout quarantine.
@@ -1240,6 +1862,9 @@
 +#ifndef METROID_GPU_RPMH_H
 +#define METROID_GPU_RPMH_H
 +int metroid_gpu_rpmh_enable(void);
++int metroid_gpu_rpmh_fabric_enable(void);
++bool metroid_gpu_rpmh_fabric_ready(void);
++static bool mg_fabric_held;
 +
 +static int
 +mg_arc_max(const char *name, uint32_t *address, uint32_t *level)
@@ -1291,8 +1916,10 @@
 +}
 +
 +static int
-+mg_arc_send(const uint32_t address[2], const uint32_t level[2])
++mg_votes_send(const uint32_t *address, const uint32_t *level, unsigned count)
 +{
++    if (!count || count > rh_ncpt || count > 16) return EINVAL;
++    uint32_t mask = (1u << count) - 1;
 +    int chosen = -1;
 +    for (unsigned t = RH_ACTIVE_FIRST; t < RH_ACTIVE_FIRST + RH_ACTIVE_N; t++) {
 +        uint32_t b = t * RH_TCS_STRIDE;
@@ -1301,7 +1928,8 @@
 +        for (unsigned c = 0; c < rh_ncpt; c++) {
 +            if (!(enabled & (1u << c))) continue;
 +            uint32_t a = rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE);
-+            if (a == address[0] || a == address[1]) return EBUSY;
++            for (unsigned j = 0; j < count; j++)
++                if (a == address[j]) return EBUSY;
 +        }
 +        if (chosen < 0 && rh_free(t)) chosen = (int)t;
 +    }
@@ -1319,13 +1947,13 @@
 +        return EBUSY;
 +    }
 +    rh_poisoned = true;
-+    for (unsigned c = 0; c < 2; c++) {
++    for (unsigned c = 0; c < count; c++) {
 +        uint32_t cmd = b + c * RH_CMD_STRIDE;
 +        if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
 +            !rh_sync(cmd + RH_ADDR, address[c]) ||
 +            !rh_sync(cmd + RH_DATA, level[c])) return EIO;
 +    }
-+    if (!rh_sync(b + RH_WAIT, 3) || !rh_sync(b + RH_ENABLE, 3) ||
++    if (!rh_sync(b + RH_WAIT, mask) || !rh_sync(b + RH_ENABLE, mask) ||
 +        !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN))
 +        return EIO;
 +    rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
@@ -1334,7 +1962,7 @@
 +        uint32_t irq = rh_read(rh_tcs, RH_IRQ_STATUS);
 +        uint32_t idle = rh_read(rh_tcs, b + RH_STATUS);
 +        bool complete = true;
-+        for (unsigned c = 0; c < 2; c++) {
++        for (unsigned c = 0; c < count; c++) {
 +            uint32_t status = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
 +            complete &= status != UINT32_MAX &&
 +                (status & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
@@ -1368,10 +1996,82 @@
 +    if (!error) error = mg_arc_max("mx.lvl", &address[0], &level[0]);
 +    if (!error) error = mg_arc_max("cx.lvl", &address[1], &level[1]);
 +    if (!error && address[0] == address[1]) error = EINVAL;
-+    if (!error) error = mg_arc_send(address, level);
++    if (!error) error = mg_votes_send(address, level, 2);
 +out:
 +    __atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
 +    return error;
++}
++
++/* BCM command-DB ABI: unit:u32, width:u16, VCD:u8, reserved:u8. Addresses
++ * are discovered rather than copied from another phone's command database.
++ * Validate every resource before the first transaction. */
++static int mg_bcm_address(const char *name, uint32_t *address)
++{
++    uint32_t key[2] = {0,0}; unsigned matches = 0;
++    for (unsigned i = 0; i < 8 && name[i]; i++)
++        key[i/4] |= (uint32_t)(uint8_t)name[i] << (8 * (i%4));
++    for (unsigned i = 0; i < 8; i++) {
++        unsigned h = 8 + 16 * i, slave = rh_db16(h);
++        if (!slave) break;
++        unsigned entries = RH_DB_HEADER + rh_db16(h+2);
++        unsigned aux = RH_DB_HEADER + rh_db16(h+4), count = rh_db16(h+6);
++        if (slave < 3 || slave > 5 || (entries & 3) ||
++            !rh_range(entries,count * RH_DB_ENTRY) || !rh_range(aux,0)) return EINVAL;
++        for (unsigned j = 0; j < count; j++) {
++            unsigned e = entries + j * RH_DB_ENTRY;
++            if (rh_read(rh_db,e) != key[0] || rh_read(rh_db,e+4) != key[1]) continue;
++            unsigned start = aux + rh_db16(e+22), bytes = rh_db16(e+20);
++            uint32_t a = rh_read(rh_db,e+16);
++            if (slave != 5 || (a >> 16) != 5 || (a & 3) || bytes != 8 ||
++                (start & 3) || !rh_range(start,8) ||
++                !rh_read(rh_db,start) || !rh_db16(start+4) ||
++                (rh_db16(start+6) & 0xff00) || (rh_db16(start+6) & 255) >= 16)
++                return EINVAL;
++            *address = a;
++            if (++matches != 1) return EINVAL;
++        }
++    }
++    return matches == 1 ? 0 : ENODEV;
++}
++
++int metroid_gpu_rpmh_fabric_enable(void)
++{
++    if (__atomic_exchange_n(&rh_lock,1,__ATOMIC_ACQUIRE)) return EBUSY;
++    uint32_t address[4] = {0}, data[4];
++    int error = EIO;
++    if (rh_poisoned) goto out;
++    if (mg_fabric_held) { error = 0; goto out; }
++    error = rh_map(); if (error) goto out;
++    /* tuna.c: GPU/TCU -> SH1 -> LLCC(SH0) -> EBI(MC0); configuration
++     * path -> CN0. SH1/CN0 are one-bit enable BCMs. MC0/SH0 use the
++     * saturating 14-bit X/Y wire maximum, covering any inherited HLOS
++     * demand without reducing it. Temporary bring-up: no DVFS or release,
++     * and no deep sleep. ACV's performance-mask policy is not modified. */
++    const char *names[] = {"MC0","SH0","SH1","CN0"};
++    for (unsigned i = 0; i < 4; i++) {
++        error = mg_bcm_address(names[i],&address[i]); if (error) goto out;
++        for (unsigned j = 0; j < i; j++)
++            if (address[i] == address[j]) { error = EINVAL; goto out; }
++        /* Commit each resource, so no VCD can be left uncommitted. Every
++         * command waits for completion before the next is issued. */
++        data[i] = 0x60000000u | (i < 2 ? 0x0fffffffu : 1u);
++    }
++    error = mg_votes_send(address,data,4);
++    if (!error) {
++        mg_fabric_held = true;
++        printf("METROID GPU: DDR/LLCC/TCU/CNOC BCM votes acknowledged; retained until reboot\n");
++    }
++out:
++    __atomic_store_n(&rh_lock,0,__ATOMIC_RELEASE);
++    return error;
++}
++
++bool metroid_gpu_rpmh_fabric_ready(void)
++{
++    if (__atomic_exchange_n(&rh_lock,1,__ATOMIC_ACQUIRE)) return false;
++    bool ready = mg_fabric_held && !rh_poisoned;
++    __atomic_store_n(&rh_lock,0,__ATOMIC_RELEASE);
++    return ready;
 +}
 +#endif
 --- /dev/null
