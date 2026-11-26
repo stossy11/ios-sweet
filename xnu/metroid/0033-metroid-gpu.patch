@@ -318,7 +318,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/MetroidGEM.cpp
-@@ -0,0 +1,424 @@
+@@ -0,0 +1,426 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * HakiOS/MSM DRM 1.7 wire interface for the Metroid Gen8 backend.
 + * ABI reference: HakiOS62e09f85 BoardGPU.cpp and Linux uapi/drm/msm_drm.h.
@@ -542,7 +542,7 @@
 +{
 +    if (job_pending || !r->buffer_count || r->buffer_count > MG_GEN8_MAX_BUFFERS ||
 +        !r->command_count || r->command_count > MG_GEN8_MAX_IBS ||
-+        r->flags != 0x10 || r->queue != 1 || r->in_sync || r->out_sync ||
++        (r->flags & ~0x80000000u) != 0x10 || r->queue != 1 || r->in_sync || r->out_sync ||
 +        r->in_count || r->out_count || r->pad) return kIOReturnBadArgument;
 +    auto bos = IONew(gem_bo,r->buffer_count);
 +    auto cmds = IONew(gem_cmd,r->command_count);
@@ -559,7 +559,9 @@
 +        bool valid = true;
 +        for (unsigned i = 0; i < r->buffer_count; i++) {
 +            gem_buffer *b = lookup(bos[i].handle);
-+            if (!b || !(bos[i].flags & 3) || (bos[i].flags & ~3u) ||
++            /* MSM_SUBMIT_BO_DUMP is a diagnostic hint, emitted by Mesa for
++             * command BOs. It does not add a GPU access permission. */
++            if (!b || !(bos[i].flags & 3) || (bos[i].flags & ~7u) ||
 +                ((bos[i].flags & 2) && (b->flags & GEM_READONLY)) ||
 +                (bos[i].presumed && bos[i].presumed != b->address)) { valid = false; break; }
 +            for (unsigned j = 0; j < i; j++) if (bos[i].handle == bos[j].handle) valid = false;
@@ -573,8 +575,7 @@
 +            if (c.type != 1 || c.index >= r->buffer_count || !c.bytes ||
 +                ((c.offset | c.bytes) & 3) || c.relocations || c.relocs || c.pad ||
 +                c.offset > job->buffers[c.index].bytes ||
-+                c.bytes > job->buffers[c.index].bytes-c.offset ||
-+                (job->buffers[c.index].access & MG_GPU_WRITE)) { valid = false; break; }
++                c.bytes > job->buffers[c.index].bytes-c.offset) { valid = false; break; }
 +            job->buffers[c.index].access |= MG_GPU_READ | MG_GPU_EXEC;
 +            job->ibs[i] = {c.index,c.offset,c.bytes};
 +        }
@@ -661,6 +662,7 @@
 +        if (!b || r.info.pad) ret = kIOReturnBadArgument;
 +        else if (r.info.info == 0) r.info.value = b->handle;
 +        else if (r.info.info == 1) r.info.value = b->address;
++        else if (r.info.info == 2) { /* advisory debugger name; not retained or dereferenced */ }
 +        else if (r.info.info == 5) r.info.value = b->flags | 0x20000u; /* actual WC mapping */
 +        else ret = kIOReturnUnsupported;
 +        break;
@@ -1126,7 +1128,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_accel.c
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,271 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_accel.h"
 +#ifdef MG_HOST_TEST
@@ -1136,6 +1138,8 @@
 +#endif
 +static int poison(struct mg_accel *a, int error)
 +{ a->error = error; a->quarantined = true; return error; }
++static void trace(struct mg_accel *a, const char *phase)
++{ if (a->live->io.trace) a->live->io.trace(a->live->io.context,phase); }
 +static bool powered(void *p)
 +{
 +    struct mg_accel *a = p;
@@ -1249,6 +1253,7 @@
 +static int authenticate_zap(void *p)
 +{
 +    struct mg_accel *a = p;
++    trace(a,"authenticate ZAP with PAS13");
 +    const struct mg_zap_io io = {.context=a,.reserved=a->io.zap_reserved,
 +        .metadata=a->metadata->memory.cpu,.reserved_pa=a->io.zap_pa,
 +        .metadata_pa=a->metadata->memory.pa,.reserved_bytes=a->io.zap_bytes,
@@ -1258,6 +1263,7 @@
 +static int boot_gpu(void *p)
 +{
 +    struct mg_accel *a = p;
++    trace(a,"start GX and CP firmware");
 +    int error = mg_scheduler_vote(&a->scheduler,1,1); if (error) return error;
 +    const struct mg_hw_config config = {a->sqe->gpu,a->aqe->gpu,a->restore->gpu,
 +        a->restore->memory.cpu,a->restore->memory.bytes};
@@ -1333,6 +1339,7 @@
 +    a->attempted = true; a->live = live; a->io = *io; a->images = *images;
 +    if (!powered(a)) return poison(a,MG_UNBACKED);
 +    error = io->tables(io->context,a->performance,a->bandwidth); if (error) return poison(a,error);
++    trace(a,"attach GPU stream0 and extend GMU mappings");
 +    error = live->io.memory.allocate(live->io.memory.context,MG_PT_MAX_PAGES*4096,&a->table);
 +    if (error) return poison(a,error);
 +    error = mg_vm_init(&a->gpu,a->table.cpu,a->table.pa,a->table.bytes,&live->io.smmu,a,powered,idle);
@@ -1340,6 +1347,7 @@
 +    if (!error) error = mg_vm_adopt(&a->gmu,&live->memory.tables,&live->domain,&live->io.smmu,a,powered,idle);
 +    if (error) return poison(a,error);
 +    a->stage = MG_ACCEL_DOMAINS;
++    trace(a,"allocate SQE/AQE/context buffers");
 +    struct mg_accel_block **blocks[] = {&a->sqe,&a->aqe,&a->restore,&a->metadata,&a->context,&a->timestamps,&a->commands,&a->output};
 +    const size_t sizes[] = {images->sqe_bytes-4,images->aqe_bytes-4,4096,MG_ZAP_METADATA,4096,4096,4096,4096};
 +    for (unsigned i = 0; i < 8; i++) {
@@ -1358,6 +1366,7 @@
 +    const struct mg_sched_config config = {hfi_pointer(a),MG_HFI_BYTES,live->memory.config.hfi,
 +        0x20070001,{a->performance,17},{a->bandwidth,160}};
 +    const struct mg_sched_io scheduler_io = {a,domains,read_reg,write_reg,delay,firmware_allocation,boot_gpu};
++    trace(a,"start HFI scheduler");
 +    error = mg_scheduler_boot(&a->scheduler,&scheduler_io,&config); if (error) return poison(a,error);
 +    a->stage = MG_ACCEL_SCHEDULER;
 +    error = mg_render_init(&a->render,&a->gpu,&a->backend,a,running,264000000); if (error) return poison(a,error);
@@ -1372,6 +1381,7 @@
 +    error = mg_gen8_init(&a->backend,&submission,&submission_io); if (error) return poison(a,error);
 +    /* HFI control sequence is shared across scheduler/bootstrap/context traffic. */
 +    a->backend.control_sequence = a->scheduler.sequence;
++    trace(a,"register GPU context");
 +    error = mg_gen8_context_open(&a->backend); if (error) return poison(a,error);
 +    a->stage = MG_ACCEL_CONTEXT;
 +    struct mg_accel_block *proof[] = {a->commands,a->output};
@@ -1384,6 +1394,7 @@
 +        /* Renderer owns these VAs. Leave kernel block GPU field zero so its
 +         * mapped callback validates through the renderer's lifetime records. */
 +    }
++    trace(a,"verify fenced GPU writes");
 +    error = mg_render_selftest(&a->render,a->commands->memory.cpu,a->output->memory.cpu);
 +    if (error) return poison(a,error);
 +    a->stage = MG_ACCEL_PROOF;
@@ -1994,9 +2005,12 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_live.c
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,106 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_live.h"
++
++static void trace(struct mg_live *s, const char *phase)
++{ if (s->io.trace) s->io.trace(s->io.context,phase); }
 +
 +static int ready(void *context)
 +{
@@ -2043,26 +2057,32 @@
 +    if (s->attempted) return MG_BUSY;
 +    s->attempted = true;
 +    s->io = *io; s->image = image; s->image_bytes = bytes;
++    trace(s,"allocate GMU memory");
 +    int error = mg_gmu_memory_prepare(&s->memory, &io->memory, image, bytes);
 +    if (error) goto fail;
 +    s->stage = MG_LIVE_MEMORY;
 +    s->fabric_attempted = true;
++    trace(s,"retain fabric votes");
 +    error = io->retain_fabric(io->context);
 +    if (error) goto fail;
 +    if (!io->fabric_ready(io->context)) { error = MG_UNBACKED; goto fail; }
 +    s->stage = MG_LIVE_FABRIC;
++    trace(s,"enable CX and clocks");
 +    error = mg_power_enable(&io->power, &s->power);
 +    if (error) goto fail;
 +    s->stage = MG_LIVE_POWER;
++    trace(s,"configure GMU platform");
 +    error = io->configure(io->context);
 +    if (error) goto fail;
 +    s->stage = MG_LIVE_PLATFORM;
 +    if (!io->fabric_ready(io->context)) { error = MG_UNBACKED; goto fail; }
 +    /* Must precede even the first possibly-posted SMMU write. */
 +    s->memory.exposed = true;
++    trace(s,"attach GMU stream5");
 +    error = mg_smmu_attach(&io->smmu, &s->domain, &s->memory.tables);
 +    if (error) goto fail;
 +    s->stage = MG_LIVE_SMMU;
++    trace(s,"load firmware and start CM3/HFI");
 +    const struct mg_start_io start = {s, read_reg, write_reg, delay_us, ready, prepare, scm};
 +    error = mg_gmu_start(&start, &s->memory.config, &s->start);
 +    if (error) goto fail;
@@ -2094,7 +2114,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_live.h
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,83 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_LIVE_H
 +#define METROID_GPU_LIVE_H
@@ -2125,6 +2145,7 @@
 +    void (*delay)(void *, unsigned);
 +    void (*publish)(void *, const void *, size_t);
 +    mg_scm_call scm;
++    void (*trace)(void *, const char *phase); /* optional boot checkpoints */
 +};
 +struct mg_live {
 +    struct mg_gmu_memory memory;
@@ -2165,6 +2186,7 @@
 +    uint32_t exposed, quarantined, hfi_ready, accelerator_ready;
 +};
 +void metroid_gpu_copy_report(struct mg_live_report *);
++bool metroid_gpu_copy_status(char *, size_t);
 +void metroid_gpu_service_start(void);
 +void metroid_gpu_live_init(const void *, size_t);
 +struct mg_accel_images;
@@ -2479,7 +2501,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_platform.c
-@@ -0,0 +1,273 @@
+@@ -0,0 +1,302 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * XNU adapter for the retained GMU owner. No inherited bandwidth assumption.
 + * Register sequences: Nothing 031e8669, gpucc-tuna.c/adreno_gen8.c.
@@ -2506,6 +2528,8 @@
 +    struct mg_fabric_owner fabric;
 +    unsigned phase, report_ready;
 +    struct mg_live_report report;
++    char status[256];
++    bool show_status;
 +} platform;
 +
 +int metroid_gpu_install_fabric_owner(const struct mg_fabric_owner *owner)
@@ -2526,6 +2550,14 @@
 +    /* Published exactly once, after all mutable boot state is finalized. */
 +    if (__atomic_load_n(&platform.report_ready, __ATOMIC_ACQUIRE))
 +        *out = platform.report;
++}
++bool metroid_gpu_copy_status(char *out, size_t bytes)
++{
++    if (!out || !bytes) return false;
++    out[0] = 0;
++    if (!__atomic_load_n(&platform.report_ready,__ATOMIC_ACQUIRE) || !platform.show_status) return false;
++    strlcpy(out,platform.status,bytes);
++    return true;
 +}
 +static uint32_t rd(vm_offset_t base, uint32_t offset)
 +{
@@ -2629,7 +2661,9 @@
 +{
 +    (void)p;
 +    if (!platform.gpu || platform.live.stage != MG_LIVE_HFI || platform.live.quarantined) return false;
-+    uint32_t cx = power_read(NULL,MG_CC,0x9080), clk = power_read(NULL,MG_CC,0x90d4),
++    /* gpu_cc_cx_gdsc.gds_hw_ctrl: use the same power-status register that
++     * cold power-up polls, rather than the software control register. */
++    uint32_t cx = power_read(NULL,MG_CC,0x9094), clk = power_read(NULL,MG_CC,0x90d4),
 +        smmu = power_read(NULL,MG_CC,0x7000);
 +    return cx != UINT32_MAX && (cx & 0x80000000) && clk != UINT32_MAX &&
 +        (clk & 0x80000001) == 1 && smmu != UINT32_MAX && (smmu & 0x80000001) == 1;
@@ -2652,8 +2686,12 @@
 +}
 +static int scheduler_tables(void *p, uint32_t *perf, uint32_t *bw)
 +{ (void)p; return metroid_gpu_rpmh_scheduler_tables(perf,bw) ? MG_IO : MG_OK; }
++static void checkpoint(void *p, const char *phase)
++{ (void)p; printf("METROID GPU: checkpoint: %s\n",phase); }
 +static void initialize(const void *image, size_t bytes, const struct mg_accel_images *images)
 +{
++    int status = 1;
++    (void)PE_parse_boot_argn("metroidgpustatus",&status,sizeof(status));
 +    /* Gen8.6.0 source profile: HUB=200MHz, NOC timeout=6800us.
 +     * ilog2(200*6800)-1 = 19; AHB expires after 2^20 cycles = 5242.88us.
 +     * A previously installed board owner takes precedence. */
@@ -2692,6 +2730,7 @@
 +            goto report;
 +        }
 +    }
++    checkpoint(NULL,"map register apertures");
 +    platform.gpu = ml_io_map(MG_GPU_PA, MG_REGISTER_BYTES);
 +    platform.gcc = ml_io_map(0x00100000, 0x80000);
 +    platform.smmu = ml_io_map(MG_SMMU_PA, MG_SMMU_SIZE);
@@ -2709,9 +2748,13 @@
 +        .smmu = {NULL, smmu_read, smmu_write, smmu_write64, wait_us, publish},
 +        .retain_fabric = retain_fabric, .fabric_ready = fabric_ready,
 +        .configure = configure, .read = gpu_read, .write = gpu_write,
-+        .delay = wait_us, .publish = publish, .scm = mg_scm_native,
++        .delay = wait_us, .publish = publish, .scm = mg_scm_native, .trace = checkpoint,
 +    };
 +    (void)mg_live_boot(&platform.live, &io, image, bytes);
++    if (platform.live.error) printf("METROID GPU: GMU failure=%d stage=%u power=%u bus=%u offset=%#x value=%#x SMMU=%#x/%#x start=%#x/%#x\n",
++        platform.live.error,platform.live.stage,platform.live.power.stage,platform.live.power.bus,
++        platform.live.power.offset,platform.live.power.value,platform.live.domain.offset,platform.live.domain.value,
++        platform.live.start.reg,platform.live.start.value);
 +    if (images && platform.live.stage == MG_LIVE_HFI) {
 +        void *zap = metroid_gpu_zap_reserved_map(0x94e9a000,0x2000);
 +        const struct mg_accel_io accelerator_io = {NULL,accelerator_powered,synchronize,
@@ -2743,6 +2786,14 @@
 +        .hfi_ready = platform.live.stage == MG_LIVE_HFI,
 +        .accelerator_ready = metroid_gpu_gem_ready(),
 +    };
++    platform.show_status = status != 0;
++    snprintf(platform.status,sizeof(platform.status),
++        "GPU ready=%u err=%d live=%u power=%u start=%u accel=%u sched=%u GX=%u ZAP=%u power-reg=%x/%x SMMU=%x/%x HFI=%x",
++        platform.report.accelerator_ready,platform.report.error,platform.live.stage,platform.live.power.stage,
++        platform.live.start.stage,platform.accelerator.stage,platform.accelerator.scheduler.stage,
++        platform.accelerator.hardware.stage,platform.accelerator.zap.stage,platform.live.power.offset,
++        platform.live.power.value,platform.live.domain.offset,platform.live.domain.value,
++        platform.accelerator.scheduler.last_header);
 +    __atomic_store_n(&platform.report_ready, 1, __ATOMIC_RELEASE);
 +    printf("METROID GPU: live result=%d stage=%u exposed=%u quarantine=%u HFI=%u accelerator=%u\n",
 +        platform.report.error, platform.report.stage, platform.report.exposed,
@@ -3448,7 +3499,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_render.c
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,188 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_render.h"
 +#ifdef MG_HOST_TEST
@@ -3576,12 +3627,14 @@
 +    struct mg_render *r = p;
 +    if (!value || !ready(r)) return false;
 +    switch (key) {
-+    case 1: case 6: case 8: case 9: case 10: case 17: *value = 0; break;
++    case 1: case 8: case 9: case 10: case 17: *value = 0; break;
 +    case 2: *value = 0x260000; break;
 +    case 3: *value = MG_CHIP_ID; break;
 +    case 4: *value = r->frequency; break;
++    case 6: *value = 0x4000000; break; /* UCHE GMEM base programmed by GX owner */
 +    case 7: *value = 1; break;
 +    case 16: *value = 16; break;
++    case 20: *value = 0x1fffffffff000ull; break; /* actual UCHE trap base */
 +    default: return false;
 +    }
 +    return true;
@@ -5119,7 +5172,7 @@
 +        const struct mg_gen8_buffer *v = &job->buffers[i];
 +        if (!cpu_range(v->cpu,v->bytes) || ((uintptr_t)v->cpu & 3) || !gpu_range(v->gpu,v->bytes) ||
 +            !v->access || (v->access & ~7u) ||
-+            ((v->access & MG_GPU_EXEC) && ((v->access & MG_GPU_WRITE) || !(v->access & MG_GPU_READ))))
++            ((v->access & MG_GPU_EXEC) && !(v->access & MG_GPU_READ)))
 +            return MG_INVALID;
 +        if (v->bytes > MG_GEN8_MAX_JOB_BYTES-total) return MG_LIMIT;
 +        total += v->bytes;
@@ -5188,7 +5241,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_submit.h
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,108 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_SUBMIT_H
 +#define METROID_GPU_SUBMIT_H
@@ -5240,6 +5293,9 @@
 + * context_valid() verifies the owned stream0 page-table/bank/ASID tuple.
 + * gmu_mapped() verifies the owner's retained coherent/uncached stream5 mapping.
 + * mapped() must verify this owner's pinned CPU/GPU mapping and permissions.
++ * Writable executable BOs are supported for trusted clients (Mesa marks
++ * command BOs writable even when fetching only). EXEC still requires READ;
++ * WRITE requires output cache ownership transfer after real retirement.
 + * sync() publishes commands/inputs before dispatch and makes device writes
 + * CPU-visible only after GPU retirement. It must report failures.
 + * retire() releases the caller's job reference only after successful wait.
