@@ -997,7 +997,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu.h
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,136 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Metroid Adreno825 / Gen8.6.0 driver foundation.
 + * Wire formats follow Nothing's public KGSL source at 031e8669eb19.
@@ -1028,6 +1028,14 @@
 +    MG_TOO_SMALL = -8, MG_STALE = -9, MG_TIMEOUT = -10, MG_BUSY = -11
 +};
 +
++/* Nothing clk_branch2_check_halt(): CLK_OFF clear OR NOC FSM ON.
++ * Request-bit readback is not a branch-completion acknowledgement. */
++static inline bool mg_clock_running(uint32_t value)
++{
++    return value != UINT32_MAX && (!(value & 0x80000000u) ||
++        ((value >> 28) & 7u) == 2u);
++}
++
 +/* One-shot cold power/clock test. The RPMh callback must serialize with the
 + * touch driver's apps-DRV2 owner and preserve existing CX/MX consumers. It
 + * must cover PLL calibration at 1305.6 MHz (MX >= SVS_L1), GMU 500 MHz and
@@ -1036,7 +1044,7 @@
 + */
 +enum mg_bus { MG_CC, MG_GCC };
 +enum mg_power_stage { MG_POWER_OFF, MG_POWER_RAILS, MG_POWER_CX,
-+    MG_POWER_PLL, MG_POWER_HUB, MG_POWER_CLOCKS, MG_POWER_RESET_HELD };
++    MG_POWER_PLL, MG_POWER_HUB, MG_POWER_CLOCKS, MG_POWER_READY };
 +struct mg_power_io {
 +    void *context;
 +    uint32_t (*read)(void *, enum mg_bus, uint32_t);
@@ -2016,7 +2024,7 @@
 +{
 +    struct mg_live *s = context;
 +    return s->memory.exposed && s->domain.attached && !s->domain.quarantined &&
-+        s->power.stage == MG_POWER_RESET_HELD &&
++        s->power.stage == MG_POWER_READY &&
 +        s->io.fabric_ready(s->io.context) ? MG_OK : MG_UNBACKED;
 +}
 +static uint32_t read_reg(void *context, uint32_t reg)
@@ -2137,7 +2145,7 @@
 +     * failure retains votes too. Never implement this as unconditional OK. */
 +    int (*retain_fabric)(void *);
 +    bool (*fabric_ready)(void *);
-+    /* After power-enable, safely deassert GPUCC reset with CM3 reset held,
++    /* After power-enable, verify GPUCC reset released and CM3 reset held,
 +     * enable the GPU SMMU clock, initialize AHB timeout and CX timer. */
 +    int (*configure)(void *);
 +    uint32_t (*read)(void *, uint32_t); /* GPU-relative dwords */
@@ -2501,7 +2509,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_platform.c
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,316 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * XNU adapter for the retained GMU owner. No inherited bandwidth assumption.
 + * Register sequences: Nothing 031e8669, gpucc-tuna.c/adreno_gen8.c.
@@ -2612,17 +2620,26 @@
 +}
 +static uint64_t counter(void)
 +{ uint64_t value; __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(value)); return value; }
++static int verify_cm3_reset(void)
++{
++    /* Power-up released the block reset before clock setup. The independent
++     * CM3 reset must still be asserted: never adopt running firmware. */
++    uint32_t reset = power_read(NULL, MG_CC, 0x9314);
++    if (reset == UINT32_MAX) return MG_IO;
++    if (reset & 1) return MG_STALE;
++    uint32_t cm3 = gpu_read(NULL, 0x1f800);
++    if (cm3 != 1) {
++        platform.live.start.reg = 0x1f800;
++        platform.live.start.value = cm3;
++        return cm3 == UINT32_MAX ? MG_IO : MG_STALE;
++    }
++    return MG_OK;
++}
 +static int configure(void *p)
 +{
 +    (void)p;
-+    /* Never inspect the GMU while GPUCC holds its block in reset. Once
-+     * deasserted, the CM3 reset default must still be asserted. */
-+    uint32_t reset = power_read(NULL, MG_CC, 0x9314);
-+    if (reset == UINT32_MAX || !(reset & 1)) return MG_STALE;
-+    power_write(NULL, MG_CC, 0x9314, reset & ~1u);
-+    wait_us(NULL, 10);
-+    if ((power_read(NULL, MG_CC, 0x9314) & 1) || gpu_read(NULL, 0x1f800) != 1)
-+        return MG_STALE;
++    int error = verify_cm3_reset();
++    if (error) return error;
 +    uint32_t vote = power_read(NULL, MG_CC, 0x7000);
 +    if (vote == UINT32_MAX) return MG_IO;
 +    power_write(NULL, MG_CC, 0x7000, vote | 1);
@@ -2630,7 +2647,7 @@
 +    for (us = 0; us < 1000; us++) {
 +        vote = power_read(NULL, MG_CC, 0x7000);
 +        if (vote == UINT32_MAX) return MG_IO;
-+        if ((vote & 0x80000001u) == 1) break;
++        if (mg_clock_running(vote)) break;
 +        wait_us(NULL, 1);
 +    }
 +    if (us == 1000) return MG_TIMEOUT;
@@ -2665,8 +2682,8 @@
 +     * cold power-up polls, rather than the software control register. */
 +    uint32_t cx = power_read(NULL,MG_CC,0x9094), clk = power_read(NULL,MG_CC,0x90d4),
 +        smmu = power_read(NULL,MG_CC,0x7000);
-+    return cx != UINT32_MAX && (cx & 0x80000000) && clk != UINT32_MAX &&
-+        (clk & 0x80000001) == 1 && smmu != UINT32_MAX && (smmu & 0x80000001) == 1;
++    return cx != UINT32_MAX && (cx & 0x80000000) &&
++        mg_clock_running(clk) && mg_clock_running(smmu);
 +}
 +static int synchronize(void *p, enum mg_gpu_sync direction, const void *cpu, size_t bytes)
 +{
@@ -2787,13 +2804,18 @@
 +        .accelerator_ready = metroid_gpu_gem_ready(),
 +    };
 +    platform.show_status = status != 0;
++    /* GPUCC registers only: never read powered-down CM3 for diagnostics. */
++    uint32_t gmu_reset = platform.gpu ? power_read(NULL,MG_CC,0x9314) : UINT32_MAX;
++    uint32_t xo_reset = platform.gpu ? power_read(NULL,MG_CC,0x9000) : UINT32_MAX;
++    uint32_t aon = platform.gpu ? power_read(NULL,MG_CC,0x9008) : UINT32_MAX;
 +    snprintf(platform.status,sizeof(platform.status),
-+        "GPU ready=%u err=%d live=%u power=%u start=%u accel=%u sched=%u GX=%u ZAP=%u power-reg=%x/%x SMMU=%x/%x HFI=%x",
++        "GPU ready=%u err=%d live=%u power=%u start=%u accel=%u sched=%u GX=%u ZAP=%u power-reg=%x/%x SMMU=%x/%x HFI=%x start-reg=%x/%x RST=%x/%x AON=%x",
 +        platform.report.accelerator_ready,platform.report.error,platform.live.stage,platform.live.power.stage,
 +        platform.live.start.stage,platform.accelerator.stage,platform.accelerator.scheduler.stage,
 +        platform.accelerator.hardware.stage,platform.accelerator.zap.stage,platform.live.power.offset,
 +        platform.live.power.value,platform.live.domain.offset,platform.live.domain.value,
-+        platform.accelerator.scheduler.last_header);
++        platform.accelerator.scheduler.last_header,platform.live.start.reg,platform.live.start.value,
++        gmu_reset,xo_reset,aon);
 +    __atomic_store_n(&platform.report_ready, 1, __ATOMIC_RELEASE);
 +    printf("METROID GPU: live result=%d stage=%u exposed=%u quarantine=%u HFI=%u accelerator=%u\n",
 +        platform.report.error, platform.report.stage, platform.report.exposed,
@@ -2806,7 +2828,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_power.c
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,207 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Cold CX/GMU clock bring-up from Nothing 031e8669eb19 gpucc-tuna.c,
 + * gcc-tuna.c, gdsc.c, clk-alpha-pll.c (Lucid OLE/EVO) and clk-rcg2.c.
@@ -2849,11 +2871,31 @@
 +static int branch(const struct mg_power_io *io, struct mg_power_status *s,
 +    enum mg_bus bus, uint32_t offset, bool skip_halt)
 +{
-+    int r = change(io, s, bus, offset, BIT(0), BIT(0));
-+    if (r) return r;
++    uint32_t old = rd(io, s, bus, offset);
++    if (old == UINT32_MAX) return MG_IO;
++    s->touched = true;
++    io->write(io->context, bus, offset, old | BIT(0));
 +    /* GCC DDRSS_GPU_AXI is BRANCH_HALT_SKIP. AHB uses HALT_DELAY. */
 +    if (skip_halt) { io->delay(io->context, 10); return MG_OK; }
-+    return poll(io, s, bus, offset, BIT(31), 0);
++    for (unsigned us = 0; us < 1000; us++) {
++        uint32_t value = rd(io, s, bus, offset);
++        if (value == UINT32_MAX) return MG_IO;
++        if (mg_clock_running(value)) return MG_OK;
++        io->delay(io->context, 1);
++    }
++    return MG_TIMEOUT;
++}
++
++/* gpucc_tuna_probe uses plain regmap_update_bits for these AON votes.
++ * They have no branch enable-readback/halt completion contract. */
++static int aon_vote(const struct mg_power_io *io, struct mg_power_status *s,
++    uint32_t offset)
++{
++    uint32_t old = rd(io, s, MG_CC, offset);
++    if (old == UINT32_MAX) return MG_IO;
++    s->touched = true;
++    io->write(io->context, MG_CC, offset, old | BIT(0));
++    return MG_OK;
 +}
 +
 +static int rcg(const struct mg_power_io *io, struct mg_power_status *s,
@@ -2886,7 +2928,7 @@
 +        if (v & BIT(0)) {
 +            /* An enable request is not proof of a running clock. ABL can
 +             * leave e.g. CX_GMU=0x80002001 (requested, but halted). */
-+            if (!(v & BIT(31))) return MG_BUSY;
++            if (mg_clock_running(v)) return MG_BUSY;
 +            inherited |= BIT(i);
 +        }
 +    }
@@ -2925,8 +2967,11 @@
 +    if (io->rails(io->context)) return MG_IO;
 +    s->stage = MG_POWER_RAILS;
 +#define TRY(expr) do { int error = (expr); if (error) return error; } while (0)
-+    /* Hold GMU's clock-controller reset before enabling any GMU clock. */
++    /* Pulse the block reset to establish the CM3 reset default. This is
++     * distinct from CM3_SYSRESET, which remains asserted until firmware start.
++     * reset.c allows four microseconds for each reset edge to propagate. */
 +    TRY(change(io, s, MG_CC, 0x9314, BIT(0), BIT(0)));
++    io->delay(io->context, 4);
 +    /* Normalize only proven dormant requests, with reset acknowledged and
 +     * before enabling CX or changing PLL/RCG parents. Preserve other bits.
 +     * All initial ownership/PLL/shared-source checks have passed first. */
@@ -2943,10 +2988,14 @@
 +    TRY(poll(io, s, MG_CC, 0x9094, BIT(31), BIT(31)));
 +    io->delay(io->context, 1);
 +    s->stage = MG_POWER_CX;
-+    /* Probe's always-on branches. Keep reset asserted throughout this test. */
++    /* Do not hold the entire GMU block in reset while enabling its clocks.
++     * configure() must verify CM3_SYSRESET before any firmware/DMA setup. */
++    TRY(change(io, s, MG_CC, 0x9314, BIT(0), 0));
++    io->delay(io->context, 4);
++    /* Probe-time AON votes are not ordinary clock branches. */
 +    const uint32_t aon[] = {0x93a4, 0x9008, 0x93a8, 0x9004, 0x90cc};
 +    for (unsigned i = 0; i < sizeof(aon)/sizeof(aon[0]); i++)
-+        TRY(branch(io, s, MG_CC, aon[i], false));
++        TRY(aon_vote(io, s, aon[i]));
 +    /* Standby PLL: 1 GHz main / 2 = 500 MHz GMU. Calibration runs at
 +     * 0x44 * 19.2 MHz; rails callback must cover that rate, not just GMU.
 +     * No active PLL reprogramming or dynamic frequency changes.
@@ -2982,8 +3031,8 @@
 +    TRY(branch(io, s, MG_CC, 0x90e4, false));
 +    TRY(branch(io, s, MG_CC, 0x90d4, false));
 +    s->stage = MG_POWER_CLOCKS;
-+    TRY(poll(io, s, MG_CC, 0x9314, BIT(0), BIT(0)));
-+    s->stage = MG_POWER_RESET_HELD;
++    TRY(poll(io, s, MG_CC, 0x9314, BIT(0), 0));
++    s->stage = MG_POWER_READY;
 +    return MG_OK;
 +#undef TRY
 +}
