@@ -1,6 +1,6 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,19 @@
+@@ -109,6 +109,25 @@
  bsd/dev/metroid_touch.c			standard
  bsd/dev/metroid_wifi.c			standard
  bsd/dev/metroid_usb.c			standard
@@ -17,6 +17,12 @@
 +bsd/dev/metroid_gpu_submit.c		standard
 +bsd/dev/metroid_gpu_live.c		standard
 +bsd/dev/metroid_gpu_platform.c		standard
++bsd/dev/metroid_gpu_vm.c			standard
++bsd/dev/metroid_gpu_scheduler.c		standard
++bsd/dev/metroid_gpu_render.c		standard
++bsd/dev/metroid_gpu_hardware.c		standard
++bsd/dev/metroid_gpu_zap.c			standard
++bsd/dev/metroid_gpu_accel.c		standard
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
@@ -55,17 +61,18 @@
  	registerService();
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -32,6 +32,7 @@
+@@ -32,6 +32,8 @@
  # libIOKit
  
  iokit/Kernel/IOHibernateIO.cpp				optional hibernation
 +iokit/Kernel/MetroidGPU.cpp				optional iokitcpp
++iokit/Kernel/MetroidGEM.cpp				optional iokitcpp
  iokit/Kernel/IOHibernateRestoreKernel.c			optional hibernation
  
  iokit/Kernel/IOLib.cpp					optional iokitcpp
 --- /dev/null
 +++ b/iokit/Kernel/MetroidGPU.cpp
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,216 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Read-only bring-up service. Deliberately does not match "HakiosGPU": that
 + * name makes the Metal plugin enumerate a usable GEM/submit accelerator.
@@ -80,21 +87,34 @@
 +#include <libkern/c++/OSNumber.h>
 +#include "../../bsd/dev/metroid_gpu_live.h"
 +
-+/* Metal discovers devices by this IOKit metaclass, not the service name.
-+ * An explicit experimental boot selects the existing userspace bundle even
-+ * before the unfinished GEM backend can render. Do not relabel diagnostics
-+ * as HakiosGPU: the bundle's separate backend lookup must fail honestly. */
++/* Never map this carveout as Device memory: MDT copies use ordinary RAM
++ * accesses. It is outside XNU-managed RAM and must have no cached CPU alias.
++ * Descriptor+mapping have reboot lifetime, including PAS failures. */
++extern "C" void *metroid_gpu_zap_reserved_map(uint64_t pa, size_t bytes)
++{
++    if (pa != 0x94e9a000 || bytes != 0x2000) return nullptr;
++    auto memory = IOMemoryDescriptor::withPhysicalAddress(pa,bytes,kIODirectionInOut);
++    if (!memory) return nullptr;
++    auto mapping = memory->createMappingInTask(kernel_task,0,kIOMapAnywhere | kIOMapWriteCombineCache,0,bytes);
++    if (!mapping) { memory->release(); return nullptr; }
++    return reinterpret_cast<void *>(mapping->getVirtualAddress());
++}
++
++/* Discovery is deferred until the framebuffer and proven GEM backend both
++ * exist. Framebuffer start and GPU startup may occur in either order. */
++extern "C" bool metroid_gpu_gem_ready(void);
++static IOService *metal_framebuffer;
++static unsigned metal_attempted;
 +class IOAcceleratorES : public IOService {
 +    OSDeclareDefaultStructors(IOAcceleratorES);
 +};
 +OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
 +
-+extern "C" void metroid_gpu_publish_metal(IOService *framebuffer)
++extern "C" void metroid_gpu_metal_ready(void)
 +{
-+    int enabled = 0;
-+    if (!PE_parse_boot_argn("metroidmetal", &enabled, sizeof(enabled)) || enabled != 1)
-+        return;
-+    if (!framebuffer) return;
++    IOService *framebuffer = __atomic_load_n(&metal_framebuffer,__ATOMIC_ACQUIRE);
++    if (!framebuffer || !metroid_gpu_gem_ready()) return;
++    if (__atomic_exchange_n(&metal_attempted,1,__ATOMIC_ACQ_REL)) return;
 +    auto accelerator = new IOAcceleratorES;
 +    if (!accelerator) return;
 +    if (!accelerator->init() || !accelerator->attach(framebuffer)) {
@@ -111,10 +131,9 @@
 +    bool properties = accelerator->setProperty("MetalPluginName", "HakiosMetal") &&
 +        accelerator->setProperty("MetalPluginClassName", "HakiosMetalDevice") &&
 +        accelerator->setProperty("MetroidExperimentalMetal", true) &&
-+        accelerator->setProperty("AcceleratorReady", false);
++        accelerator->setProperty("AcceleratorReady", true);
 +    if (properties) {
-+        IOLog("METROID METAL: metroidmetal=1 selects HakiosMetal/HakiosMetalDevice; "
-+            "experimental discovery, GPU rendering not ready\n");
++        IOLog("METROID METAL: selecting HakiosMetal after fenced GPU execution proof\n");
 +        accelerator->registerService();
 +    } else {
 +        accelerator->stop(framebuffer);
@@ -122,6 +141,17 @@
 +        IOLog("METROID METAL: failed to set discovery properties; not published\n");
 +    }
 +    accelerator->release();
++}
++extern "C" void metroid_gpu_publish_metal(IOService *framebuffer)
++{
++    int enabled = 0;
++    if (!PE_parse_boot_argn("metroidmetal",&enabled,sizeof(enabled)) || enabled != 1 || !framebuffer) return;
++    /* Reboot lifetime; the attached accelerator's parent must outlive it. */
++    framebuffer->retain();
++    IOService *expected = nullptr;
++    if (!__atomic_compare_exchange_n(&metal_framebuffer,&expected,framebuffer,false,
++        __ATOMIC_RELEASE,__ATOMIC_ACQUIRE)) framebuffer->release();
++    metroid_gpu_metal_ready();
 +}
 +
 +/* Descriptor-owned Normal-NC memory: no WB CPU alias used for HFI polling.
@@ -259,6 +289,433 @@
 +    service->release();
 +}
 +#endif
+--- /dev/null
++++ b/iokit/Kernel/MetroidGEM.cpp
+@@ -0,0 +1,424 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ * HakiOS/MSM DRM 1.7 wire interface for the Metroid Gen8 backend.
++ * ABI reference: HakiOS62e09f85 BoardGPU.cpp and Linux uapi/drm/msm_drm.h.
++ * Bring-up is restricted to administrator clients: untrusted PM4 validation
++ * and separate per-process GPU page tables are not implemented here.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOKitKeys.h>
++#include <kern/clock.h>
++#include <sys/systm.h>
++#include "arm/SweetSurface.h"
++#include "../../bsd/dev/metroid_gpu_gem.h"
++
++struct gem_param { uint32_t pipe, param; uint64_t value; uint32_t len, pad; };
++struct gem_new { uint64_t bytes; uint32_t flags, handle; };
++struct gem_info { uint32_t handle, info; uint64_t value; uint32_t len, pad; };
++struct gem_time { int64_t seconds, nanoseconds; };
++struct gem_prep { uint32_t handle, op; gem_time timeout; };
++struct gem_wait { uint32_t fence, flags; gem_time timeout; uint32_t queue, pad; };
++struct gem_bo { uint32_t flags, handle; uint64_t presumed; };
++struct gem_cmd { uint32_t type, index, offset, bytes, pad, relocations; uint64_t relocs; };
++struct gem_submit {
++    uint32_t flags, fence, buffer_count, command_count; uint64_t buffers, commands;
++    int32_t fence_fd; uint32_t queue;
++    uint64_t in_sync, out_sync; uint32_t in_count, out_count, stride, pad;
++};
++struct gem_surface {
++    uint32_t surface, handle; uint64_t bytes;
++    uint32_t offset, row_bytes, width, height, format, planes;
++};
++struct gem_close { uint32_t handle, pad; };
++struct gem_queue { uint32_t flags, priority, id; };
++struct gem_madvise { uint32_t handle, advice, retained; };
++static_assert(sizeof(gem_param) == 24 && sizeof(gem_new) == 16 &&
++    sizeof(gem_info) == 24 && sizeof(gem_submit) == 72 &&
++    sizeof(gem_cmd) == 32 && sizeof(gem_surface) == 40 && sizeof(gem_wait) == 32,"MSM/HakiOS ABI");
++
++#define GEM_SLOTS 512u
++#define GEM_CLIENT_BYTES (128u * 1024u * 1024u)
++#define GEM_MAX_BYTES (64u * 1024u * 1024u)
++#define GEM_READONLY 2u
++extern "C" void metroid_gpu_metal_ready(void);
++static mg_gem_ops ops;
++static IOLock *device_lock;
++static unsigned installed;
++
++extern "C" bool metroid_gpu_gem_ready(void)
++{ return __atomic_load_n(&installed,__ATOMIC_ACQUIRE) == 2 && ops.ready(ops.context); }
++static IOReturn result(int error)
++{
++    switch (error) {
++    case MG_OK: return kIOReturnSuccess;
++    case MG_LIMIT: return kIOReturnNoResources;
++    case MG_BUSY: case MG_FULL: return kIOReturnBusy;
++    case MG_TIMEOUT: return kIOReturnTimeout;
++    case MG_INVALID: return kIOReturnBadArgument;
++    case MG_UNSUPPORTED: return kIOReturnUnsupported;
++    default: return kIOReturnNotReady;
++    }
++}
++struct gem_buffer {
++    IOMemoryDescriptor *memory;
++    IOMemoryMap *mapping;
++    SweetSurface *surface;
++    uint64_t *pages, address, fence;
++    void *cpu;
++    size_t bytes;
++    uint32_t handle, flags;
++    unsigned page_count;
++};
++
++class HakiosGPUUserClient : public IOUserClient {
++    OSDeclareDefaultStructors(HakiosGPUUserClient);
++    gem_buffer *buffers;
++    mg_gen8_job *job;
++    uint64_t wired, last_fence;
++    uint32_t generation;
++    bool closed, job_pending;
++    gem_buffer *lookup(uint32_t);
++    IOReturn add(IOMemoryDescriptor *, SweetSurface *, uint32_t, uint32_t *);
++    bool drop(gem_buffer *);
++    IOReturn submit(gem_submit *);
++    IOReturn surface(gem_surface *);
++public:
++    bool start(IOService *) override;
++    IOReturn clientClose() override;
++    void free() override;
++    IOReturn clientMemoryForType(UInt32, IOOptionBits *, IOMemoryDescriptor **) override;
++    IOReturn externalMethod(uint32_t, IOExternalMethodArguments *, IOExternalMethodDispatch *, OSObject *, void *) override;
++};
++OSDefineMetaClassAndStructors(HakiosGPUUserClient, IOUserClient);
++gem_buffer *HakiosGPUUserClient::lookup(uint32_t handle)
++{
++    unsigned index = handle & 1023u;
++    if (!index || index > GEM_SLOTS || !buffers) return nullptr;
++    gem_buffer *b = &buffers[index-1];
++    return b->memory && b->handle == handle ? b : nullptr;
++}
++bool HakiosGPUUserClient::start(IOService *provider)
++{
++    if (!metroid_gpu_gem_ready() || !IOUserClient::start(provider)) return false;
++    buffers = IONewZero(gem_buffer,GEM_SLOTS);
++    job = IONewZero(mg_gen8_job,1);
++    return buffers && job;
++}
++/* The descriptor and CPU mapping are retained even when a failed map might
++ * have posted a PTE. Refusing to free is deliberate DMA quarantine. */
++bool HakiosGPUUserClient::drop(gem_buffer *b)
++{
++    if (!b->memory) return true;
++    if ((b->fence && ops.wait(ops.context,b->fence,0)) ||
++        ops.unmap(ops.context,b->address,b->bytes)) return false;
++    b->memory->complete();
++    if (b->mapping) b->mapping->release();
++    b->memory->release();
++    if (b->surface) b->surface->release();
++    IODelete(b->pages,uint64_t,b->page_count);
++    wired -= b->bytes;
++    *b = {};
++    return true;
++}
++IOReturn HakiosGPUUserClient::clientClose()
++{
++    IOLockLock(device_lock);
++    if (!closed) {
++        closed = true;
++        if (job_pending && !ops.wait(ops.context,last_fence,MG_QUEUE_MAX_WAIT_US)) job_pending = false;
++        if (buffers) for (unsigned i = 0; i < GEM_SLOTS; i++) {
++            if (buffers[i].memory && !drop(&buffers[i])) {
++                /* Keep the metadata, descriptor and map alive too: the owner
++                 * may still refer to this backing after an uncertain dispatch. */
++                IOLog("METROID GEM: retaining client backing after uncertain GPU access\n");
++            }
++        }
++    }
++    IOLockUnlock(device_lock);
++    terminate();
++    return kIOReturnSuccess;
++}
++void HakiosGPUUserClient::free()
++{
++    /* clientClose is the only GPU teardown path. free may also follow a failed
++     * start, where no buffers were mapped. Never contact a powered-off GPU. */
++    bool retained = false;
++    if (buffers) for (unsigned i = 0; i < GEM_SLOTS; i++) retained |= buffers[i].memory != nullptr;
++    if (!retained && buffers) IODelete(buffers,gem_buffer,GEM_SLOTS);
++    if (!job_pending && job) IODelete(job,mg_gen8_job,1);
++    IOUserClient::free();
++}
++IOReturn HakiosGPUUserClient::add(IOMemoryDescriptor *memory, SweetSurface *s,
++    uint32_t flags, uint32_t *handle)
++{
++    size_t bytes = static_cast<size_t>(memory->getLength());
++    if (!bytes || bytes > GEM_MAX_BYTES || (bytes & 4095) || bytes > GEM_CLIENT_BYTES-wired ||
++        (flags & ~GEM_READONLY) || job_pending) return kIOReturnBadArgument;
++    unsigned index;
++    for (index = 0; index < GEM_SLOTS; index++) if (!buffers[index].memory) break;
++    if (index == GEM_SLOTS || generation == 0x3fffffu) return kIOReturnNoResources;
++    if (memory->prepare() != kIOReturnSuccess) return kIOReturnVMError;
++    auto mapping = memory->map();
++    unsigned count = static_cast<unsigned>(bytes/4096);
++    auto pages = IONew(uint64_t,count);
++    if (!mapping || !pages) {
++        if (mapping) mapping->release();
++        if (pages) IODelete(pages,uint64_t,count);
++        memory->complete(); return kIOReturnNoMemory;
++    }
++    for (unsigned i = 0; i < count; i++) {
++        IOByteCount span = 0;
++        pages[i] = memory->getPhysicalSegment(i*4096ull,&span);
++        if (!pages[i] || (pages[i] & 4095) || span < 4096) {
++            mapping->release(); IODelete(pages,uint64_t,count);
++            memory->complete(); return kIOReturnVMError;
++        }
++    }
++    gem_buffer b = {};
++    b.memory = memory; b.mapping = mapping; b.surface = s; b.pages = pages;
++    b.cpu = reinterpret_cast<void *>(mapping->getVirtualAddress());
++    b.bytes = bytes; b.page_count = count; b.flags = flags;
++    b.handle = (++generation << 10) | (index+1);
++    mg_gem_backing backing = {b.cpu,pages,count,bytes,
++        static_cast<unsigned>(MG_GPU_READ | MG_GPU_EXEC | (flags & GEM_READONLY ? 0 : MG_GPU_WRITE))};
++    int error = ops.map(ops.context,&backing,&b.address);
++    if (error && !b.address) {
++        mapping->release(); IODelete(pages,uint64_t,count); memory->complete();
++        return result(error);
++    }
++    memory->retain(); if (s) s->retain();
++    buffers[index] = b; wired += bytes;
++    if (error) return result(error); /* retained, deliberately no user handle */
++    *handle = b.handle;
++    return kIOReturnSuccess;
++}
++IOReturn HakiosGPUUserClient::surface(gem_surface *request)
++{
++    SweetSurface *s = sweet_surface_copy(request->surface);
++    if (!s) return kIOReturnNotFound;
++    if (!s->memory) { s->release(); return kIOReturnNotReady; }
++    request->bytes = s->memory->getLength(); request->offset = s->offset;
++    request->row_bytes = s->bytesPerRow; request->width = s->width;
++    request->height = s->height; request->format = s->pixelFormat; request->planes = s->planeCount;
++    IOReturn ret = kIOReturnSuccess;
++    if (request->handle == UINT32_MAX) request->handle = 0;
++    else {
++        bool found = false;
++        for (unsigned i = 0; i < GEM_SLOTS; i++) if (buffers[i].memory && buffers[i].surface == s) {
++            request->handle = buffers[i].handle; found = true; break;
++        }
++        if (!found) ret = add(s->memory,s,0,&request->handle);
++    }
++    s->release();
++    return ret;
++}
++IOReturn HakiosGPUUserClient::submit(gem_submit *r)
++{
++    if (job_pending || !r->buffer_count || r->buffer_count > MG_GEN8_MAX_BUFFERS ||
++        !r->command_count || r->command_count > MG_GEN8_MAX_IBS ||
++        r->flags != 0x10 || r->queue != 1 || r->in_sync || r->out_sync ||
++        r->in_count || r->out_count || r->pad) return kIOReturnBadArgument;
++    auto bos = IONew(gem_bo,r->buffer_count);
++    auto cmds = IONew(gem_cmd,r->command_count);
++    if (!bos || !cmds) {
++        if (bos) IODelete(bos,gem_bo,r->buffer_count);
++        if (cmds) IODelete(cmds,gem_cmd,r->command_count);
++        return kIOReturnNoMemory;
++    }
++    IOReturn ret = kIOReturnBadArgument;
++    do {
++        if (copyin(r->buffers,bos,r->buffer_count*sizeof(*bos)) ||
++            copyin(r->commands,cmds,r->command_count*sizeof(*cmds))) { ret = kIOReturnVMError; break; }
++        *job = {}; job->buffer_count = r->buffer_count; job->ib_count = r->command_count;
++        bool valid = true;
++        for (unsigned i = 0; i < r->buffer_count; i++) {
++            gem_buffer *b = lookup(bos[i].handle);
++            if (!b || !(bos[i].flags & 3) || (bos[i].flags & ~3u) ||
++                ((bos[i].flags & 2) && (b->flags & GEM_READONLY)) ||
++                (bos[i].presumed && bos[i].presumed != b->address)) { valid = false; break; }
++            for (unsigned j = 0; j < i; j++) if (bos[i].handle == bos[j].handle) valid = false;
++            job->buffers[i] = {b->cpu,b->address,b->bytes,
++                static_cast<unsigned>((bos[i].flags & 1 ? MG_GPU_READ : 0) |
++                    (bos[i].flags & 2 ? MG_GPU_WRITE : 0))};
++        }
++        if (!valid) break;
++        for (unsigned i = 0; i < r->command_count; i++) {
++            const gem_cmd &c = cmds[i];
++            if (c.type != 1 || c.index >= r->buffer_count || !c.bytes ||
++                ((c.offset | c.bytes) & 3) || c.relocations || c.relocs || c.pad ||
++                c.offset > job->buffers[c.index].bytes ||
++                c.bytes > job->buffers[c.index].bytes-c.offset ||
++                (job->buffers[c.index].access & MG_GPU_WRITE)) { valid = false; break; }
++            job->buffers[c.index].access |= MG_GPU_READ | MG_GPU_EXEC;
++            job->ibs[i] = {c.index,c.offset,c.bytes};
++        }
++        if (!valid) break;
++        uint64_t fence = 0;
++        int error = ops.submit(ops.context,job,&fence);
++        if (fence) {
++            last_fence = fence; job_pending = true;
++            for (unsigned i = 0; i < r->buffer_count; i++) lookup(bos[i].handle)->fence = fence;
++        }
++        if (error) { ret = result(error); break; }
++        if (!fence || fence > UINT32_MAX) { ret = kIOReturnInternalError; break; }
++        /* Deliberately synchronous bring-up: no buffer reuse or presentation
++         * can outrun the real retirement/CPU-visibility proof. */
++        error = ops.wait(ops.context,fence,MG_QUEUE_MAX_WAIT_US);
++        if (!error) job_pending = false;
++        ret = result(error);
++        if (!error) { r->fence = static_cast<uint32_t>(fence); r->fence_fd = -1; }
++    } while (false);
++    IODelete(bos,gem_bo,r->buffer_count); IODelete(cmds,gem_cmd,r->command_count);
++    return ret;
++}
++IOReturn HakiosGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
++    IOMemoryDescriptor **memory)
++{
++    if (!options || !memory) return kIOReturnBadArgument;
++    *memory = nullptr;
++    IOLockLock(device_lock);
++    gem_buffer *b = closed ? nullptr : lookup(type);
++    if (b) { b->memory->retain(); *memory = b->memory; *options = 0; }
++    IOLockUnlock(device_lock);
++    return b ? kIOReturnSuccess : kIOReturnBadArgument;
++}
++IOReturn HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a,
++    IOExternalMethodDispatch *, OSObject *, void *)
++{
++    union request { gem_param param; gem_new create; gem_info info; gem_prep prep;
++        gem_wait wait; gem_submit submit; gem_surface surface; gem_close close;
++        gem_queue queue; gem_madvise advice; } r = {};
++    size_t bytes;
++    switch (selector) {
++    case 0x40: case 0x41: bytes = sizeof(r.param); break;
++    case 0x42: bytes = sizeof(r.create); break;
++    case 0x43: bytes = sizeof(r.info); break;
++    case 0x44: bytes = sizeof(r.prep); break;
++    case 0x45: bytes = 4; break;
++    case 0x46: bytes = sizeof(r.submit); break;
++    case 0x47: bytes = sizeof(r.wait); break;
++    case 0x48: bytes = sizeof(r.advice); break;
++    case 0x4a: bytes = sizeof(r.queue); break;
++    case 0x4b: bytes = 4; break;
++    case 0x09: bytes = sizeof(r.close); break;
++    case 0x7e: bytes = sizeof(r.surface); break;
++    default: return kIOReturnUnsupported;
++    }
++    if (!a || a->scalarInputCount || a->scalarOutputCount || a->structureInputDescriptor ||
++        a->structureOutputDescriptor || !a->structureInput || !a->structureOutput ||
++        a->structureInputSize != bytes || a->structureOutputSize != bytes) return kIOReturnBadArgument;
++    memcpy(&r,a->structureInput,bytes);
++    IOLockLock(device_lock);
++    IOReturn ret = kIOReturnSuccess;
++    if (closed || isInactive() || !metroid_gpu_gem_ready()) ret = kIOReturnNotReady;
++    else switch (selector) {
++    case 0x40:
++        if (r.param.pipe != 0x10 || r.param.len || r.param.pad ||
++            !ops.parameter(ops.context,r.param.param,&r.param.value)) ret = kIOReturnUnsupported;
++        break;
++    case 0x41: break; /* optional diagnostic process name */
++    case 0x42: {
++        if (!r.create.bytes || r.create.bytes > GEM_MAX_BYTES ||
++            (r.create.flags & ~(GEM_READONLY | 0xf0000u | 1u | 4u))) { ret = kIOReturnBadArgument; break; }
++        size_t capacity = static_cast<size_t>((r.create.bytes+PAGE_MASK) & ~(uint64_t)PAGE_MASK);
++        auto memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++            kIODirectionInOut | kIOMemoryMapperNone | kIOMemoryKernelUserShared | kIOMapWriteCombineCache,
++            capacity,PAGE_SIZE);
++        if (!memory) { ret = kIOReturnNoMemory; break; }
++        if (!memory->getBytesNoCopy()) { memory->release(); ret = kIOReturnNoMemory; break; }
++        bzero(memory->getBytesNoCopy(),capacity);
++        ret = add(memory,nullptr,r.create.flags & GEM_READONLY,&r.create.handle);
++        memory->release(); break;
++    }
++    case 0x43: {
++        gem_buffer *b = lookup(r.info.handle);
++        if (!b || r.info.pad) ret = kIOReturnBadArgument;
++        else if (r.info.info == 0) r.info.value = b->handle;
++        else if (r.info.info == 1) r.info.value = b->address;
++        else if (r.info.info == 5) r.info.value = b->flags | 0x20000u; /* actual WC mapping */
++        else ret = kIOReturnUnsupported;
++        break;
++    }
++    case 0x44: {
++        gem_buffer *b = lookup(r.prep.handle);
++        ret = b ? result(b->fence ? ops.wait(ops.context,b->fence,MG_QUEUE_MAX_WAIT_US) : MG_OK) : kIOReturnBadArgument;
++        break;
++    }
++    case 0x45: break; /* synchronous submit owns cache transitions */
++    case 0x46: ret = submit(&r.submit); break;
++    case 0x47:
++        ret = (!r.wait.fence || r.wait.fence > last_fence || r.wait.flags || r.wait.queue != 1) ?
++            kIOReturnBadArgument : result(ops.wait(ops.context,r.wait.fence,MG_QUEUE_MAX_WAIT_US));
++        if (!ret && r.wait.fence == last_fence) job_pending = false;
++        break;
++    case 0x48: if (!lookup(r.advice.handle)) ret = kIOReturnBadArgument; else r.advice.retained = 1; break;
++    case 0x4a:
++        if (r.queue.flags || r.queue.priority) ret = kIOReturnUnsupported; else r.queue.id = 1;
++        break;
++    case 0x4b: if (r.close.handle != 1) ret = kIOReturnBadArgument; break;
++    case 0x09: {
++        gem_buffer *b = lookup(r.close.handle);
++        ret = b && !r.close.pad ? (drop(b) ? kIOReturnSuccess : kIOReturnBusy) : kIOReturnBadArgument;
++        break;
++    }
++    case 0x7e: ret = surface(&r.surface); break;
++    }
++    if (!ret) memcpy(a->structureOutput,&r,bytes);
++    IOLockUnlock(device_lock);
++    return ret;
++}
++
++class HakiosGPU : public IOService {
++    OSDeclareDefaultStructors(HakiosGPU);
++public:
++    IOReturn newUserClient(task_t, void *, UInt32, OSDictionary *, IOUserClient **) override;
++};
++OSDefineMetaClassAndStructors(HakiosGPU, IOService);
++IOReturn HakiosGPU::newUserClient(task_t task, void *security, UInt32 type,
++    OSDictionary *properties, IOUserClient **out)
++{
++    if (!out) return kIOReturnBadArgument;
++    *out = nullptr;
++    if (type || !metroid_gpu_gem_ready()) return kIOReturnNotReady;
++    IOReturn privilege = IOUserClient::clientHasPrivilege(security,kIOClientPrivilegeAdministrator);
++    if (privilege) return privilege;
++    auto client = new HakiosGPUUserClient;
++    if (!client) return kIOReturnNoMemory;
++    if (!client->initWithTask(task,security,type,properties)) { client->release(); return kIOReturnError; }
++    if (!client->attach(this)) { client->release(); return kIOReturnError; }
++    if (!client->start(this)) { client->detach(this); client->release(); return kIOReturnError; }
++    *out = client; return kIOReturnSuccess;
++}
++extern "C" int metroid_gpu_gem_install(const mg_gem_ops *owner)
++{
++    if (!owner || !owner->ready || !owner->map || !owner->unmap || !owner->submit ||
++        !owner->wait || !owner->parameter || !owner->ready(owner->context)) return MG_UNBACKED;
++    unsigned expected = 0;
++    if (!__atomic_compare_exchange_n(&installed,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return MG_BUSY;
++    ops = *owner;
++    device_lock = IOLockAlloc();
++    IOService *provider = IOService::getPlatform();
++    auto service = new HakiosGPU;
++    if (!device_lock || !provider || !service) {
++        if (service) service->release();
++        if (device_lock) { IOLockFree(device_lock); device_lock = nullptr; }
++        return MG_LIMIT;
++    }
++    if (!service->init() || !service->attach(provider)) { service->release(); return MG_IO; }
++    if (!service->start(provider)) { service->detach(provider); service->release(); return MG_IO; }
++    service->setName("HakiosGPU");
++    service->setProperty("GPUChipID",MG_CHIP_ID,32);
++    service->setProperty("SynchronousSubmission",true);
++    service->setProperty("AdministratorClientsOnly",true);
++    __atomic_store_n(&installed,2,__ATOMIC_RELEASE);
++    service->registerService(); service->release();
++    metroid_gpu_metal_ready();
++    IOLog("METROID GEM: HakiosGPU published after GPU execution proof\n");
++    return MG_OK;
++}
++#endif
 --- a/bsd/dev/metroid_touch_power.h
 +++ b/bsd/dev/metroid_touch_power.h
 @@ -334,3 +334,5 @@
@@ -269,7 +726,7 @@
 +#include "metroid_gpu_rpmh.h"
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu.c
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,239 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Metroid Adreno825 hardware bring-up entry point. metroidgpu=1 reads ONLY
 + * the GPU clock-controller registers below. metroidgpu=2 attempts a cold
@@ -288,24 +745,24 @@
 +#include <IOKit/IOLib.h>
 +#include "metroid_gpu.h"
 +#include "metroid_gpu_memory.h"
-+#include "metroid_gpu_live.h"
++#include "metroid_gpu_accel.h"
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern void ml_io_unmap(vm_offset_t, vm_size_t);
 +void metroid_gpu_init(void);
 +static unsigned mg_started;
 +
-+struct mg_hardware { vm_offset_t cc, gcc; };
++struct mg_probe_hardware { vm_offset_t cc, gcc; };
 +static uint32_t mg_read(void *context, enum mg_bus bus, uint32_t offset)
 +{
-+    struct mg_hardware *h = context;
++    struct mg_probe_hardware *h = context;
 +    uint32_t value = *(volatile uint32_t *)((bus == MG_CC ? h->cc : h->gcc) + offset);
 +    __asm__ volatile("dmb oshld" ::: "memory");
 +    return value;
 +}
 +static void mg_write(void *context, enum mg_bus bus, uint32_t offset, uint32_t value)
 +{
-+    struct mg_hardware *h = context;
++    struct mg_probe_hardware *h = context;
 +    __asm__ volatile("dmb oshst" ::: "memory");
 +    *(volatile uint32_t *)((bus == MG_CC ? h->cc : h->gcc) + offset) = value;
 +    __asm__ volatile("dsb osh" ::: "memory");
@@ -355,16 +812,34 @@
 +}
 +#pragma clang diagnostic pop
 +
-+static void mg_payload_check(bool prepare_memory, bool live)
++static bool reserved_image(const char *name, const void **image, size_t *bytes)
++{
++    DTEntry node; const void *property; unsigned size = 0;
++    const boot_args *args = PE_state.bootArgs;
++    if (!args || args->Version != 2 ||
++        SecureDTLookupEntry(NULL,"/chosen/memory-map",&node) != kSuccess ||
++        SecureDTGetProperty(node,name,&property,&size) != kSuccess || size != 16) return false;
++    uint64_t extent[2]; memcpy(extent,property,sizeof(extent));
++    uint64_t pa = extent[0], n = extent[1];
++    if (!n || n > MG_FW_MAX_BYTES || (pa & PAGE_MASK) || pa < args->physBase ||
++        args->topOfKernelData < args->physBase ||
++        args->topOfKernelData-args->physBase > args->memSize ||
++        pa > args->topOfKernelData || n > args->topOfKernelData-pa) return false;
++    *image = (const void *)ml_static_ptovirt((vm_offset_t)pa); *bytes = (size_t)n;
++    return true;
++}
++static void mg_payload_check(bool prepare_memory, bool live, bool accelerator)
 +{
 +    DTEntry node;
 +    const void *property;
 +    unsigned size = 0;
 +    static struct mg_fw_plan plan;
++    struct mg_accel_images images = {0};
 +    if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &node) != kSuccess ||
 +        SecureDTGetProperty(node, "MetroidGMU", &property, &size) != kSuccess || size != 16) {
 +        printf("METROID GPU: no reserved MetroidGMU image; use metroid-gpu-payload.py\n");
-+        if (live) metroid_gpu_live_init(NULL, 0);
++        if (accelerator) metroid_gpu_accelerator_init(NULL,0,&images);
++        else if (live) metroid_gpu_live_init(NULL, 0);
 +        return;
 +    }
 +    uint64_t extent[2];
@@ -377,13 +852,28 @@
 +        args->topOfKernelData - args->physBase > args->memSize ||
 +        pa > args->topOfKernelData || bytes > args->topOfKernelData - pa) {
 +        printf("METROID GPU: invalid reserved GMU firmware extent\n");
-+        if (live) metroid_gpu_live_init(NULL, 0);
++        if (accelerator) metroid_gpu_accelerator_init(NULL,0,&images);
++        else if (live) metroid_gpu_live_init(NULL, 0);
 +        return;
 +    }
 +    const void *image = (const void *)ml_static_ptovirt((vm_offset_t)pa);
 +    int result = mg_fw_parse(image, (size_t)bytes, &plan);
 +    printf("METROID GPU: reserved GMU preflight result=%d bytes=%llu blocks=%u reservations=%u\n",
 +        result, (unsigned long long)bytes, plan.count, plan.reservation_count);
++    if (accelerator) {
++        if (!result && (!reserved_image("MetroidSQE",&images.sqe,&images.sqe_bytes) ||
++            !reserved_image("MetroidAQE",&images.aqe,&images.aqe_bytes) ||
++            !reserved_image("MetroidZAP",&images.zap,&images.zap_bytes))) result = MG_UNBACKED;
++        const void *parts[] = {image,images.sqe,images.aqe,images.zap};
++        const size_t lengths[] = {(size_t)bytes,images.sqe_bytes,images.aqe_bytes,images.zap_bytes};
++        for (unsigned i = 0; !result && i < 4; i++) for (unsigned j = 0; j < i; j++) {
++            uintptr_t a = (uintptr_t)parts[i], b = (uintptr_t)parts[j];
++            if (a < b+lengths[j] && b < a+lengths[i]) result = MG_INVALID;
++        }
++        if (result) printf("METROID GPU: mode6 requires distinct reserved GMU/SQE/AQE/ZAP firmware images; result=%d\n",result);
++        metroid_gpu_accelerator_init(result ? NULL : image,result ? 0 : (size_t)bytes,&images);
++        return;
++    }
 +    if (live) {
 +        metroid_gpu_live_init(result ? NULL : image, result ? 0 : (size_t)bytes);
 +        return;
@@ -414,13 +904,13 @@
 +{
 +    int mode = 0;
 +    if (!PE_parse_boot_argn("metroidgpu", &mode, sizeof(mode)) || !mode) return;
-+    if ((mode < 1 || mode > 5) || !mg_is_metroid()) {
++    if ((mode < 1 || mode > 6) || !mg_is_metroid()) {
 +        printf("METROID GPU: unsupported mode/platform; disabled\n");
 +        return;
 +    }
 +    /* IOKit can retry service startup. Never repeat a partial hardware test. */
 +    if (__atomic_exchange_n(&mg_started, 1, __ATOMIC_ACQUIRE)) return;
-+    if (mode >= 3) { mg_payload_check(mode == 4, mode == 5); return; }
++    if (mode >= 3) { mg_payload_check(mode == 4, mode >= 5, mode == 6); return; }
 +    /* Each offset is from Nothing's drivers/clk/qcom/gpucc-tuna.c.
 +     * Do not probe GX, CM3, TCM or SMMU registers before power/clock bring-up:
 +     * reads of a powered-down domain can themselves produce a bus fault.
@@ -459,7 +949,7 @@
 +        vm_size_t gcc_size = 0x80000;
 +        vm_offset_t gcc = ml_io_map(0x00100000, gcc_size);
 +        if (gcc) {
-+            struct mg_hardware hardware = {mapping + bias, gcc};
++            struct mg_probe_hardware hardware = {mapping + bias, gcc};
 +            struct mg_power_io io = {&hardware, mg_read, mg_write, mg_delay, mg_rails};
 +            struct mg_power_status status;
 +            int result = mg_power_enable(&io, &status);
@@ -478,7 +968,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu.h
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,128 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Metroid Adreno825 / Gen8.6.0 driver foundation.
 + * Wire formats follow Nothing's public KGSL source at 031e8669eb19.
@@ -535,6 +1025,7 @@
 +int metroid_gpu_rpmh_enable(void);
 +int metroid_gpu_rpmh_fabric_enable(void);
 +bool metroid_gpu_rpmh_fabric_ready(void);
++int metroid_gpu_rpmh_scheduler_tables(uint32_t *performance, uint32_t *bandwidth);
 +
 +enum mg_region { MG_ITCM, MG_CACHE, MG_DTCM, MG_UNCACHED, MG_UNCACHED_EXT };
 +#define MG_FW_MAX_BLOCKS 128u
@@ -605,6 +1096,330 @@
 +int mg_hfi_read(struct mg_hfi_queue *, uint32_t *out, size_t capacity);
 +int mg_hfi_ack(const uint32_t *message, size_t words, uint32_t sent_header,
 +    uint32_t *firmware_result);
++#endif
+--- /dev/null
++++ b/bsd/dev/metroid_gpu_accel.c
+@@ -0,0 +1,262 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include "metroid_gpu_accel.h"
++#ifdef MG_HOST_TEST
++#include <string.h>
++#else
++#include <libkern/libkern.h>
++#endif
++static int poison(struct mg_accel *a, int error)
++{ a->error = error; a->quarantined = true; return error; }
++static bool powered(void *p)
++{
++    struct mg_accel *a = p;
++    return !a->quarantined && a->live->stage == MG_LIVE_HFI && !a->live->quarantined &&
++        a->live->domain.attached && a->io.powered(a->io.context) &&
++        a->live->io.fabric_ready(a->live->io.context);
++}
++static bool idle(void *p) { return !((struct mg_accel *)p)->render.active; }
++static bool domains(void *p)
++{
++    struct mg_accel *a = p;
++    return powered(a) && a->gpu.domain.attached && a->gmu.domain.attached &&
++        !a->gpu.quarantined && !a->gmu.quarantined &&
++        mg_vm_validate(&a->gpu) == MG_OK && mg_vm_validate(&a->gmu) == MG_OK;
++}
++static bool running(void *p)
++{
++    struct mg_accel *a = p;
++    return domains(a) && a->hardware.stage == MG_HW_NONSECURE && !a->hardware.quarantined &&
++        a->scheduler.stage == MG_SCHED_GPU && !a->scheduler.quarantined;
++}
++static uint32_t read_reg(void *p, uint32_t reg)
++{ struct mg_accel *a = p; return a->live->io.read(a->live->io.context,reg); }
++static void write_reg(void *p, uint32_t reg, uint32_t value)
++{ struct mg_accel *a = p; a->live->io.write(a->live->io.context,reg,value); }
++static void delay(void *p, unsigned us)
++{ struct mg_accel *a = p; a->live->io.delay(a->live->io.context,us); }
++static void publish(void *p, const void *cpu, size_t bytes)
++{ struct mg_accel *a = p; a->live->io.publish(a->live->io.context,cpu,bytes); }
++static int sync_memory(void *p, enum mg_gpu_sync direction, const void *cpu, size_t bytes)
++{ struct mg_accel *a = p; return running(a) ? a->io.sync(a->io.context,direction,cpu,bytes) : MG_UNBACKED; }
++static size_t rounded(size_t bytes) { return (bytes+MG_MEMORY_PAGE-1) & ~(size_t)(MG_MEMORY_PAGE-1); }
++static int allocate(struct mg_accel *a, size_t bytes, struct mg_accel_block **out)
++{
++    if (!bytes || bytes > MG_GEN8_MAX_JOB_BYTES || a->block_count == MG_ACCEL_BLOCKS)
++        return MG_LIMIT;
++    bytes = rounded(bytes);
++    size_t metadata = rounded(bytes/4096*sizeof(uint64_t));
++    if (bytes+metadata > MG_GEN8_MAX_JOB_BYTES-a->allocated) return MG_LIMIT;
++    /* Count before allocator calls: even a failed second allocation retains
++     * the first descriptor, and no partially exposed owner is unwound. */
++    struct mg_accel_block *b = &a->blocks[a->block_count++];
++    const struct mg_memory_io *io = &a->live->io.memory;
++    int error = io->allocate(io->context,bytes,&b->memory); if (error) return error;
++    if (!b->memory.cpu || !b->memory.token || !b->memory.pa || b->memory.bytes != bytes ||
++        (((uintptr_t)b->memory.cpu | b->memory.pa) & (MG_MEMORY_PAGE-1))) return MG_UNBACKED;
++    a->allocated += bytes;
++    error = io->allocate(io->context,metadata,&b->page_storage); if (error) return error;
++    if (!b->page_storage.cpu || b->page_storage.bytes != metadata) return MG_UNBACKED;
++    a->allocated += metadata; b->pages = b->page_storage.cpu;
++    memset(b->memory.cpu,0,bytes);
++    for (unsigned i = 0; i < bytes/4096; i++) b->pages[i] = b->memory.pa+i*4096ull;
++    *out = b; return MG_OK;
++}
++static int map_block(struct mg_accel *a, struct mg_accel_block *b,
++    struct mg_vm *vm, unsigned access, uint32_t alignment, bool cache)
++{
++    uint64_t start = vm == &a->gpu ? 0x80000000ull : cache ? 0x4000 : 0x60000000;
++    uint64_t end = vm == &a->gpu ? 0xb0000000ull : cache ? 0x1000000 : 0x80000000;
++    /* Walk retained boot and newly allocated mappings. Align VA, not PA: the
++     * GMU protocol's alignment exponent is a virtual-address requirement. */
++    for (;;) {
++        start = (start+alignment-1) & ~(uint64_t)(alignment-1);
++        if (start+b->memory.bytes > end) return MG_LIMIT;
++        bool moved = false;
++        for (unsigned i = 0; vm == &a->gmu && i < a->live->memory.count; i++) {
++            const struct mg_dma_range *r = &a->live->memory.ranges[i];
++            if (start < (uint64_t)r->iova+r->bytes && r->iova < start+b->memory.bytes) {
++                start = (uint64_t)r->iova+r->bytes+4096; moved = true; break;
++            }
++        }
++        if (!moved) for (unsigned i = 0; i < a->block_count; i++) {
++            const struct mg_accel_block *r = &a->blocks[i];
++            uint32_t va = vm == &a->gpu ? r->gpu : r->gmu;
++            if (va && start < (uint64_t)va+r->memory.bytes+4096 && va < start+b->memory.bytes+4096) {
++                start = (uint64_t)va+r->memory.bytes+4096; moved = true; break;
++            }
++        }
++        if (!moved) break;
++    }
++    /* Assign before posting any PTE: all failures retain backing. */
++    if (vm == &a->gpu) { b->gpu = (uint32_t)start; b->gpu_access = access; }
++    else { b->gmu = (uint32_t)start; b->gmu_access = access; }
++    return mg_vm_map(vm,(uint32_t)start,b->pages,(unsigned)(b->memory.bytes/4096),access);
++}
++static int firmware_allocation(void *p, struct mg_sched_allocation *request)
++{
++    struct mg_accel *a = p;
++    unsigned size_shift = (request->align >> 8) & 255, va_shift = request->align & 255;
++    if (size_shift > 26 || va_shift > 26) return MG_LIMIT;
++    uint32_t alignment = 1u << (va_shift < 12 ? 12 : va_shift);
++    uint64_t unit = 1ull << (size_shift < 14 ? 14 : size_shift);
++    uint64_t bytes = ((uint64_t)request->bytes+unit-1) & ~(unit-1);
++    struct mg_accel_block *b = NULL;
++    int error = allocate(a,(size_t)bytes,&b); if (error) return error;
++    unsigned f = request->flags;
++    if (f & 1) {
++        unsigned access = MG_VM_READ | MG_VM_EXEC | (f & 2 ? MG_VM_PRIV : 0) | (f & 4 ? MG_VM_WRITE : 0);
++        error = map_block(a,b,&a->gpu,access,alignment,false); if (error) return error;
++    }
++    if (f & 8) {
++        unsigned access = MG_VM_READ | (f & 16 ? MG_VM_PRIV : 0) | (f & 32 ? MG_VM_WRITE : 0);
++        error = map_block(a,b,&a->gmu,access,alignment,(f & 128) != 0); if (error) return error;
++    }
++    publish(a,b->memory.cpu,b->memory.bytes);
++    request->bytes = (uint32_t)b->memory.bytes; request->gpu = b->gpu; request->gmu = b->gmu;
++    return MG_OK;
++}
++static struct mg_scm_result pas(void *p, unsigned cmd, uint64_t pa, uint64_t bytes)
++{ struct mg_accel *a = p; return a->io.pas(a->io.context,cmd,pa,bytes); }
++static int authenticate_zap(void *p)
++{
++    struct mg_accel *a = p;
++    const struct mg_zap_io io = {.context=a,.reserved=a->io.zap_reserved,
++        .metadata=a->metadata->memory.cpu,.reserved_pa=a->io.zap_pa,
++        .metadata_pa=a->metadata->memory.pa,.reserved_bytes=a->io.zap_bytes,
++        .metadata_bytes=a->metadata->memory.bytes,.publish=publish,.pas=pas};
++    return mg_zap_authenticate(&a->zap,&io,a->images.zap,a->images.zap_bytes);
++}
++static int boot_gpu(void *p)
++{
++    struct mg_accel *a = p;
++    int error = mg_scheduler_vote(&a->scheduler,1,1); if (error) return error;
++    const struct mg_hw_config config = {a->sqe->gpu,a->aqe->gpu,a->restore->gpu,
++        a->restore->memory.cpu,a->restore->memory.bytes};
++    const struct mg_hw_io io = {a,domains,read_reg,write_reg,delay,publish,authenticate_zap};
++    return mg_hardware_boot(&a->hardware,&io,&config,&a->scheduler);
++}
++static bool mapped(void *p, const void *cpu, uint64_t gpu, size_t bytes, unsigned access)
++{
++    struct mg_accel *a = p;
++    if (!domains(a) || !cpu || !bytes || !access || (access & ~7u)) return false;
++    for (unsigned i = 0; i < a->block_count; i++) {
++        const struct mg_accel_block *b = &a->blocks[i];
++        if (!b->gpu || gpu < b->gpu || gpu-b->gpu >= b->memory.bytes) continue;
++        size_t offset = (size_t)(gpu-b->gpu);
++        if ((uintptr_t)cpu < (uintptr_t)b->memory.cpu ||
++            (uintptr_t)cpu-(uintptr_t)b->memory.cpu != offset || bytes > b->memory.bytes-offset) continue;
++        unsigned permissions = MG_VM_READ | (access & MG_GPU_WRITE ? MG_VM_WRITE : 0) |
++            (access & MG_GPU_EXEC ? MG_VM_EXEC : 0) | (b->gpu_access & MG_VM_PRIV);
++        return mg_vm_contains(&a->gpu,(uint32_t)gpu & ~4095u,b->pages+offset/4096,
++            (unsigned)(((offset & 4095)+bytes+4095)/4096),permissions);
++    }
++    return mg_render_mapped(&a->render,cpu,gpu,bytes,access);
++}
++static bool gmu_mapped(void *p, const void *cpu, uint32_t gmu, size_t bytes)
++{
++    struct mg_accel *a = p;
++    if (!domains(a)) return false;
++    if (mg_live_gmu_mapped(a->live,cpu,gmu,bytes)) return true;
++    for (unsigned i = 0; i < a->block_count; i++) {
++        const struct mg_accel_block *b = &a->blocks[i];
++        if (b->gmu && gmu >= b->gmu && (uint64_t)gmu-b->gmu < b->memory.bytes) {
++            size_t offset = gmu-b->gmu;
++            if ((uintptr_t)cpu >= (uintptr_t)b->memory.cpu &&
++                (uintptr_t)cpu-(uintptr_t)b->memory.cpu == offset && bytes && bytes <= b->memory.bytes-offset)
++                return mg_vm_contains(&a->gmu,gmu & ~4095u,b->pages+offset/4096,
++                    (unsigned)(((offset & 4095)+bytes+4095)/4096),b->gmu_access);
++        }
++    }
++    return false;
++}
++static bool context_valid(void *p, uint64_t pt, uint32_t cb, uint32_t asid)
++{
++    struct mg_accel *a = p;
++    if (!domains(a) || a->gpu.tables.pa != pt || a->gpu.domain.cb != cb || a->gpu.domain.asid != asid) return false;
++    const struct mg_smmu_io *io = &a->gpu.io;
++    const struct mg_smmu_domain *d = &a->gpu.domain;
++    uint32_t b = d->cb_base+(d->cb << d->page_shift);
++    uint64_t ttbr = pt | ((uint64_t)asid << 48);
++    uint32_t ctl = io->read(io->context,b), fsr = io->read(io->context,b+0x58);
++    return ctl != UINT32_MAX && (ctl & 0x10e7) == 0x1027 && fsr != UINT32_MAX && !(fsr & 0xc00001fe) &&
++        io->read(io->context,0x800+d->smr*4) == 0x80000000 && io->read(io->context,0xc00+d->smr*4) == cb &&
++        io->read(io->context,b+0x20) == (uint32_t)ttbr && io->read(io->context,b+0x24) == (uint32_t)(ttbr >> 32);
++}
++static void retire(void *p, struct mg_gen8_job *job) { (void)p; (void)job; /* wait owns the persistent job */ }
++static void *hfi_pointer(struct mg_accel *a)
++{
++    for (unsigned i = 0; i < a->live->memory.count; i++)
++        if (a->live->memory.backing[i].iova == a->live->memory.config.hfi) return a->live->memory.backing[i].cpu;
++    return NULL;
++}
++int mg_accel_boot(struct mg_accel *a, struct mg_live *live,
++    const struct mg_accel_io *io, const struct mg_accel_images *images)
++{
++    if (!a || !live || !io || !images || !io->powered || !io->sync || !io->tables ||
++        !io->zap_reserved || !io->zap_pa || !io->zap_bytes || !io->pas ||
++        !images->sqe || !images->aqe || images->sqe_bytes < 8 || images->aqe_bytes < 8 ||
++        images->sqe_bytes > 1024*1024 || images->aqe_bytes > 1024*1024 ||
++        ((images->sqe_bytes | images->aqe_bytes) & 3)) return MG_INVALID;
++    struct mg_zap_plan zap;
++    int error = mg_zap_parse(images->zap,images->zap_bytes,&zap);
++    if (error || zap.span > io->zap_bytes) return error ? error : MG_UNBACKED;
++    if (a->attempted) return MG_BUSY;
++    a->attempted = true; a->live = live; a->io = *io; a->images = *images;
++    if (!powered(a)) return poison(a,MG_UNBACKED);
++    error = io->tables(io->context,a->performance,a->bandwidth); if (error) return poison(a,error);
++    error = live->io.memory.allocate(live->io.memory.context,MG_PT_MAX_PAGES*4096,&a->table);
++    if (error) return poison(a,error);
++    error = mg_vm_init(&a->gpu,a->table.cpu,a->table.pa,a->table.bytes,&live->io.smmu,a,powered,idle);
++    if (!error) error = mg_vm_attach(&a->gpu,0);
++    if (!error) error = mg_vm_adopt(&a->gmu,&live->memory.tables,&live->domain,&live->io.smmu,a,powered,idle);
++    if (error) return poison(a,error);
++    a->stage = MG_ACCEL_DOMAINS;
++    struct mg_accel_block **blocks[] = {&a->sqe,&a->aqe,&a->restore,&a->metadata,&a->context,&a->timestamps,&a->commands,&a->output};
++    const size_t sizes[] = {images->sqe_bytes-4,images->aqe_bytes-4,4096,MG_ZAP_METADATA,4096,4096,4096,4096};
++    for (unsigned i = 0; i < 8; i++) {
++        error = allocate(a,sizes[i],blocks[i]); if (error) return poison(a,error);
++        if (i < 3 || i == 5) {
++            unsigned access = MG_VM_READ | (i < 2 ? MG_VM_EXEC | MG_VM_PRIV : i == 2 ? MG_VM_WRITE | MG_VM_PRIV : MG_VM_WRITE);
++            error = map_block(a,*blocks[i],&a->gpu,access,4096,false);
++        } else if (i == 4) error = map_block(a,*blocks[i],&a->gmu,MG_VM_READ | MG_VM_WRITE,4096,false);
++        if (error) return poison(a,error);
++    }
++    /* Firmware container's first DWORD is excluded exactly as adreno_get_firmware. */
++    memcpy(a->sqe->memory.cpu,(const uint8_t *)images->sqe+4,images->sqe_bytes-4);
++    memcpy(a->aqe->memory.cpu,(const uint8_t *)images->aqe+4,images->aqe_bytes-4);
++    publish(a,a->sqe->memory.cpu,a->sqe->memory.bytes); publish(a,a->aqe->memory.cpu,a->aqe->memory.bytes);
++    a->stage = MG_ACCEL_BUFFERS;
++    const struct mg_sched_config config = {hfi_pointer(a),MG_HFI_BYTES,live->memory.config.hfi,
++        0x20070001,{a->performance,17},{a->bandwidth,160}};
++    const struct mg_sched_io scheduler_io = {a,domains,read_reg,write_reg,delay,firmware_allocation,boot_gpu};
++    error = mg_scheduler_boot(&a->scheduler,&scheduler_io,&config); if (error) return poison(a,error);
++    a->stage = MG_ACCEL_SCHEDULER;
++    error = mg_render_init(&a->render,&a->gpu,&a->backend,a,running,264000000); if (error) return poison(a,error);
++    uint32_t *timestamps = a->timestamps->memory.cpu;
++    const struct mg_gen8_config submission = {.chip_id=MG_CHIP_ID,.hfi_version=0x20070001,
++        .context_id=1,.context_bank=a->gpu.domain.cb,.asid=a->gpu.domain.asid,.page_table=a->gpu.tables.pa,
++        .hfi_memory=hfi_pointer(a),.hfi_bytes=MG_HFI_BYTES,.hfi_address=live->memory.config.hfi,
++        .context_memory=a->context->memory.cpu,.context_address=a->context->gmu,
++        .sop=timestamps,.eop=timestamps+1,.sop_address=a->timestamps->gpu,.eop_address=a->timestamps->gpu+4};
++    const struct mg_gen8_io submission_io = {a,running,context_valid,gmu_mapped,mapped,sync_memory,
++        read_reg,write_reg,delay,retire};
++    error = mg_gen8_init(&a->backend,&submission,&submission_io); if (error) return poison(a,error);
++    /* HFI control sequence is shared across scheduler/bootstrap/context traffic. */
++    a->backend.control_sequence = a->scheduler.sequence;
++    error = mg_gen8_context_open(&a->backend); if (error) return poison(a,error);
++    a->stage = MG_ACCEL_CONTEXT;
++    struct mg_accel_block *proof[] = {a->commands,a->output};
++    for (unsigned i = 0; i < 2; i++) {
++        struct mg_accel_block *b = proof[i];
++        const struct mg_gem_backing backing = {b->memory.cpu,b->pages,(unsigned)(b->memory.bytes/4096),b->memory.bytes,
++            MG_GPU_READ | (i ? MG_GPU_WRITE : MG_GPU_EXEC)};
++        uint64_t address = 0;
++        error = a->render.ops.map(a->render.ops.context,&backing,&address); if (error) return poison(a,error);
++        /* Renderer owns these VAs. Leave kernel block GPU field zero so its
++         * mapped callback validates through the renderer's lifetime records. */
++    }
++    error = mg_render_selftest(&a->render,a->commands->memory.cpu,a->output->memory.cpu);
++    if (error) return poison(a,error);
++    a->stage = MG_ACCEL_PROOF;
++    return MG_OK;
++}
+--- /dev/null
++++ b/bsd/dev/metroid_gpu_accel.h
+@@ -0,0 +1,56 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef METROID_GPU_ACCEL_H
++#define METROID_GPU_ACCEL_H
++#include "metroid_gpu_live.h"
++#include "metroid_gpu_render.h"
++#include "metroid_gpu_hardware.h"
++#include "metroid_gpu_zap.h"
++struct mg_accel_images {
++    const void *sqe, *aqe, *zap;
++    size_t sqe_bytes, aqe_bytes, zap_bytes;
++};
++struct mg_accel_io {
++    void *context;
++    bool (*powered)(void *);
++    int (*sync)(void *, enum mg_gpu_sync, const void *, size_t);
++    int (*tables)(void *, uint32_t *performance, uint32_t *bandwidth);
++    void *zap_reserved;
++    uint64_t zap_pa;
++    size_t zap_bytes;
++    struct mg_scm_result (*pas)(void *, unsigned, uint64_t, uint64_t);
++};
++#define MG_ACCEL_BLOCKS 96u
++struct mg_accel_block {
++    struct mg_memory_block memory, page_storage;
++    uint64_t *pages;
++    uint32_t gpu, gmu, gpu_access, gmu_access;
++};
++enum mg_accel_stage { MG_ACCEL_OFF, MG_ACCEL_DOMAINS, MG_ACCEL_BUFFERS,
++    MG_ACCEL_SCHEDULER, MG_ACCEL_CONTEXT, MG_ACCEL_PROOF };
++struct mg_accel {
++    struct mg_live *live;
++    struct mg_accel_io io;
++    struct mg_accel_images images;
++    struct mg_vm gpu, gmu;
++    struct mg_memory_block table;
++    struct mg_accel_block blocks[MG_ACCEL_BLOCKS];
++    unsigned block_count;
++    size_t allocated;
++    struct mg_accel_block *sqe, *aqe, *restore, *metadata, *context, *timestamps;
++    struct mg_accel_block *commands, *output;
++    struct mg_scheduler scheduler;
++    struct mg_hardware hardware;
++    struct mg_zap_status zap;
++    struct mg_gen8_backend backend;
++    struct mg_render render;
++    uint32_t performance[17], bandwidth[160];
++    enum mg_accel_stage stage;
++    int error;
++    bool attempted, quarantined;
++};
++/* Zero-init once. Real controller/domain/firmware startup, followed by real
++ * timestamp/visibility+GPU-write proof. Does not publish an IOKit service;
++ * caller installs render.ops only after this returns MG_OK. */
++int mg_accel_boot(struct mg_accel *, struct mg_live *,
++    const struct mg_accel_io *, const struct mg_accel_images *);
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_fw.c
@@ -736,6 +1551,270 @@
 +    }
 +    return MG_OK;
 +}
+--- /dev/null
++++ b/bsd/dev/metroid_gpu_gem.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef METROID_GPU_GEM_H
++#define METROID_GPU_GEM_H
++#include "metroid_gpu_submit.h"
++
++/* The real platform owner installs this only after scheduler/firmware/domain
++ * initialization and a fenced GPU memory-write self-test. Installation does
++ * not manufacture readiness. All methods are serialized by the service lock.
++ * map retains the backing through the service; unmap returning an error means
++ * the service must leave it wired, mapped and retained until reboot.
++ */
++struct mg_gem_backing {
++    void *cpu;
++    const uint64_t *pages;
++    unsigned page_count;
++    size_t bytes;
++    unsigned access;
++};
++struct mg_gem_ops {
++    void *context;
++    bool (*ready)(void *);
++    int (*map)(void *, const struct mg_gem_backing *, uint64_t *address);
++    int (*unmap)(void *, uint64_t address, size_t bytes);
++    /* Nonzero fence retains this persistent job even on failure. wait must
++     * prove GPU retirement and CPU visibility before releasing that reference. */
++    int (*submit)(void *, struct mg_gen8_job *, uint64_t *fence);
++    int (*wait)(void *, uint64_t fence, unsigned microseconds);
++    bool (*parameter)(void *, uint32_t, uint64_t *);
++};
++#ifdef __cplusplus
++extern "C" {
++#endif
++int metroid_gpu_gem_install(const struct mg_gem_ops *);
++bool metroid_gpu_gem_ready(void);
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
++++ b/bsd/dev/metroid_gpu_hardware.c
+@@ -0,0 +1,182 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ * Cold A825 GX/CP initialization, Nothing031e8669 adreno_gen8{,_hwsched}.c.
++ */
++#include "metroid_gpu_hardware.h"
++#include "metroid_gpu_registers.h"
++#define BIT(n) (1u << (n))
++enum { PIPE_NONE, PIPE_BR, PIPE_BV, PIPE_LPAC, PIPE_AQE0, PIPE_AQE1, PIPE_DDE_BR, PIPE_DDE_BV };
++#include "metroid_gpu_profile.h"
++#define COUNT(a) (sizeof(a)/sizeof((a)[0]))
++
++static int fail(struct mg_hardware *h, int error)
++{ h->error = error; h->quarantined = true; return error; }
++static void write_reg(struct mg_hardware *h, uint32_t reg, uint32_t value)
++{ h->reg = reg; h->value = value; h->io.write(h->io.context,reg,value); }
++static uint32_t read_reg(struct mg_hardware *h, uint32_t reg)
++{ h->reg = reg; return h->value = h->io.read(h->io.context,reg); }
++static int poll(struct mg_hardware *h, uint32_t reg, uint32_t mask, uint32_t wanted, unsigned us)
++{
++    for (unsigned i = 0; i < us; i++) {
++        if (!h->io.ready(h->io.context)) return fail(h,MG_UNBACKED);
++        uint32_t value = read_reg(h,reg);
++        if (value == UINT32_MAX) return fail(h,MG_IO);
++        if ((value & mask) == wanted) return MG_OK;
++        h->io.delay(h->io.context,1);
++    }
++    return fail(h,MG_TIMEOUT);
++}
++static void aperture(struct mg_hardware *h, unsigned pipe)
++{ write_reg(h,GEN8_CP_APERTURE_CNTL_HOST,pipe << 12); }
++static bool pipe_enabled(unsigned pipe) { return pipe != PIPE_LPAC && pipe != PIPE_AQE1; }
++static void pipe_write(struct mg_hardware *h, unsigned pipe, uint32_t reg, uint32_t value)
++{ aperture(h,pipe); write_reg(h,reg,value); }
++static uint32_t packet7(unsigned opcode, unsigned count)
++{
++    unsigned cp = 1, op = 1;
++    for (unsigned n = count; n; n >>= 1) cp ^= n & 1;
++    for (unsigned n = opcode; n; n >>= 1) op ^= n & 1;
++    return 0x70000000u | count | (cp << 15) | (opcode << 16) | (op << 23);
++}
++static int restore(struct mg_hardware *h, const struct mg_hw_config *c)
++{
++    uint32_t *out = c->restore_cpu;
++    /* Exact 16-byte cpu_gpu_lock followed by static pairs and pipe triplets. */
++    unsigned at = 4, dynamic = 0;
++    for (unsigned list = 0; list < 2; list++) {
++        const uint32_t *regs = list ? gen8_pwrup_reglist : gen8_ifpc_pwrup_reglist;
++        unsigned count = list ? COUNT(gen8_pwrup_reglist) : COUNT(gen8_ifpc_pwrup_reglist);
++        for (unsigned i = 0; i < count; i++) {
++            if ((at+2)*4 > c->restore_bytes) return fail(h,MG_LIMIT);
++            out[at++] = regs[i]; out[at++] = read_reg(h,regs[i]);
++            if (h->value == UINT32_MAX) return fail(h,MG_IO);
++        }
++    }
++    for (unsigned pipe = PIPE_BR; pipe <= PIPE_DDE_BV; pipe++) {
++        if (!pipe_enabled(pipe)) continue;
++        aperture(h,pipe);
++        for (unsigned i = 0; i < COUNT(gen8_0_0_pwrup_extlist); i++) {
++            const struct mg_hw_ext *e = &gen8_0_0_pwrup_extlist[i];
++            if (!(e->pipelines & BIT(pipe))) continue;
++            if ((at+3)*4 > c->restore_bytes) return fail(h,MG_LIMIT);
++            out[at++] = pipe << 12; out[at++] = e->reg; out[at++] = read_reg(h,e->reg);
++            if (h->value == UINT32_MAX) return fail(h,MG_IO);
++            dynamic++;
++        }
++    }
++    aperture(h,0);
++    out[0] = out[1] = out[2] = 0;
++    out[3] = COUNT(gen8_ifpc_pwrup_reglist) | (COUNT(gen8_pwrup_reglist) << 8) | (dynamic << 16);
++    h->io.publish(h->io.context,out,at*4);
++    return MG_OK;
++}
++static int registers(struct mg_hardware *h)
++{
++    aperture(h,0);
++    write_reg(h,GEN8_RBBM_PERFCTR_GPU_BUSY_MASKED,UINT32_MAX);
++    /* GMEM=0x260000, UCHE alignment=64MiB, highest bank bit16, MAL32, UBWC5. */
++    write_reg(h,GEN8_UCHE_CCHE_GC_GMEM_RANGE_MIN_LO,0x4000000);
++    write_reg(h,GEN8_UCHE_CCHE_GC_GMEM_RANGE_MIN_HI,0);
++    write_reg(h,GEN8_SP_HLSQ_GC_GMEM_RANGE_MIN_LO,0x4000000);
++    write_reg(h,GEN8_SP_HLSQ_GC_GMEM_RANGE_MIN_HI,0);
++    write_reg(h,GEN8_UCHE_TRAP_BASE_LO,0xfffff000);
++    write_reg(h,GEN8_UCHE_TRAP_BASE_HI,0x1ffff);
++    write_reg(h,GEN8_UCHE_WRITE_THRU_BASE_LO,0xfffff000);
++    write_reg(h,GEN8_UCHE_WRITE_THRU_BASE_HI,0x1ffff);
++    write_reg(h,GEN8_GMUCX_POWER_COUNTER_SELECT_XOCLK_1,4);
++    pipe_write(h,PIPE_BV,GEN8_GRAS_NC_MODE_CNTL,0x60);
++    pipe_write(h,PIPE_BR,GEN8_GRAS_NC_MODE_CNTL,0x60);
++    pipe_write(h,PIPE_BR,GEN8_RB_CCU_NC_MODE_CNTL,6);
++    pipe_write(h,PIPE_BR,GEN8_RB_CMP_NC_MODE_CNTL,0x20006);
++    aperture(h,0);
++    write_reg(h,GEN8_SP_NC_MODE_CNTL,0x26);
++    write_reg(h,GEN8_TPL1_NC_MODE_CNTL,6);
++    for (unsigned i = 0; i < COUNT(gen8_0_0_bicubic_regs); i++)
++        write_reg(h,gen8_0_0_bicubic_regs[i].reg,gen8_0_0_bicubic_regs[i].value);
++    write_reg(h,GEN8_UCHE_CLIENT_PF,0x81);
++    for (unsigned i = 0; gen8_6_0_nonctxt_regs[i].reg; i++) {
++        const struct mg_hw_nonctxt *r = &gen8_6_0_nonctxt_regs[i];
++        for (unsigned pipe = PIPE_NONE; pipe <= PIPE_DDE_BV; pipe++)
++            if (pipe_enabled(pipe) && (r->pipelines & BIT(pipe))) pipe_write(h,pipe,r->reg,r->value);
++    }
++    aperture(h,0);
++    write_reg(h,GEN8_RBBM_INTERFACE_HANG_INT_CNTL,0x40cfffff);
++    write_reg(h,GEN8_RBBM_SLICE_INTERFACE_HANG_INT_CNTL,BIT(30));
++    write_reg(h,GEN8_GMUAO_GPU_CX_BUSY_MASK,0xff000000);
++    uint32_t select = read_reg(h,GEN8_GMUCX_POWER_COUNTER_SELECT_XOCLK_0);
++    if (select == UINT32_MAX) return fail(h,MG_IO);
++    write_reg(h,GEN8_GMUCX_POWER_COUNTER_SELECT_XOCLK_0,(select & ~255u) | 0x20);
++    write_reg(h,GEN8_GMUCX_POWER_COUNTER_ENABLE,1);
++    for (unsigned pipe = PIPE_BR; pipe <= PIPE_BV; pipe++)
++        pipe_write(h,pipe,GEN8_CP_PROTECT_CNTL_PIPE,0xffff000b);
++    aperture(h,0);
++    uint32_t span = 0;
++    for (unsigned i = 0; gen8_0_0_protected_regs[i].reg; i++) {
++        const struct mg_hw_protect *r = &gen8_0_0_protected_regs[i];
++        span = r->start | ((r->end-r->start) << 18) | (r->noaccess << 31);
++        write_reg(h,r->reg,span);
++    }
++    for (unsigned pipe = PIPE_BR; pipe <= PIPE_DDE_BV; pipe++) {
++        if (!pipe_enabled(pipe)) continue;
++        if (pipe <= PIPE_BV) pipe_write(h,pipe,GEN8_CP_PROTECT_REG_PIPE+15,span);
++        pipe_write(h,pipe,GEN8_CP_APRIV_CNTL_PIPE,pipe == PIPE_BR ? 0x6f : 0xf);
++        pipe_write(h,pipe,GEN8_CP_INTERRUPT_STATUS_MASK_PIPE,0x07e83f7f);
++        pipe_write(h,pipe,GEN8_CP_HW_FAULT_STATUS_MASK_PIPE,0x77f);
++    }
++    aperture(h,0);
++    write_reg(h,GEN8_CP_INTERRUPT_STATUS_MASK_GLOBAL,0x007f007f);
++    write_reg(h,GEN8_RBBM_SECVID_TSB_CNTL,0);
++    write_reg(h,GEN8_RBBM_SECVID_TSB_TRUSTED_BASE_LO,0xf0000000);
++    write_reg(h,GEN8_RBBM_SECVID_TSB_TRUSTED_BASE_HI,0);
++    /* A 32-bit IOVA domain reserves [f0000000,100000000) for secure memory;
++     * this driver never maps it or exposes secure-buffer allocation. */
++    write_reg(h,GEN8_RBBM_SECVID_TSB_TRUSTED_SIZE,0x10000000);
++    /* Disable host IRQ delivery: faults/completion are polled, never claimed. */
++    write_reg(h,GEN8_RBBM_INT_0_MASK,0);
++    for (unsigned i = 0; i < COUNT(gen8_ao_hwcg_regs); i++)
++        write_reg(h,gen8_ao_hwcg_regs[i].reg,gen8_ao_hwcg_regs[i].value);
++    write_reg(h,GEN8_RBBM_CLOCK_CNTL_GLOBAL,1);
++    write_reg(h,GEN8_RBBM_CGC_GLOBAL_LOAD_CMD,1);
++    write_reg(h,GEN8_RBBM_CGC_P2S_TRIG_CMD,1);
++    int error = poll(h,GEN8_RBBM_CGC_P2S_STATUS,1,1,3);
++    if (!error) write_reg(h,GEN8_RBBM_CLOCK_CNTL_GLOBAL,0);
++    return error;
++}
++int mg_hardware_boot(struct mg_hardware *h, const struct mg_hw_io *io,
++    const struct mg_hw_config *c, struct mg_scheduler *s)
++{
++    if (!h || !io || !c || !s || !io->ready || !io->read || !io->write ||
++        !io->delay || !io->publish || !io->authenticate_zap || !c->sqe || !c->aqe ||
++        !c->restore || ((c->sqe | c->aqe | c->restore) & 4095) ||
++        c->sqe >= (1ull << 32) || c->aqe >= (1ull << 32) || c->restore >= (1ull << 32) ||
++        !c->restore_cpu || ((uintptr_t)c->restore_cpu & 4095) || c->restore_bytes < 4096 ||
++        !s->booting_gpu || s->stage != MG_SCHED_STARTED) return MG_INVALID;
++    if (h->attempted) return MG_BUSY;
++    h->attempted = true; h->io = *io;
++    if (!io->ready(io->context)) return fail(h,MG_UNBACKED);
++    h->exposed = true;
++    write_reg(h,GEN8_GMUCX_HOST2GMU_INTR_SET,BIT(30));
++    int error = poll(h,GEN8_GMUCX_GMU2HOST_INTR_INFO,BIT(31),BIT(31),100000);
++    if (error) return error;
++    write_reg(h,GEN8_GMUCX_GMU2HOST_INTR_CLR,BIT(31));
++    h->stage = MG_HW_OOB;
++    error = registers(h); if (error) return error;
++    h->stage = MG_HW_REGISTERS;
++    write_reg(h,GEN8_CP_SQE_INSTR_BASE_LO,(uint32_t)c->sqe);
++    write_reg(h,GEN8_CP_SQE_INSTR_BASE_HI,0);
++    write_reg(h,GEN8_CP_AQE_INSTR_BASE_LO_0,(uint32_t)c->aqe);
++    write_reg(h,GEN8_CP_AQE_INSTR_BASE_HI_0,0);
++    error = restore(h,c); if (error) return error;
++    h->stage = MG_HW_RESTORE;
++    const uint32_t cp[] = {packet7(0x17,1),BIT(27),packet7(0x48,7),
++        0x14b,3,0x20000000,2,(uint32_t)c->restore,0,BIT(31)};
++    error = mg_scheduler_raw(s,cp,COUNT(cp)); if (error) return fail(h,error);
++    error = poll(h,GEN8_GMUAO_GPU_CX_BUSY_STATUS,BIT(23),0,200000); if (error) return error;
++    h->stage = MG_HW_CP;
++    error = io->authenticate_zap(io->context); if (error) return fail(h,error);
++    h->stage = MG_HW_ZAP;
++    const uint32_t nonsecure[] = {packet7(0x66,1),0};
++    error = mg_scheduler_raw(s,nonsecure,COUNT(nonsecure)); if (error) return fail(h,error);
++    error = poll(h,GEN8_GMUAO_GPU_CX_BUSY_STATUS,BIT(23),0,200000); if (error) return error;
++    h->stage = MG_HW_NONSECURE;
++    return MG_OK;
++}
+--- /dev/null
++++ b/bsd/dev/metroid_gpu_hardware.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef METROID_GPU_HARDWARE_H
++#define METROID_GPU_HARDWARE_H
++#include "metroid_gpu_scheduler.h"
++struct mg_hw_config {
++    uint64_t sqe, aqe, restore;
++    uint32_t *restore_cpu;
++    size_t restore_bytes;
++};
++struct mg_hw_io {
++    void *context;
++    bool (*ready)(void *);
++    uint32_t (*read)(void *, uint32_t);
++    void (*write)(void *, uint32_t, uint32_t);
++    void (*delay)(void *, unsigned);
++    void (*publish)(void *, const void *, size_t);
++    int (*authenticate_zap)(void *);
++};
++enum mg_hw_stage { MG_HW_OFF, MG_HW_OOB, MG_HW_REGISTERS, MG_HW_RESTORE,
++    MG_HW_CP, MG_HW_ZAP, MG_HW_NONSECURE };
++struct mg_hardware {
++    struct mg_hw_io io;
++    enum mg_hw_stage stage;
++    uint32_t reg, value;
++    int error;
++    bool attempted, exposed, quarantined;
++};
++/* Called by the scheduler's boot_gpu callback. Retains GX OOB until reboot;
++ * no IFPC, reset recovery, preemption, LPAC, performance counters or IRQs.
++ * Firmware and restore pointers must already have pinned privileged stream0
++ * mappings. Failure never releases OOB, backing, SMMU or secure ownership.
++ */
++int mg_hardware_boot(struct mg_hardware *, const struct mg_hw_io *,
++    const struct mg_hw_config *, struct mg_scheduler *);
++#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_hfi.c
 @@ -0,0 +1,147 @@
@@ -988,7 +2067,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_live.h
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,81 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_LIVE_H
 +#define METROID_GPU_LIVE_H
@@ -1061,6 +2140,9 @@
 +void metroid_gpu_copy_report(struct mg_live_report *);
 +void metroid_gpu_service_start(void);
 +void metroid_gpu_live_init(const void *, size_t);
++struct mg_accel_images;
++void metroid_gpu_accelerator_init(const void *, size_t, const struct mg_accel_images *);
++void *metroid_gpu_zap_reserved_map(uint64_t, size_t);
 +int metroid_gpu_dma_allocate(void *, size_t, struct mg_memory_block *);
 +void metroid_gpu_dma_release(void *, struct mg_memory_block *);
 +#ifdef __cplusplus
@@ -1370,7 +2452,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_platform.c
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,273 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * XNU adapter for the retained GMU owner. No inherited bandwidth assumption.
 + * Register sequences: Nothing 031e8669, gpucc-tuna.c/adreno_gen8.c.
@@ -1381,7 +2463,9 @@
 +#include <kern/clock.h>
 +#include <machine/machine_routines.h>
 +#include <IOKit/IOLib.h>
-+#include "metroid_gpu_live.h"
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/boot.h>
++#include "metroid_gpu_accel.h"
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern void ml_io_unmap(vm_offset_t, vm_size_t);
@@ -1391,6 +2475,7 @@
 +static struct {
 +    vm_offset_t gpu, gcc, smmu;
 +    struct mg_live live;
++    struct mg_accel accelerator;
 +    struct mg_fabric_owner fabric;
 +    unsigned phase, report_ready;
 +    struct mg_live_report report;
@@ -1513,7 +2598,34 @@
 +    return MG_OK;
 +}
 +
-+void metroid_gpu_live_init(const void *image, size_t bytes)
++static bool accelerator_powered(void *p)
++{
++    (void)p;
++    if (!platform.gpu || platform.live.stage != MG_LIVE_HFI || platform.live.quarantined) return false;
++    uint32_t cx = power_read(NULL,MG_CC,0x9080), clk = power_read(NULL,MG_CC,0x90d4),
++        smmu = power_read(NULL,MG_CC,0x7000);
++    return cx != UINT32_MAX && (cx & 0x80000000) && clk != UINT32_MAX &&
++        (clk & 0x80000001) == 1 && smmu != UINT32_MAX && (smmu & 0x80000001) == 1;
++}
++static int synchronize(void *p, enum mg_gpu_sync direction, const void *cpu, size_t bytes)
++{
++    (void)p;
++    if (!cpu || !bytes || bytes > UINTPTR_MAX-(uintptr_t)cpu || !accelerator_powered(NULL)) return MG_UNBACKED;
++    if (direction == MG_GPU_TO_DEVICE) { publish(NULL,cpu,bytes); return MG_OK; }
++    if (direction != MG_GPU_TO_CPU) return MG_INVALID;
++    uint64_t ctr;
++    __asm__ volatile("dsb sy; mrs %0, ctr_el0" : "=r"(ctr) :: "memory");
++    uintptr_t line = (uintptr_t)4 << ((ctr >> 16) & 15), end = (uintptr_t)cpu+bytes;
++    /* Ownership was transferred before submission; after real EOP discard
++     * stale CPU cache lines rather than cleaning them over GPU output. */
++    for (uintptr_t va = (uintptr_t)cpu & ~(line-1); va < end; va += line)
++        __asm__ volatile("dc ivac, %0" :: "r"(va) : "memory");
++    __asm__ volatile("dsb sy" ::: "memory");
++    return MG_OK;
++}
++static int scheduler_tables(void *p, uint32_t *perf, uint32_t *bw)
++{ (void)p; return metroid_gpu_rpmh_scheduler_tables(perf,bw) ? MG_IO : MG_OK; }
++static void initialize(const void *image, size_t bytes, const struct mg_accel_images *images)
 +{
 +    /* Gen8.6.0 source profile: HUB=200MHz, NOC timeout=6800us.
 +     * ilog2(200*6800)-1 = 19; AHB expires after 2^20 cycles = 5242.88us.
@@ -1537,6 +2649,22 @@
 +        platform.live.error = MG_INVALID;
 +        goto report;
 +    }
++    if (images) {
++        struct mg_zap_plan plan;
++        const boot_args *args = PE_state.bootArgs;
++        /* Pinned tuna reserved-memory profile, outside all kernel-managed
++         * RAM. Refuse an incompatible boot memory map before touching GPU. */
++        if (!args || !args->memSize || args->memSize > UINT64_MAX-args->physBase ||
++            (args->physBase < 0x94e9c000 && 0x94e9a000 < args->physBase+args->memSize) ||
++            mg_zap_parse(images->zap,images->zap_bytes,&plan) || plan.span > 0x2000 ||
++            !images->sqe || !images->aqe || images->sqe_bytes < 8 || images->aqe_bytes < 8 ||
++            images->sqe_bytes > 0x100000 || images->aqe_bytes > 0x100000 ||
++            ((images->sqe_bytes | images->aqe_bytes) & 3)) {
++            platform.live.error = MG_INVALID;
++            printf("METROID GPU: accelerator firmware/carveout preflight failed; no power writes\n");
++            goto report;
++        }
++    }
 +    platform.gpu = ml_io_map(MG_GPU_PA, MG_REGISTER_BYTES);
 +    platform.gcc = ml_io_map(0x00100000, 0x80000);
 +    platform.smmu = ml_io_map(MG_SMMU_PA, MG_SMMU_SIZE);
@@ -1557,24 +2685,46 @@
 +        .delay = wait_us, .publish = publish, .scm = mg_scm_native,
 +    };
 +    (void)mg_live_boot(&platform.live, &io, image, bytes);
++    if (images && platform.live.stage == MG_LIVE_HFI) {
++        void *zap = metroid_gpu_zap_reserved_map(0x94e9a000,0x2000);
++        const struct mg_accel_io accelerator_io = {NULL,accelerator_powered,synchronize,
++            scheduler_tables,zap,0x94e9a000,0x2000,mg_scm_pas_native};
++        int error = zap ? mg_accel_boot(&platform.accelerator,&platform.live,&accelerator_io,images) : MG_UNBACKED;
++        if (!error) error = metroid_gpu_gem_install(&platform.accelerator.render.ops);
++        if (error) {
++            platform.accelerator.error = error; platform.accelerator.quarantined = true;
++        }
++        printf("METROID GPU: accelerator result=%d stage=%u scheduler=%u GX=%u ZAP=%u reg=%#x value=%#x HFI=%#x\n",
++            error,platform.accelerator.stage,platform.accelerator.scheduler.stage,
++            platform.accelerator.hardware.stage,platform.accelerator.zap.stage,
++            platform.accelerator.hardware.reg,platform.accelerator.hardware.value,
++            platform.accelerator.scheduler.last_header);
++        printf("METROID GPU: scheduler fault reg=%#x value=%#x allocation kind=%u flags=%#x bytes=%u align=%#x\n",
++            platform.accelerator.scheduler.fault_register,platform.accelerator.scheduler.fault_value,
++            platform.accelerator.scheduler.last_kind,platform.accelerator.scheduler.last_flags,
++            platform.accelerator.scheduler.last_bytes,platform.accelerator.scheduler.last_align);
++    }
 +report:
 +    platform.report = (struct mg_live_report){
-+        .version = 1, .mode = 5, .stage = platform.live.stage,
-+        .error = platform.live.error, .power_stage = platform.live.power.stage,
++        .version = 1, .mode = images ? 6 : 5, .stage = platform.live.stage,
++        .error = platform.live.error ? platform.live.error : platform.accelerator.error, .power_stage = platform.live.power.stage,
 +        .start_stage = platform.live.start.stage,
 +        .smmu_offset = platform.live.domain.offset, .smmu_value = platform.live.domain.value,
 +        .start_register = platform.live.start.reg, .start_value = platform.live.start.value,
 +        .ranges = platform.live.memory.count, .table_pages = platform.live.memory.tables.used,
-+        .exposed = platform.live.memory.exposed, .quarantined = platform.live.quarantined,
++        .exposed = platform.live.memory.exposed, .quarantined = platform.live.quarantined || platform.accelerator.quarantined,
 +        .hfi_ready = platform.live.stage == MG_LIVE_HFI,
-+        .accelerator_ready = 0, /* scheduler/SQE/AQE/ZAP + render proof absent */
++        .accelerator_ready = metroid_gpu_gem_ready(),
 +    };
 +    __atomic_store_n(&platform.report_ready, 1, __ATOMIC_RELEASE);
-+    printf("METROID GPU: live result=%d stage=%u exposed=%u quarantine=%u HFI=%u; accelerator unavailable\n",
++    printf("METROID GPU: live result=%d stage=%u exposed=%u quarantine=%u HFI=%u accelerator=%u\n",
 +        platform.report.error, platform.report.stage, platform.report.exposed,
-+        platform.report.quarantined, platform.report.hfi_ready);
++        platform.report.quarantined, platform.report.hfi_ready,platform.report.accelerator_ready);
 +    metroid_gpu_service_start();
 +}
++void metroid_gpu_live_init(const void *image, size_t bytes) { initialize(image,bytes,NULL); }
++void metroid_gpu_accelerator_init(const void *image, size_t bytes, const struct mg_accel_images *images)
++{ initialize(image,bytes,images); }
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_power.c
@@ -1736,6 +2886,299 @@
 +#undef TRY
 +}
 --- /dev/null
++++ b/bsd/dev/metroid_gpu_profile.h
+@@ -0,0 +1,290 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ * Copyright (c) 2023-2024, Qualcomm Innovation Center, Inc. All rights reserved.
++ * Gen8.6.0 register tables from Nothing031e8669 adreno-gpulist.h/adreno_gen8.c.
++ * Kept verbatim apart from portable structure/type names.
++ */
++#ifndef METROID_GPU_PROFILE_H
++#define METROID_GPU_PROFILE_H
++struct mg_hw_nonctxt { uint32_t reg, value, pipelines; };
++struct mg_hw_protect { uint32_t reg, start, end, noaccess; };
++struct mg_hw_pair { uint32_t reg, value; };
++struct mg_hw_ext { uint32_t reg, pipelines; };
++static const struct mg_hw_nonctxt gen8_6_0_nonctxt_regs[] = {
++	{ GEN8_CP_SMMU_STREAM_ID_LPAC, 0x00000101, BIT(PIPE_NONE) },
++	{ GEN8_GRAS_DBG_ECO_CNTL, 0x00000800, BIT(PIPE_BR) | BIT(PIPE_BV) },
++	{ GEN8_PC_AUTO_VERTEX_STRIDE, 0x00000001, BIT(PIPE_BR) | BIT(PIPE_BV) },
++	{ GEN8_PC_VIS_STREAM_CNTL, 0x10010000, BIT(PIPE_BR) | BIT(PIPE_BV) },
++	{ GEN8_PC_CONTEXT_SWITCH_STABILIZE_CNTL_1, 0x00000002, BIT(PIPE_BR) | BIT(PIPE_BV) },
++	{ GEN8_PC_CHICKEN_BITS_1, 0x00000003, BIT(PIPE_BR) | BIT(PIPE_BV) },
++	{ GEN8_PC_CHICKEN_BITS_2, 0x00000200, BIT(PIPE_BR) | BIT(PIPE_BV) },
++	{ GEN8_PC_CHICKEN_BITS_3, 0x00500000, BIT(PIPE_BR) | BIT(PIPE_BV) },
++	{ GEN8_PC_CHICKEN_BITS_4, 0x00500050, BIT(PIPE_BR) | BIT(PIPE_BV) },
++	/* Configure GBIF GX registers */
++	{ GEN8_UCHE_GBIF_GX_CONFIG, 0x010240e0, BIT(PIPE_NONE) },
++	{ GEN8_RBBM_GBIF_CLIENT_QOS_CNTL, 0x22122212, BIT(PIPE_NONE) },
++	/* Enable full concurrent resolve and unresolves */
++	{ GEN8_RB_CCU_CNTL, 0x00000068, BIT(PIPE_BR) },
++	{ GEN8_RB_GC_GMEM_PROTECT, 0x02600000, BIT(PIPE_BR) },
++	/* Configure number of outstanding transactions to 32 */
++	{ GEN8_RB_RESOLVE_PREFETCH_CNTL, 0x00000007, BIT(PIPE_BR) },
++	/* Configure UCHE request time out to 16 cycles for CCU/UCHE arbitration */
++	{ GEN8_RB_CMP_DBG_ECO_CNTL, 0x00004000, BIT(PIPE_BR) },
++	{ GEN8_RBBM_NC_MODE_CNTL, 0x00000001, BIT(PIPE_NONE) },
++	{ GEN8_RBBM_SLICE_NC_MODE_CNTL, 0x00000001, BIT(PIPE_NONE) },
++	{ GEN8_RBBM_WAIT_IDLE_CLOCKS_CNTL, 0x00000030, BIT(PIPE_NONE) },
++	{ GEN8_RBBM_WAIT_IDLE_CLOCKS_CNTL2, 0x00000030, BIT(PIPE_NONE) },
++	{ GEN8_RBBM_CGC_P2S_CNTL, 0x00000040, BIT(PIPE_NONE) },
++	/* Enable contribution of all shader stages to SP perfcounters */
++	{ GEN8_SP_PERFCTR_SHADER_MASK, 0x0000003f, BIT(PIPE_NONE) },
++	/*
++	 * BIT(26): Limit the number of wave-slots for Eviction buffer to 1 per ALU GRP
++	 * BIT(30): Disable LPAC auto-promotion
++	 */
++	{ GEN8_SP_CHICKEN_BITS_1, BIT(26) | BIT(30), BIT(PIPE_NONE) },
++	/*
++	 * BIT(22): Disable PS out of order retire
++	 * BIT(23): Enable half wave mode and MM instruction src&dst is half precision
++	 */
++	{ GEN8_SP_CHICKEN_BITS_2, BIT(22) | BIT(23), BIT(PIPE_NONE) },
++	{ GEN8_SP_CHICKEN_BITS_3, 0x00300000, BIT(PIPE_NONE) },
++	{ GEN8_SP_HLSQ_TIMEOUT_THRESHOLD_DP, 0x00000080,  BIT(PIPE_NONE) },
++	{ GEN8_TPL1_DBG_ECO_CNTL, 0x10000000, BIT(PIPE_NONE) },
++	/* Enable cubemap small miplevel optimization settings */
++	{ GEN8_TPL1_DBG_ECO_CNTL1, 0x00000724, BIT(PIPE_NONE) },
++	/* Disable tag bank id hashing */
++	{ GEN8_UCHE_MODE_CNTL, 0x00080000, BIT(PIPE_NONE) },
++	{ GEN8_UCHE_CCHE_MODE_CNTL, 0x00001000, BIT(PIPE_NONE) },
++	/* Limit gmem number of ways for GMEM requests in each set */
++	{ GEN8_UCHE_CCHE_CACHE_WAYS, 0x00000800, BIT(PIPE_NONE)},
++	/* Disable write slow pointer in data phase queue */
++	{ GEN8_UCHE_HW_DBG_CNTL, BIT(8), BIT(PIPE_NONE) },
++	/* Configure UCHE to CCU switchthreshold timeout cycles */
++	{ GEN8_UCHE_VARB_IDLE_TIMEOUT, 0x00000020, BIT(PIPE_NONE) },
++	{ GEN8_VFD_DBG_ECO_CNTL, 0x00008000, BIT(PIPE_BR) | BIT(PIPE_BV) },
++	{ GEN8_VFD_CB_BV_THRESHOLD, 0x00500050, BIT(PIPE_BR) | BIT(PIPE_BV) },
++	{ GEN8_VFD_CB_BR_THRESHOLD, 0x00600060, BIT(PIPE_BR) | BIT(PIPE_BV) },
++	{ GEN8_VFD_CB_BUSY_REQ_CNT, 0x00200020, BIT(PIPE_BR) | BIT(PIPE_BV) },
++	{ GEN8_VFD_CB_LP_REQ_CNT, 0x00000020, BIT(PIPE_BR) | BIT(PIPE_BV) },
++	{ GEN8_VPC_FLATSHADE_MODE_CNTL, 0x00000001, BIT(PIPE_BR) | BIT(PIPE_BV) },
++	/* Disable redundant tile data optimization */
++	{ GEN8_VSC_KMD_DBG_ECO_CNTL, BIT(11), BIT(PIPE_NONE)},
++	{ 0 },
++};
++static const struct mg_hw_protect gen8_0_0_protected_regs[] = {
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 0, 0x00000, 0x003a3, 0 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 1, 0x003b4, 0x0043f, 0 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 2, 0x00440, 0x0045f, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 3, 0x00580, 0x005df, 0 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 4, 0x005e0, 0x006ff, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 5, 0x0074a, 0x0074f, 0 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 6, 0x00759, 0x0077f, 0 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 7, 0x00789, 0x00789, 0 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 8, 0x0078c, 0x0079f, 0 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 9, 0x00800, 0x00829, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 10, 0x00837, 0x008e6, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 11, 0x008e7, 0x009b0, 0 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 12, 0x008ec, 0x009af, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 13, 0x009b1, 0x00c01, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 14, 0x00ce0, 0x00ce1, 0 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 15, 0x00df0, 0x00df0, 0 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 16, 0x00df1, 0x00df1, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 17, 0x00e01, 0x00e01, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 18, 0x00e03, 0x02e02, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 19, 0x03c00, 0x03cc5, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 20, 0x03cc6, 0x05cc5, 0 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 21, 0x08600, 0x087ff, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 22, 0x08e00, 0x08eff, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 23, 0x08f00, 0x08f00, 0 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 24, 0x08f01, 0x090bf, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 25, 0x09600, 0x097ff, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 26, 0x0981a, 0x09aff, 0 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 27, 0x09e00, 0x09fff, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 28, 0x0a600, 0x0a7ff, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 29, 0x0ae00, 0x0ae00, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 30, 0x0ae02, 0x0ae06, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 31, 0x0ae08, 0x0ae0e, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 32, 0x0ae10, 0x0b17f, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 33, 0x0b600, 0x0d5ff, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 34, 0x0dc00, 0x0fbff, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 35, 0x0fc00, 0x11bff, 0 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 36, 0x18400, 0x1843f, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 37, 0x18440, 0x1857f, 0 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 38, 0x18580, 0x1a57f, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 39, 0x1b400, 0x1d3ff, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 40, 0x1f400, 0x1f877, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 41, 0x1f878, 0x1ffff, 0 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 42, 0x1f930, 0x1fc59, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 43, 0x20000, 0x21fff, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 44, 0x27800, 0x2787f, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 45, 0x27880, 0x27c01, 0 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 46, 0x27882, 0x27883, 1 },
++	{ GEN8_CP_PROTECT_REG_GLOBAL + 63, 0x27c02, 0x27c02, 1 },
++	{ 0 },
++};
++static const struct mg_hw_pair gen8_ao_hwcg_regs[] = {
++	{ GEN8_GMUAO_CGC_MODE_CNTL, 0x00020000 },
++	{ GEN8_GMUAO_CGC_DELAY_CNTL, 0x00010111 },
++	{ GEN8_GMUAO_CGC_HYST_CNTL, 0x00005555 },
++};
++static const struct mg_hw_pair gen8_0_0_bicubic_regs[] = {
++	/*GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_0 default and recomended values are same */
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_1,  0x3fe05ff4 },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_2,  0x3fa0ebee },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_3,  0x3f5193ed },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_4,  0x3f0243f0 },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_5,  0x00000000 },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_6,  0x3fd093e8 },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_7,  0x3f4133dc },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_8,  0x3ea1dfdb },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_9,  0x3e0283e0 },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_10, 0x0000ac2b },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_11, 0x0000f01d },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_12, 0x00114412 },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_13, 0x0021980a },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_14, 0x0051ec05 },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_15, 0x0000380e },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_16, 0x3ff09001 },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_17, 0x3fc10bfa },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_18, 0x3f9193f7 },
++	{ GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_19, 0x3f7227f7 },
++};
++static const uint32_t gen8_pwrup_reglist[] = {
++	GEN8_UCHE_MODE_CNTL,
++	GEN8_UCHE_VARB_IDLE_TIMEOUT,
++	GEN8_UCHE_GBIF_GX_CONFIG,
++	GEN8_UCHE_CACHE_WAYS,
++	GEN8_UCHE_CCHE_MODE_CNTL,
++	GEN8_UCHE_CCHE_CACHE_WAYS,
++	GEN8_UCHE_CCHE_GC_GMEM_RANGE_MIN_LO,
++	GEN8_UCHE_CCHE_GC_GMEM_RANGE_MIN_HI,
++	GEN8_UCHE_CCHE_LPAC_GMEM_RANGE_MIN_LO,
++	GEN8_UCHE_CCHE_LPAC_GMEM_RANGE_MIN_HI,
++	GEN8_UCHE_HW_DBG_CNTL,
++	GEN8_UCHE_WRITE_THRU_BASE_LO,
++	GEN8_UCHE_WRITE_THRU_BASE_HI,
++	GEN8_UCHE_TRAP_BASE_LO,
++	GEN8_UCHE_TRAP_BASE_HI,
++	GEN8_UCHE_CLIENT_PF,
++	GEN8_VSC_KMD_DBG_ECO_CNTL,
++	GEN8_RB_CMP_NC_MODE_CNTL,
++	GEN8_SP_HLSQ_TIMEOUT_THRESHOLD_DP,
++	GEN8_SP_HLSQ_GC_GMEM_RANGE_MIN_LO,
++	GEN8_SP_HLSQ_GC_GMEM_RANGE_MIN_HI,
++	GEN8_SP_READ_SEL,
++};
++static const uint32_t gen8_ifpc_pwrup_reglist[] = {
++	GEN8_RBBM_NC_MODE_CNTL,
++	GEN8_RBBM_SLICE_INTERFACE_HANG_INT_CNTL,
++	GEN8_RBBM_SLICE_NC_MODE_CNTL,
++	GEN8_SP_NC_MODE_CNTL,
++	GEN8_SP_HLSQ_LPAC_GMEM_RANGE_MIN_LO,
++	GEN8_SP_HLSQ_LPAC_GMEM_RANGE_MIN_HI,
++	GEN8_SP_CHICKEN_BITS_1,
++	GEN8_SP_CHICKEN_BITS_2,
++	GEN8_SP_CHICKEN_BITS_3,
++	GEN8_SP_PERFCTR_SHADER_MASK,
++	GEN8_TPL1_NC_MODE_CNTL,
++	GEN8_TPL1_DBG_ECO_CNTL,
++	GEN8_TPL1_DBG_ECO_CNTL1,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_1,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_2,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_3,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_4,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_5,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_6,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_7,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_8,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_9,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_10,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_11,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_12,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_13,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_14,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_15,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_16,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_17,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_18,
++	GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_19,
++	GEN8_CP_PROTECT_REG_GLOBAL,
++	GEN8_CP_PROTECT_REG_GLOBAL + 1,
++	GEN8_CP_PROTECT_REG_GLOBAL + 2,
++	GEN8_CP_PROTECT_REG_GLOBAL + 3,
++	GEN8_CP_PROTECT_REG_GLOBAL + 4,
++	GEN8_CP_PROTECT_REG_GLOBAL + 5,
++	GEN8_CP_PROTECT_REG_GLOBAL + 6,
++	GEN8_CP_PROTECT_REG_GLOBAL + 7,
++	GEN8_CP_PROTECT_REG_GLOBAL + 8,
++	GEN8_CP_PROTECT_REG_GLOBAL + 9,
++	GEN8_CP_PROTECT_REG_GLOBAL + 10,
++	GEN8_CP_PROTECT_REG_GLOBAL + 11,
++	GEN8_CP_PROTECT_REG_GLOBAL + 12,
++	GEN8_CP_PROTECT_REG_GLOBAL + 13,
++	GEN8_CP_PROTECT_REG_GLOBAL + 14,
++	GEN8_CP_PROTECT_REG_GLOBAL + 15,
++	GEN8_CP_PROTECT_REG_GLOBAL + 16,
++	GEN8_CP_PROTECT_REG_GLOBAL + 17,
++	GEN8_CP_PROTECT_REG_GLOBAL + 18,
++	GEN8_CP_PROTECT_REG_GLOBAL + 19,
++	GEN8_CP_PROTECT_REG_GLOBAL + 20,
++	GEN8_CP_PROTECT_REG_GLOBAL + 21,
++	GEN8_CP_PROTECT_REG_GLOBAL + 22,
++	GEN8_CP_PROTECT_REG_GLOBAL + 23,
++	GEN8_CP_PROTECT_REG_GLOBAL + 24,
++	GEN8_CP_PROTECT_REG_GLOBAL + 25,
++	GEN8_CP_PROTECT_REG_GLOBAL + 26,
++	GEN8_CP_PROTECT_REG_GLOBAL + 27,
++	GEN8_CP_PROTECT_REG_GLOBAL + 28,
++	GEN8_CP_PROTECT_REG_GLOBAL + 29,
++	GEN8_CP_PROTECT_REG_GLOBAL + 30,
++	GEN8_CP_PROTECT_REG_GLOBAL + 31,
++	GEN8_CP_PROTECT_REG_GLOBAL + 32,
++	GEN8_CP_PROTECT_REG_GLOBAL + 33,
++	GEN8_CP_PROTECT_REG_GLOBAL + 34,
++	GEN8_CP_PROTECT_REG_GLOBAL + 35,
++	GEN8_CP_PROTECT_REG_GLOBAL + 36,
++	GEN8_CP_PROTECT_REG_GLOBAL + 37,
++	GEN8_CP_PROTECT_REG_GLOBAL + 38,
++	GEN8_CP_PROTECT_REG_GLOBAL + 39,
++	GEN8_CP_PROTECT_REG_GLOBAL + 40,
++	GEN8_CP_PROTECT_REG_GLOBAL + 41,
++	GEN8_CP_PROTECT_REG_GLOBAL + 42,
++	GEN8_CP_PROTECT_REG_GLOBAL + 43,
++	GEN8_CP_PROTECT_REG_GLOBAL + 44,
++	GEN8_CP_PROTECT_REG_GLOBAL + 45,
++	GEN8_CP_PROTECT_REG_GLOBAL + 46,
++	GEN8_CP_PROTECT_REG_GLOBAL + 63,
++	GEN8_CP_INTERRUPT_STATUS_MASK_GLOBAL,
++};
++static const struct mg_hw_ext gen8_0_0_pwrup_extlist[] = {
++	{ GEN8_CP_HW_FAULT_STATUS_MASK_PIPE, BIT(PIPE_BR) | BIT(PIPE_BV) | BIT(PIPE_LPAC)
++		| BIT(PIPE_AQE0) | BIT(PIPE_AQE1) | BIT(PIPE_DDE_BR) | BIT(PIPE_DDE_BV) },
++	{ GEN8_CP_INTERRUPT_STATUS_MASK_PIPE, BIT(PIPE_BR) | BIT(PIPE_BV) | BIT(PIPE_LPAC)
++		| BIT(PIPE_AQE0) | BIT(PIPE_AQE1) | BIT(PIPE_DDE_BR) | BIT(PIPE_DDE_BV) },
++	{ GEN8_CP_PROTECT_CNTL_PIPE, BIT(PIPE_BR) | BIT(PIPE_BV) | BIT(PIPE_LPAC)},
++	{ GEN8_CP_PROTECT_REG_PIPE + 15, BIT(PIPE_BR) | BIT(PIPE_BV) | BIT(PIPE_LPAC)},
++	{ GEN8_GRAS_TSEFE_DBG_ECO_CNTL, BIT(PIPE_BV) | BIT(PIPE_BR)},
++	{ GEN8_GRAS_NC_MODE_CNTL, BIT(PIPE_BV) | BIT(PIPE_BR)},
++	{ GEN8_GRAS_DBG_ECO_CNTL, BIT(PIPE_BV) | BIT(PIPE_BR)},
++	{ GEN8_RB_CCU_CNTL, BIT(PIPE_BR)},
++	{ GEN8_RB_CCU_NC_MODE_CNTL, BIT(PIPE_BR)},
++	{ GEN8_RB_CMP_NC_MODE_CNTL, BIT(PIPE_BR)},
++	{ GEN8_RB_RESOLVE_PREFETCH_CNTL, BIT(PIPE_BR)},
++	{ GEN8_RB_CMP_DBG_ECO_CNTL, BIT(PIPE_BR)},
++	{ GEN8_RB_GC_GMEM_PROTECT, BIT(PIPE_BR)},
++	{ GEN8_RB_LPAC_GMEM_PROTECT, BIT(PIPE_BR)},
++	{ GEN8_RB_CONTEXT_SWITCH_GMEM_SAVE_RESTORE, BIT(PIPE_BR)},
++	{ GEN8_VPC_FLATSHADE_MODE_CNTL, BIT(PIPE_BV) | BIT(PIPE_BR)},
++	{ GEN8_PC_CHICKEN_BITS_1, BIT(PIPE_BV) | BIT(PIPE_BR)},
++	{ GEN8_PC_CHICKEN_BITS_2, BIT(PIPE_BV) | BIT(PIPE_BR)},
++	{ GEN8_PC_CHICKEN_BITS_3, BIT(PIPE_BV) | BIT(PIPE_BR)},
++	{ GEN8_PC_CHICKEN_BITS_4, BIT(PIPE_BV) | BIT(PIPE_BR)},
++	{ GEN8_PC_AUTO_VERTEX_STRIDE, BIT(PIPE_BR) | BIT(PIPE_BV)},
++	{ GEN8_PC_VIS_STREAM_CNTL, BIT(PIPE_BR) | BIT(PIPE_BV)},
++	{ GEN8_PC_CONTEXT_SWITCH_STABILIZE_CNTL_1, BIT(PIPE_BR) | BIT(PIPE_BV)},
++	{ GEN8_VFD_CB_BV_THRESHOLD, BIT(PIPE_BV) | BIT(PIPE_BR)},
++	{ GEN8_VFD_CB_BR_THRESHOLD, BIT(PIPE_BV) | BIT(PIPE_BR)},
++	{ GEN8_VFD_CB_BUSY_REQ_CNT, BIT(PIPE_BV) | BIT(PIPE_BR)},
++	{ GEN8_VFD_CB_LP_REQ_CNT, BIT(PIPE_BV) | BIT(PIPE_BR)},
++	{ GEN8_VFD_DBG_ECO_CNTL, BIT(PIPE_BR) | BIT(PIPE_BV)},
++};
++#endif
+--- /dev/null
 +++ b/bsd/dev/metroid_gpu_queue.c
 @@ -0,0 +1,67 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
@@ -1850,8 +3293,362 @@
 +
 +#endif
 --- /dev/null
++++ b/bsd/dev/metroid_gpu_registers.h
+@@ -0,0 +1,124 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ * Copyright (c) 2023-2024, Qualcomm Innovation Center, Inc. All rights reserved.
++ * Register subset from Nothing031e8669 gen8_reg.h; offsets in DWORDS.
++ */
++#ifndef METROID_GPU_REGISTERS_H
++#define METROID_GPU_REGISTERS_H
++#define GEN8_CP_APERTURE_CNTL_HOST                             0x81c
++#define GEN8_CP_APRIV_CNTL_PIPE                                0x84d
++#define GEN8_CP_AQE_INSTR_BASE_HI_0                            0x819
++#define GEN8_CP_AQE_INSTR_BASE_LO_0                            0x818
++#define GEN8_CP_HW_FAULT_STATUS_MASK_PIPE                      0x8b4
++#define GEN8_CP_INTERRUPT_STATUS_MASK_GLOBAL                   0x8b6
++#define GEN8_CP_INTERRUPT_STATUS_MASK_PIPE                     0x8b8
++#define GEN8_CP_PROTECT_CNTL_PIPE                              0x84e
++#define GEN8_CP_PROTECT_REG_GLOBAL                             0x850
++#define GEN8_CP_PROTECT_REG_PIPE                               0x8a0
++#define GEN8_CP_SMMU_STREAM_ID_LPAC                            0x814
++#define GEN8_CP_SQE_INSTR_BASE_HI                              0x817
++#define GEN8_CP_SQE_INSTR_BASE_LO                              0x816
++#define GEN8_GMUAO_CGC_DELAY_CNTL	0x23b0a
++#define GEN8_GMUAO_CGC_HYST_CNTL	0x23b0b
++#define GEN8_GMUAO_CGC_MODE_CNTL	0x23b09
++#define GEN8_GMUAO_GPU_CX_BUSY_MASK	0x23b0e
++#define GEN8_GMUAO_GPU_CX_BUSY_STATUS	0x23b0c
++#define GEN8_GMUCX_GMU2HOST_INTR_CLR		0x1f991
++#define GEN8_GMUCX_GMU2HOST_INTR_INFO		0x1f992
++#define GEN8_GMUCX_HOST2GMU_INTR_SET		0x1f994
++#define GEN8_GMUCX_POWER_COUNTER_ENABLE            0x1fc10
++#define GEN8_GMUCX_POWER_COUNTER_SELECT_XOCLK_0    0x1fc40
++#define GEN8_GMUCX_POWER_COUNTER_SELECT_XOCLK_1    0x1fc41
++#define GEN8_GRAS_DBG_ECO_CNTL              0x8702
++#define GEN8_GRAS_NC_MODE_CNTL              0x8700
++#define GEN8_GRAS_TSEFE_DBG_ECO_CNTL        0x8600
++#define GEN8_PC_AUTO_VERTEX_STRIDE          0x9e0a
++#define GEN8_PC_CHICKEN_BITS_1              0x9e50
++#define GEN8_PC_CHICKEN_BITS_2              0x9f20
++#define GEN8_PC_CHICKEN_BITS_3              0x9e22
++#define GEN8_PC_CHICKEN_BITS_4              0x9e23
++#define GEN8_PC_CONTEXT_SWITCH_STABILIZE_CNTL_1 0x9e64
++#define GEN8_PC_VIS_STREAM_CNTL             0x9e0d
++#define GEN8_RBBM_CGC_GLOBAL_LOAD_CMD            0x09b
++#define GEN8_RBBM_CGC_P2S_CNTL                   0x09d
++#define GEN8_RBBM_CGC_P2S_STATUS                 0x09f
++#define GEN8_RBBM_CGC_P2S_TRIG_CMD               0x09c
++#define GEN8_RBBM_CLOCK_CNTL_GLOBAL              0x09a
++#define GEN8_RBBM_GBIF_CLIENT_QOS_CNTL           0x008
++#define GEN8_RBBM_INTERFACE_HANG_INT_CNTL        0x02f
++#define GEN8_RBBM_INT_0_MASK                     0x062
++#define GEN8_RBBM_NC_MODE_CNTL                   0x440
++#define GEN8_RBBM_PERFCTR_GPU_BUSY_MASKED        0x19e
++#define GEN8_RBBM_SECVID_TSB_CNTL                0xf803
++#define GEN8_RBBM_SECVID_TSB_TRUSTED_BASE_HI     0xf801
++#define GEN8_RBBM_SECVID_TSB_TRUSTED_BASE_LO     0xf800
++#define GEN8_RBBM_SECVID_TSB_TRUSTED_SIZE        0xf802
++#define GEN8_RBBM_SLICE_INTERFACE_HANG_INT_CNTL   0x58f
++#define GEN8_RBBM_SLICE_NC_MODE_CNTL              0x5ec
++#define GEN8_RBBM_WAIT_IDLE_CLOCKS_CNTL          0x010
++#define GEN8_RBBM_WAIT_IDLE_CLOCKS_CNTL2         0x011
++#define GEN8_RB_CCU_CNTL                    0x8e07
++#define GEN8_RB_CCU_NC_MODE_CNTL            0x8e08
++#define GEN8_RB_CMP_DBG_ECO_CNTL            0x8f02
++#define GEN8_RB_CMP_NC_MODE_CNTL            0x8f00
++#define GEN8_RB_CONTEXT_SWITCH_GMEM_SAVE_RESTORE 0x8e50
++#define GEN8_RB_GC_GMEM_PROTECT             0x8e09
++#define GEN8_RB_LPAC_GMEM_PROTECT           0x8e0a
++#define GEN8_RB_RESOLVE_PREFETCH_CNTL       0x8f01
++#define GEN8_SP_CHICKEN_BITS_1                   0xae08
++#define GEN8_SP_CHICKEN_BITS_2                   0xae09
++#define GEN8_SP_CHICKEN_BITS_3                   0xae0a
++#define GEN8_SP_HLSQ_GC_GMEM_RANGE_MIN_HI        0xae11
++#define GEN8_SP_HLSQ_GC_GMEM_RANGE_MIN_LO        0xae10
++#define GEN8_SP_HLSQ_LPAC_GMEM_RANGE_MIN_HI      0xae13
++#define GEN8_SP_HLSQ_LPAC_GMEM_RANGE_MIN_LO      0xae12
++#define GEN8_SP_HLSQ_TIMEOUT_THRESHOLD_DP        0xae6b
++#define GEN8_SP_NC_MODE_CNTL                     0xae02
++#define GEN8_SP_PERFCTR_SHADER_MASK              0xae0f
++#define GEN8_SP_READ_SEL                         0xae6d
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_0   0xb606
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_1   0xb607
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_10   0xb610
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_11   0xb611
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_12   0xb612
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_13   0xb613
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_14   0xb614
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_15   0xb615
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_16   0xb616
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_17   0xb617
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_18   0xb618
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_19   0xb619
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_2   0xb608
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_3   0xb609
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_4   0xb60a
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_5   0xb60b
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_6   0xb60c
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_7   0xb60d
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_8   0xb60e
++#define GEN8_TPL1_BICUBIC_WEIGHTS_TABLE_9   0xb60f
++#define GEN8_TPL1_DBG_ECO_CNTL              0xb600
++#define GEN8_TPL1_DBG_ECO_CNTL1             0xb602
++#define GEN8_TPL1_NC_MODE_CNTL              0xb604
++#define GEN8_UCHE_CACHE_WAYS                0xe04
++#define GEN8_UCHE_CCHE_CACHE_WAYS                0xf02
++#define GEN8_UCHE_CCHE_GC_GMEM_RANGE_MIN_HI      0xf09
++#define GEN8_UCHE_CCHE_GC_GMEM_RANGE_MIN_LO      0xf08
++#define GEN8_UCHE_CCHE_LPAC_GMEM_RANGE_MIN_HI    0xf0b
++#define GEN8_UCHE_CCHE_LPAC_GMEM_RANGE_MIN_LO    0xf0a
++#define GEN8_UCHE_CCHE_MODE_CNTL                 0xf01
++#define GEN8_UCHE_CLIENT_PF                 0xe11
++#define GEN8_UCHE_GBIF_GX_CONFIG            0xe12
++#define GEN8_UCHE_HW_DBG_CNTL               0xe16
++#define GEN8_UCHE_MODE_CNTL                 0xe01
++#define GEN8_UCHE_TRAP_BASE_HI              0xe09
++#define GEN8_UCHE_TRAP_BASE_LO              0xe08
++#define GEN8_UCHE_VARB_IDLE_TIMEOUT         0xe10
++#define GEN8_UCHE_WRITE_THRU_BASE_HI        0xe07
++#define GEN8_UCHE_WRITE_THRU_BASE_LO        0xe06
++#define GEN8_VFD_CB_BR_THRESHOLD            0xa63a
++#define GEN8_VFD_CB_BUSY_REQ_CNT            0xa63b
++#define GEN8_VFD_CB_BV_THRESHOLD            0xa639
++#define GEN8_VFD_CB_LP_REQ_CNT              0xa63c
++#define GEN8_VFD_DBG_ECO_CNTL               0xa600
++#define GEN8_VPC_FLATSHADE_MODE_CNTL             0x9741
++#define GEN8_VSC_KMD_DBG_ECO_CNTL                 0xdf0
++#endif
+--- /dev/null
++++ b/bsd/dev/metroid_gpu_render.c
+@@ -0,0 +1,186 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include "metroid_gpu_render.h"
++#ifdef MG_HOST_TEST
++#include <string.h>
++#else
++#include <libkern/libkern.h>
++#endif
++#define VA_FIRST 0x10000000u
++#define VA_END 0x50000000u
++static bool running(struct mg_render *r)
++{
++    return r->initialized && !r->quarantined && !r->vm->quarantined &&
++        !r->backend->quarantined && r->running(r->context);
++}
++static bool ready(void *p) { struct mg_render *r = p; return r->verified && running(r) &&
++    r->backend->bound && r->backend->registered && !r->backend->closed; }
++static int poison(struct mg_render *r, int error) { r->quarantined = true; return error; }
++static int map(void *p, const struct mg_gem_backing *b, uint64_t *address)
++{
++    struct mg_render *r = p;
++    if (!address) return MG_INVALID;
++    *address = 0;
++    if (!b || !b->cpu || !b->pages || !b->bytes || (b->bytes & 4095) ||
++        ((uintptr_t)b->cpu & 4095) || b->bytes > UINTPTR_MAX-(uintptr_t)b->cpu ||
++        b->page_count != b->bytes/4096 || b->page_count > MG_VM_MAX_PAGES ||
++        !(b->access & MG_GPU_READ) || (b->access & ~7u)) return MG_INVALID;
++    if (!running(r)) return MG_UNBACKED;
++    if (r->active) return MG_BUSY;
++    if (b->bytes > MG_RENDER_BYTES-r->allocated) return MG_LIMIT;
++    unsigned slot;
++    for (slot = 0; slot < MG_RENDER_BUFFERS; slot++) if (!r->mappings[slot].address) break;
++    if (slot == MG_RENDER_BUFFERS) return MG_LIMIT;
++    uint64_t va = VA_FIRST;
++    /* First-fit with a 4K unmapped guard on either side of each allocation.
++     * Data VA can be reused only after completed jobs and TLB invalidation. */
++    for (;;) {
++        if (va + b->bytes + 4096 > VA_END) return MG_LIMIT;
++        bool moved = false;
++        for (unsigned i = 0; i < MG_RENDER_BUFFERS; i++) {
++            const struct mg_render_mapping *m = &r->mappings[i];
++            if (!m->address) continue;
++            if ((uintptr_t)b->cpu < (uintptr_t)m->backing.cpu+m->backing.bytes &&
++                (uintptr_t)m->backing.cpu < (uintptr_t)b->cpu+b->bytes) return MG_INVALID;
++            if (va < (uint64_t)m->address+m->backing.bytes+4096 &&
++                (uint64_t)m->address < va+b->bytes+4096) {
++                va = (uint64_t)m->address+m->backing.bytes+4096;
++                moved = true; break;
++            }
++        }
++        if (!moved) break;
++    }
++    struct mg_render_mapping *m = &r->mappings[slot];
++    m->backing = *b; m->address = (uint32_t)va;
++    unsigned access = MG_VM_READ | (b->access & MG_GPU_WRITE ? MG_VM_WRITE : 0) |
++        (b->access & MG_GPU_EXEC ? MG_VM_EXEC : 0);
++    int error = mg_vm_map(r->vm,m->address,b->pages,b->page_count,access);
++    if (error && !r->vm->quarantined) { *m = (struct mg_render_mapping){0}; return error; }
++    r->allocated += b->bytes;
++    *address = m->address;
++    if (error) return poison(r,error); /* nonzero address transfers backing retention */
++    return MG_OK;
++}
++static int unmap(void *p, uint64_t address, size_t bytes)
++{
++    struct mg_render *r = p;
++    if (!running(r)) return MG_UNBACKED;
++    if (r->active) return MG_BUSY;
++    for (unsigned i = 0; i < MG_RENDER_BUFFERS; i++) {
++        struct mg_render_mapping *m = &r->mappings[i];
++        if (m->address != address || m->backing.bytes != bytes) continue;
++        int error = mg_vm_unmap(r->vm,m->address,m->backing.page_count);
++        if (error) return r->vm->quarantined ? poison(r,error) : error;
++        r->allocated -= bytes; *m = (struct mg_render_mapping){0};
++        return MG_OK;
++    }
++    return MG_UNBACKED;
++}
++bool mg_render_mapped(const struct mg_render *r, const void *cpu, uint64_t gpu,
++    size_t bytes, unsigned access)
++{
++    if (!r || !cpu || !bytes || !access || (access & ~7u) ||
++        r->quarantined || r->vm->quarantined || gpu > UINT32_MAX) return false;
++    for (unsigned i = 0; i < MG_RENDER_BUFFERS; i++) {
++        const struct mg_render_mapping *m = &r->mappings[i];
++        if (!m->address || gpu < m->address || gpu-m->address >= m->backing.bytes ||
++            (uintptr_t)cpu < (uintptr_t)m->backing.cpu) continue;
++        uint64_t offset = gpu-m->address;
++        if ((uintptr_t)cpu-(uintptr_t)m->backing.cpu != offset ||
++            bytes > m->backing.bytes-offset || (access & ~m->backing.access)) continue;
++        unsigned first = (unsigned)(offset/4096), pages = (unsigned)(((offset & 4095)+bytes+4095)/4096);
++        unsigned permissions = MG_VM_READ | (access & MG_GPU_WRITE ? MG_VM_WRITE : 0) |
++            (access & MG_GPU_EXEC ? MG_VM_EXEC : 0);
++        return mg_vm_contains(r->vm,(uint32_t)gpu & ~4095u,m->backing.pages+first,pages,permissions);
++    }
++    return false;
++}
++static int submit(void *p, struct mg_gen8_job *job, uint64_t *fence)
++{
++    struct mg_render *r = p;
++    if (!fence) return MG_INVALID;
++    *fence = 0;
++    if (!running(r) || !r->backend->registered) return MG_UNBACKED;
++    if (r->active) return MG_BUSY;
++    for (unsigned i = 0; job && i < job->buffer_count && i < MG_GEN8_MAX_BUFFERS; i++) {
++        const struct mg_gen8_buffer *b = &job->buffers[i];
++        if (!mg_render_mapped(r,b->cpu,b->gpu,b->bytes,b->access)) return MG_UNBACKED;
++    }
++    int error = mg_gen8_submit(r->backend,job,fence);
++    if (*fence) { r->active = job; r->fence = *fence; }
++    if (r->backend->quarantined) return poison(r,error ? error : MG_IO);
++    return error;
++}
++static int wait(void *p, uint64_t fence, unsigned us)
++{
++    struct mg_render *r = p;
++    if (!running(r)) return MG_UNBACKED;
++    if (!fence || fence > r->backend->queue.issued) return MG_INVALID;
++    int error = mg_gen8_wait(r->backend,fence,us);
++    if (!error && r->active && fence >= r->fence) r->active = NULL;
++    if (r->backend->quarantined) return poison(r,error ? error : MG_IO);
++    return error;
++}
++static bool parameter(void *p, uint32_t key, uint64_t *value)
++{
++    struct mg_render *r = p;
++    if (!value || !ready(r)) return false;
++    switch (key) {
++    case 1: case 6: case 8: case 9: case 10: case 17: *value = 0; break;
++    case 2: *value = 0x260000; break;
++    case 3: *value = MG_CHIP_ID; break;
++    case 4: *value = r->frequency; break;
++    case 7: *value = 1; break;
++    case 16: *value = 16; break;
++    default: return false;
++    }
++    return true;
++}
++int mg_render_init(struct mg_render *r, struct mg_vm *vm, struct mg_gen8_backend *backend,
++    void *context, bool (*proof)(void *), uint32_t frequency)
++{
++    if (!r || !vm || !backend || !proof || !frequency ||
++        !vm->domain.attached || vm->domain.stream != 0 || vm->quarantined) return MG_INVALID;
++    if (r->initialized) return MG_BUSY;
++    r->vm = vm; r->backend = backend; r->context = context;
++    r->running = proof; r->frequency = frequency;
++    r->ops = (struct mg_gem_ops){r,ready,map,unmap,submit,wait,parameter};
++    r->initialized = true;
++    return MG_OK;
++}
++static uint32_t packet7(unsigned opcode, unsigned count)
++{
++    unsigned cp = 1, op = 1;
++    for (unsigned n = count; n; n >>= 1) cp ^= n & 1;
++    for (unsigned n = opcode; n; n >>= 1) op ^= n & 1;
++    return 0x70000000u | count | (cp << 15) | (opcode << 16) | (op << 23);
++}
++int mg_render_selftest(struct mg_render *r, uint32_t *commands, uint32_t *output)
++{
++    if (!r || !running(r) || r->verified || r->active || !commands || !output) return MG_INVALID;
++    const struct mg_render_mapping *cmd = NULL, *out = NULL;
++    for (unsigned i = 0; i < MG_RENDER_BUFFERS; i++) {
++        const struct mg_render_mapping *m = &r->mappings[i];
++        if (m->address && m->backing.cpu == commands) cmd = m;
++        if (m->address && m->backing.cpu == output) out = m;
++    }
++    if (!cmd || !out || cmd == out || cmd->backing.bytes < 4096 || out->backing.bytes < 4096 ||
++        !mg_render_mapped(r,commands,cmd->address,32,MG_GPU_READ | MG_GPU_EXEC) ||
++        !mg_render_mapped(r,output,out->address,16,MG_GPU_READ | MG_GPU_WRITE)) return MG_UNBACKED;
++    const uint32_t colors[] = {0xff0000ff,0xff00ff00,0xffff0000,0xffffffff};
++    memset(output,0,16);
++    commands[0] = packet7(0x3d,6); /* CP_MEM_WRITE: 64-bit address + four pixels */
++    commands[1] = out->address; commands[2] = 0;
++    memcpy(commands+3,colors,sizeof(colors));
++    commands[7] = packet7(0x26,0); /* CP_WAIT_FOR_IDLE */
++    struct mg_gen8_job *job = &r->selftest_job;
++    *job = (struct mg_gen8_job){.buffer_count = 2, .ib_count = 1};
++    job->buffers[0] = (struct mg_gen8_buffer){commands,cmd->address,cmd->backing.bytes,MG_GPU_READ | MG_GPU_EXEC};
++    job->buffers[1] = (struct mg_gen8_buffer){output,out->address,out->backing.bytes,MG_GPU_READ | MG_GPU_WRITE};
++    job->ibs[0] = (struct mg_gen8_ib){0,0,32};
++    uint64_t fence = 0;
++    int error = submit(r,job,&fence); if (error) return error;
++    error = wait(r,fence,MG_QUEUE_MAX_WAIT_US); if (error) return error;
++    if (memcmp(output,colors,sizeof(colors))) return poison(r,MG_IO);
++    r->verified = true;
++    return MG_OK;
++}
+--- /dev/null
++++ b/bsd/dev/metroid_gpu_render.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef METROID_GPU_RENDER_H
++#define METROID_GPU_RENDER_H
++#include "metroid_gpu_gem.h"
++#include "metroid_gpu_vm.h"
++#define MG_RENDER_BUFFERS 512u
++#define MG_RENDER_BYTES (96u * 1024u * 1024u)
++struct mg_render_mapping {
++    struct mg_gem_backing backing;
++    uint32_t address;
++};
++struct mg_render {
++    struct mg_vm *vm;
++    struct mg_gen8_backend *backend;
++    struct mg_gem_ops ops;
++    struct mg_render_mapping mappings[MG_RENDER_BUFFERS];
++    void *context;
++    bool (*running)(void *); /* real scheduler/GX/SQE/AQE/ZAP owner */
++    struct mg_gen8_job selftest_job;
++    struct mg_gen8_job *active;
++    uint64_t fence;
++    size_t allocated;
++    uint32_t frequency;
++    bool initialized, verified, quarantined;
++};
++int mg_render_init(struct mg_render *, struct mg_vm *, struct mg_gen8_backend *,
++    void *, bool (*running)(void *), uint32_t frequency);
++/* These callbacks validate pinned buffers when binding the Gen8 engine.
++ * CPU/GPU offset identity, lifetime and requested permissions must all agree. */
++bool mg_render_mapped(const struct mg_render *, const void *, uint64_t, size_t, unsigned);
++/* cmd/output are separate, already mapped 4K kernel-private allocations.
++ * Neither can be mapped to userspace. Completion, CPU visibility and all four
++ * expected GPU writes must agree before ops.ready can become true. */
++int mg_render_selftest(struct mg_render *, uint32_t *commands, uint32_t *output);
++#endif
+--- /dev/null
 +++ b/bsd/dev/metroid_gpu_rpmh.h
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,266 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Included ONLY at the end of metroid_touch_power.h by overlay 0033.
 + * Reuses its sole apps-DRV2 owner, lock, geometry and timeout quarantine.
@@ -1867,7 +3664,7 @@
 +static bool mg_fabric_held;
 +
 +static int
-+mg_arc_max(const char *name, uint32_t *address, uint32_t *level)
++mg_arc_details(const char *name, uint32_t *address, uint32_t *level, uint32_t *voltage)
 +{
 +    uint32_t key[2] = {0, 0};
 +    for (unsigned i = 0; i < 8 && name[i]; i++)
@@ -1907,6 +3704,7 @@
 +             */
 +            if (last < 256) return ENODEV;
 +            *address = a; *level = last_index;
++            if (voltage) *voltage = last;
 +            if (++matches != 1) return EINVAL;
 +            printf("METROID GPU POWER: %s addr=%#x corner=%u index=%u retained until reboot\n",
 +                name, a, last, last_index);
@@ -1914,6 +3712,8 @@
 +    }
 +    return matches == 1 ? 0 : ENODEV;
 +}
++static int mg_arc_max(const char *name, uint32_t *address, uint32_t *level)
++{ return mg_arc_details(name,address,level,NULL); }
 +
 +static int
 +mg_votes_send(const uint32_t *address, const uint32_t *level, unsigned count)
@@ -2073,28 +3873,381 @@
 +    __atomic_store_n(&rh_lock,0,__ATOMIC_RELEASE);
 +    return ready;
 +}
++
++/* Fixed low-frequency bring-up OPP, at the highest declared ARC corners.
++ * GMU gets its own votes; the CPU fabric owner stays retained independently.
++ * No inferred DDR unit conversion, ACV policy, bin-dependent frequency or
++ * voltage enum: all ARC indexes/levels and BCM addresses come from command DB.
++ */
++int metroid_gpu_rpmh_scheduler_tables(uint32_t *perf, uint32_t *bw)
++{
++    if (!perf || !bw) return EINVAL;
++    if (__atomic_exchange_n(&rh_lock,1,__ATOMIC_ACQUIRE)) return EBUSY;
++    int error = EIO;
++    uint32_t address[4], index[4], voltage[4];
++    if (rh_poisoned || !mg_fabric_held) goto out;
++    const char *names[] = {"gfx.lvl","mx.lvl","cx.lvl","gmxc.lvl"};
++    for (unsigned i = 0; i < 4; i++) {
++        error = mg_arc_details(names[i],&address[i],&index[i],&voltage[i]);
++        if (i == 3 && error == ENODEV) { index[3] = index[1]; voltage[3] = voltage[1]; error = 0; }
++        if (error) goto out;
++    }
++    /* hfi_table_cmd version0/typeGPU_PERF, two GX OPPs and two CX OPPs. */
++    uint32_t p[] = {15,0,1,2,3,0,UINT32_MAX,0,
++        (voltage[0] << 16) | (index[3] << 8) | index[0],
++        0xffffc0ffu | (index[1] << 8),264000,
++        2,2,0,0,(voltage[2] << 16) | (index[1] << 8) | index[2],500000};
++    for (unsigned i = 0; i < sizeof(p)/sizeof(p[0]); i++) perf[i] = p[i];
++    for (unsigned i = 0; i < 160; i++) bw[i] = 0;
++    bw[0] = 3; bw[1] = 2; bw[2] = 1; bw[3] = 3; bw[4] = 1; bw[5] = 7;
++    error = mg_bcm_address("CN0",&bw[6]); if (error) goto out;
++    const char *bcm[] = {"MC0","SH0","SH1"};
++    for (unsigned i = 0; i < 3; i++) {
++        error = mg_bcm_address(bcm[i],&bw[24+i]); if (error) goto out;
++        for (unsigned j = 0; j < i; j++) if (bw[24+i] == bw[24+j]) { error = EINVAL; goto out; }
++        if (bw[24+i] == bw[6]) { error = EINVAL; goto out; }
++        bw[32+i] = 0x40000000; /* off: committed zero vote */
++        bw[40+i] = i < 2 ? 0x6fffffff : 0x60000001;
++    }
++    bw[12] = 0x40000000; bw[18] = 0x60000001;
++out:
++    __atomic_store_n(&rh_lock,0,__ATOMIC_RELEASE);
++    return error;
++}
++#endif
+--- /dev/null
++++ b/bsd/dev/metroid_gpu_scheduler.c
+@@ -0,0 +1,258 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ * Nothing 031e8669 adreno_gen8_hwsched_hfi.c's cold, polling control path.
++ * No warmboot, IFPC, preemption, LPAC, HW fences or interrupt ownership.
++ */
++#include "metroid_gpu_scheduler.h"
++#ifdef MG_HOST_TEST
++#include <string.h>
++#else
++#include <libkern/libkern.h>
++#endif
++#define TIMEOUT_US 1000000u
++#define POLL_US 10u
++#define MEM_ALLOC 20u
++#define COUNTER 110u
++#define ERR 100u
++#define MSG_DEBUG 101u
++#define GFX_ACCESS 1u
++#define GMU_ACCESS 8u
++#define SECURE (1u << 12)
++
++static int poison(struct mg_scheduler *s, int error)
++{ if (!s->error) s->error = error; s->quarantined = true; return error; }
++static int health(struct mg_scheduler *s)
++{
++    if (s->quarantined) return MG_IO;
++    if (!s->io.ready(s->io.context)) return poison(s,MG_UNBACKED);
++    const uint32_t registers[] = {0x1f980,0x1f81c,0x1f992,0x23b05};
++    for (unsigned i = 0; i < 4; i++) {
++        uint32_t value = s->io.read(s->io.context,registers[i]);
++        if (value == UINT32_MAX || (i == 0 && !(value & 1)) ||
++            (i == 1 && (value & 0x1ff) != 0x100) ||
++            (i == 2 && (value & (1u << 15))) ||
++            (i == 3 && (value & 0x29))) {
++            s->fault_register = registers[i]; s->fault_value = value;
++            return poison(s,MG_IO);
++        }
++    }
++    return MG_OK;
++}
++static int send(struct mg_scheduler *s, uint32_t *packet, unsigned count,
++    unsigned id, unsigned type)
++{
++    if (!count || count > MG_SCHED_PACKET_WORDS || s->sequence == 4095) return MG_LIMIT;
++    int error = health(s); if (error) return error;
++    error = mg_hfi_message(id,type,++s->sequence,count,packet);
++    if (error) return error;
++    s->exposed = true;
++    error = mg_hfi_write(&s->command,packet,count);
++    if (error) return poison(s,error);
++    s->io.write(s->io.context,0x1f994,1); /* control queue doorbell */
++    return MG_OK;
++}
++static void encode(uint32_t *out, const struct mg_sched_allocation *a)
++{
++    out[0] = (uint32_t)a->gpu; out[1] = (uint32_t)(a->gpu >> 32);
++    out[2] = a->flags; out[3] = a->kind; out[4] = a->host_handle;
++    out[5] = a->firmware_handle; out[6] = a->gmu;
++    out[7] = a->bytes; out[8] = a->align;
++}
++static int allocation_reply(struct mg_scheduler *s, const uint32_t *in, unsigned words)
++{
++    if ((words != 10 && words != 11) || in[1] > 1 ||
++        (in[1] == 1 && words != 11) || (in[1] == 0 && words != 10)) return MG_INVALID;
++    struct mg_sched_allocation a = {
++        .gpu = in[2] | ((uint64_t)in[3] << 32), .flags = in[4],
++        .kind = in[5], .host_handle = in[6], .firmware_handle = in[7],
++        .gmu = in[8], .bytes = in[9], .align = words == 11 ? in[10] : 0,
++    };
++    s->last_kind = a.kind; s->last_flags = a.flags;
++    s->last_bytes = a.bytes; s->last_align = a.align;
++    /* Reject secure and fixed MMIO kinds rather than answering with RAM. */
++    if (!a.bytes || a.bytes > 64u * 1024u * 1024u || a.kind >= 27 ||
++        a.kind == 5 || a.kind == 11 || a.kind == 12 || a.kind == 13 ||
++        a.kind == 19 || a.kind == 20 || a.kind == 23 || a.kind == 26 ||
++        (a.flags & SECURE) || (a.flags & ~0x3ffu) || a.gpu || a.gmu || a.host_handle ||
++        !(a.flags & (GFX_ACCESS | GMU_ACCESS)) ||
++        (a.align & 0xffff0000u) || (a.align & 255) > 26 || ((a.align >> 8) & 255) > 26)
++        return MG_UNSUPPORTED;
++    struct mg_sched_allocation request = a;
++    struct mg_sched_allocation *existing = NULL;
++    for (unsigned i = 0; i < s->allocation_count; i++)
++        if (s->allocations[i].kind == a.kind && s->allocations[i].firmware_handle == a.firmware_handle)
++            existing = &s->allocations[i];
++    if (existing) {
++        if (existing->flags != a.flags || existing->bytes < a.bytes || existing->align != a.align)
++            return MG_STALE;
++        a = *existing;
++    } else {
++        if (s->allocation_count == MG_SCHED_ALLOCATIONS) return MG_LIMIT;
++        int error = s->io.allocate(s->io.context,&a); if (error) return error;
++        unsigned va_shift = request.align & 255, size_shift = (request.align >> 8) & 255;
++        uint64_t va_align = 1ull << (va_shift < 12 ? 12 : va_shift);
++        uint64_t size_align = 1ull << (size_shift < 12 ? 12 : size_shift);
++        if (a.flags != request.flags || a.kind != request.kind || a.align != request.align ||
++            a.firmware_handle != request.firmware_handle || a.bytes < request.bytes ||
++            a.bytes > 64u*1024u*1024u || (a.bytes & (size_align-1)) ||
++            ((request.flags & GFX_ACCESS) && (!a.gpu || (a.gpu & 4095) ||
++                a.gpu >= (1ull << 49) || a.bytes > (1ull << 49)-a.gpu)) ||
++            ((request.flags & GMU_ACCESS) && (!a.gmu || (a.gmu & (va_align-1)) ||
++                ((request.flags & 128) ? (a.gmu < 0x4000 ||
++                    (uint64_t)a.gmu+a.bytes > 0x1000000) :
++                    (a.gmu < 0x60000000 || (uint64_t)a.gmu+a.bytes > 0x80000000)))) )
++            return MG_UNBACKED;
++        for (unsigned i = 0; i < s->allocation_count; i++) {
++            const struct mg_sched_allocation *old = &s->allocations[i];
++            if ((a.gpu && old->gpu && a.gpu < old->gpu+old->bytes && old->gpu < a.gpu+a.bytes) ||
++                (a.gmu && old->gmu && (uint64_t)a.gmu < (uint64_t)old->gmu+old->bytes &&
++                    (uint64_t)old->gmu < (uint64_t)a.gmu+a.bytes)) return MG_UNBACKED;
++        }
++        a.host_handle = a.firmware_handle;
++        s->allocations[s->allocation_count++] = a;
++    }
++    uint32_t reply[11] = {0,in[0]}; encode(reply+2,&a);
++    return send(s,reply,11,MEM_ALLOC,1);
++}
++static int counter_reply(struct mg_scheduler *s, const uint32_t *in, unsigned count)
++{
++    if (count != 3) return MG_INVALID;
++    /* Per upstream, zero addresses explicitly decline an optional counter. */
++    uint32_t out[] = {0,in[0],in[1],in[2],0,0};
++    return send(s,out,6,COUNTER,1);
++}
++static int exchange(struct mg_scheduler *s, uint32_t *out, unsigned count, unsigned id,
++    bool requests)
++{
++    int error = send(s,out,count,id,0); if (error) return error;
++    uint32_t waiting = s->waiting = out[0];
++    bool acknowledged = false;
++    unsigned messages = 0;
++    for (unsigned us = 0; us < TIMEOUT_US; us += POLL_US) {
++        error = health(s); if (error) return error;
++        /* Drain debug faults before accepting an ACK. Bounded flood handling
++         * quarantines instead of hiding a fault behind an endless backlog. */
++        for (unsigned queue = 0; queue < 2; queue++) {
++            struct mg_hfi_queue *q = queue == 0 ? &s->debug : &s->message;
++            for (unsigned budget = 0; budget < 32; budget++) {
++                uint32_t in[MG_SCHED_PACKET_WORDS];
++                int words = mg_hfi_read(q,in,MG_SCHED_PACKET_WORDS);
++                if (words == MG_EMPTY) break;
++                if (words < 0) return poison(s,words);
++                s->last_header = in[0];
++                if (++messages > 4096) return poison(s,MG_LIMIT);
++                unsigned message_id = in[0] & 255, type = (in[0] >> 16) & 15;
++                if (message_id == ERR || message_id == 150) return poison(s,MG_IO);
++                if (queue == 0) {
++                    if (message_id != MSG_DEBUG || type != 0) return poison(s,MG_INVALID);
++                    continue;
++                }
++                if (type == 1) {
++                    uint32_t result;
++                    if (acknowledged) return poison(s,MG_STALE);
++                    error = mg_hfi_ack(in,(size_t)words,waiting,&result);
++                    if (error) return poison(s,error);
++                    if (result == UINT32_MAX) return poison(s,MG_IO);
++                    acknowledged = true;
++                } else if (!acknowledged && requests && type == 0 && message_id == MEM_ALLOC) {
++                    error = allocation_reply(s,in,(unsigned)words);
++                    if (error) return poison(s,error);
++                } else if (!acknowledged && requests && type == 0 && message_id == COUNTER) {
++                    error = counter_reply(s,in,(unsigned)words);
++                    if (error) return poison(s,error);
++                } else return poison(s,MG_INVALID);
++            }
++            if (q->header->read != q->header->write) return poison(s,MG_LIMIT);
++        }
++        if (acknowledged) {
++            error = health(s); if (error) return error;
++            /* ACK must also correspond to consumed control/reply packets. */
++            if (s->command.header->read == s->command.header->write) {
++                s->waiting = 0;
++                s->io.write(s->io.context,0x1f991,1);
++                return MG_OK;
++            }
++        }
++        s->io.delay(s->io.context,POLL_US);
++    }
++    return poison(s,MG_TIMEOUT);
++}
++int mg_scheduler_vote(struct mg_scheduler *s, unsigned gpu, unsigned bandwidth)
++{
++    if (!s || !s->booting_gpu || s->stage != MG_SCHED_STARTED || gpu != 1 || bandwidth != 1)
++        return MG_INVALID;
++    uint32_t packet[] = {0,1,gpu,bandwidth};
++    return exchange(s,packet,4,30,false);
++}
++int mg_scheduler_raw(struct mg_scheduler *s, const uint32_t *pm4, unsigned words)
++{
++    if (!s || !s->booting_gpu || s->stage != MG_SCHED_STARTED || !pm4 ||
++        !words || words >= MG_SCHED_PACKET_WORDS) return MG_INVALID;
++    uint32_t packet[MG_SCHED_PACKET_WORDS]; packet[0] = 0;
++    memcpy(packet+1,pm4,words * sizeof(*pm4));
++    return exchange(s,packet,words+1,131,false);
++}
++int mg_scheduler_boot(struct mg_scheduler *s, const struct mg_sched_io *io,
++    const struct mg_sched_config *c)
++{
++    if (!s || !io || !c || !io->ready || !io->read || !io->write || !io->delay ||
++        !io->allocate || !io->boot_gpu || !c->hfi || c->hfi_bytes < MG_HFI_BYTES ||
++        c->version != 0x20070001u || !c->performance.data || !c->bandwidth.data ||
++        c->performance.words < 7 || c->performance.words > MG_SCHED_PACKET_WORDS ||
++        c->bandwidth.words != 160 ||
++        (c->performance.data[0] & 255) != 15 || c->performance.data[1] != 0 ||
++        c->performance.data[2] != 1 || (c->bandwidth.data[0] & 255) != 3)
++        return MG_INVALID;
++    /* hfi_table_entry stride is DWORDS, not bytes. The BW ABI is a fixed
++     * 160-word struct with six CNOC and eight DDR address slots. */
++    const uint32_t *perf = c->performance.data, *bw = c->bandwidth.data;
++    if (!perf[3] || perf[3] > 32 || perf[4] != 3) return MG_INVALID;
++    unsigned cx = 5 + perf[3]*3;
++    if (cx + 2 > c->performance.words || !perf[cx] || perf[cx] > 4 ||
++        perf[cx+1] != 2 || cx+2+perf[cx]*2 != c->performance.words ||
++        !bw[1] || bw[1] > 16 || !bw[2] || bw[2] > 6 || !bw[3] || bw[3] > 8 ||
++        (bw[4] >> bw[2]) || (bw[5] >> bw[3])) return MG_INVALID;
++    for (unsigned group = 0; group < 2; group++) {
++        unsigned count = bw[group+2], base = group ? 24 : 6;
++        for (unsigned i = 0; i < count; i++) {
++            if ((bw[base+i] >> 16) != 5 || (bw[base+i] & 3)) return MG_INVALID;
++            for (unsigned j = 0; j < i; j++) if (bw[base+i] == bw[base+j]) return MG_INVALID;
++        }
++    }
++    if (s->attempted) return MG_BUSY;
++    s->attempted = true; s->io = *io;
++    if (!io->ready(io->context)) return poison(s,MG_UNBACKED);
++    struct mg_hfi_queue *queues[] = {&s->command,&s->message,&s->debug};
++    for (unsigned i = 0; i < 3; i++) {
++        int error = mg_hfi_bind(c->hfi,c->hfi_bytes,c->hfi_address,i,queues[i]);
++        if (error) return poison(s,error);
++        if (queues[i]->header->read != queues[i]->header->write) return poison(s,MG_STALE);
++    }
++    s->stage = MG_SCHED_BOUND;
++    uint32_t packet[MG_SCHED_PACKET_WORDS];
++    memcpy(packet,c->performance.data,c->performance.words*4u);
++    int error = exchange(s,packet,c->performance.words,15,false); if (error) return error;
++    memcpy(packet,c->bandwidth.data,c->bandwidth.words*4u);
++    error = exchange(s,packet,c->bandwidth.words,3,false); if (error) return error;
++    s->stage = MG_SCHED_TABLES;
++    /* Minimal retained-power mode: hardware scheduler/AQE on, optional power
++     * transitions, preemption, LPAC and hardware fences explicitly off. */
++    const unsigned features[][2] = {{9,0},{12,0},{2,0},{24,0},{25,0},{1,1},{29,1}};
++    for (unsigned i = 0; i < sizeof(features)/sizeof(features[0]); i++) {
++        uint32_t feature[] = {0,features[i][0],features[i][1],0};
++        error = exchange(s,feature,4,11,false); if (error) return error;
++    }
++    s->stage = MG_SCHED_FEATURES;
++    uint32_t core[] = {0,0};
++    error = exchange(s,core,2,14,false); if (error) return error;
++    s->stage = MG_SCHED_CORE;
++    uint32_t start[] = {0};
++    error = exchange(s,start,1,10,true); if (error) return error;
++    s->stage = MG_SCHED_STARTED;
++    s->booting_gpu = true;
++    error = io->boot_gpu(io->context);
++    s->booting_gpu = false;
++    if (error) return poison(s,error);
++    error = health(s); if (error) return error;
++    s->stage = MG_SCHED_GPU;
++    return MG_OK;
++}
+--- /dev/null
++++ b/bsd/dev/metroid_gpu_scheduler.h
+@@ -0,0 +1,53 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef METROID_GPU_SCHEDULER_H
++#define METROID_GPU_SCHEDULER_H
++#include "metroid_gpu.h"
++#define MG_SCHED_ALLOCATIONS 64u
++#define MG_SCHED_PACKET_WORDS 255u
++/* Packed wire data is copied explicitly as words; never dereference unaligned
++ * uint64_t fields in a firmware packet. All sizes are bytes. */
++struct mg_sched_allocation {
++    uint64_t gpu;
++    uint32_t flags, kind, host_handle, firmware_handle, gmu, bytes, align;
++};
++struct mg_sched_io {
++    void *context;
++    bool (*ready)(void *); /* live HFI controller, clocks, owned stream0/5 */
++    uint32_t (*read)(void *, uint32_t);
++    void (*write)(void *, uint32_t, uint32_t);
++    void (*delay)(void *, unsigned);
++    /* Backing and both mappings must be pinned/coherent before success.
++     * No invented addresses or unsupported secure/MMIO allocations. */
++    int (*allocate)(void *, struct mg_sched_allocation *);
++    /* Concrete GPU owner: OOB GX vote, register setup, SQE/AQE bases,
++     * CP_ME_INIT via mg_scheduler_raw, ZAP authentication and secure exit.
++     * On failure every potentially exposed resource is retained. */
++    int (*boot_gpu)(void *);
++};
++struct mg_sched_packet { const uint32_t *data; unsigned words; };
++struct mg_sched_config {
++    void *hfi; size_t hfi_bytes; uint32_t hfi_address, version;
++    /* Exact source-built performance/bandwidth table packets including header
++     * slot. They are validated before any request is sent. */
++    struct mg_sched_packet performance, bandwidth;
++};
++enum mg_sched_stage { MG_SCHED_OFF, MG_SCHED_BOUND, MG_SCHED_TABLES,
++    MG_SCHED_FEATURES, MG_SCHED_CORE, MG_SCHED_STARTED, MG_SCHED_GPU };
++struct mg_scheduler {
++    struct mg_sched_io io;
++    struct mg_hfi_queue command, message, debug;
++    struct mg_sched_allocation allocations[MG_SCHED_ALLOCATIONS];
++    unsigned allocation_count;
++    uint32_t sequence, waiting, last_header, fault_register, fault_value;
++    uint32_t last_kind, last_flags, last_bytes, last_align;
++    enum mg_sched_stage stage;
++    int error;
++    bool attempted, exposed, quarantined, booting_gpu;
++};
++int mg_scheduler_boot(struct mg_scheduler *, const struct mg_sched_io *,
++    const struct mg_sched_config *);
++/* Only callable by the serialized GPU-boot owner while boot_gpu executes.
++ * Commands are trusted kernel PM4, not a user submission path. */
++int mg_scheduler_raw(struct mg_scheduler *, const uint32_t *, unsigned words);
++int mg_scheduler_vote(struct mg_scheduler *, unsigned gpu_index, unsigned bandwidth_index);
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_scm.c
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,63 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * SCM SMC64 transport for one-argument GPU/availability calls.
 + * ABI: Nothing 031e8669eb19 drivers/firmware/qcom_scm{-smc.c,.c,.h}.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <kern/locks.h>
-+#include "metroid_gpu_start.h"
++#include "metroid_gpu_zap.h"
 +static LCK_GRP_DECLARE(mg_scm_group, "metroid-gpu-scm");
 +static LCK_MTX_DECLARE(mg_scm_lock, &mg_scm_group);
 +static bool mg_scm_poisoned;
 +
-+struct mg_scm_result mg_scm_native(void *unused, uint32_t fn, uint32_t info, uint64_t arg)
++static struct mg_scm_result invoke(uint32_t fn, uint32_t info, uint64_t arg, uint64_t b, uint64_t c)
 +{
-+    (void)unused;
-+    /* Do not expose an arbitrary secure-monitor gateway. */
-+    if (info != 1 || !((fn == 0x42000601 && arg == 0x02002801) ||
-+        (fn == 0x42002801 && arg == 0xb)))
-+        return (struct mg_scm_result){.status = -1};
 +    lck_mtx_lock(&mg_scm_lock);
 +    if (mg_scm_poisoned) {
 +        lck_mtx_unlock(&mg_scm_lock);
@@ -2106,8 +4259,8 @@
 +        register uint64_t x0 __asm__("x0") = command;
 +        register uint64_t x1 __asm__("x1") = info;
 +        register uint64_t x2 __asm__("x2") = arg;
-+        register uint64_t x3 __asm__("x3") = 0;
-+        register uint64_t x4 __asm__("x4") = 0;
++        register uint64_t x3 __asm__("x3") = b;
++        register uint64_t x4 __asm__("x4") = c;
 +        register uint64_t x5 __asm__("x5") = 0;
 +        register uint64_t x6 __asm__("x6") = quirk;
 +        register uint64_t x7 __asm__("x7") = 0;
@@ -2120,14 +4273,34 @@
 +    }
 +    /* In particular, an interrupted/WAITQ call may still own secure state.
 +     * Do not permit another GPU request after an uncertain result. */
-+    if (result.status) mg_scm_poisoned = true;
++    if (result.status || ((fn & 0xffffff00u) == 0x42000200u && result.value)) mg_scm_poisoned = true;
 +    lck_mtx_unlock(&mg_scm_lock);
 +    return result;
++}
++struct mg_scm_result mg_scm_native(void *unused, uint32_t fn, uint32_t info, uint64_t arg)
++{
++    (void)unused;
++    if (info != 1 || !((fn == 0x42000601 && arg == 0x02002801) ||
++        (fn == 0x42002801 && arg == 0xb))) return (struct mg_scm_result){.status = -1};
++    return invoke(fn,info,arg,0,0);
++}
++/* PIL commands for GPU PAS13 only. Same serialized transport as CX setup;
++ * no general SMC gateway, no PAS shutdown/reuse after ambiguous failure. */
++struct mg_scm_result mg_scm_pas_native(void *unused, unsigned command, uint64_t pa, uint64_t bytes)
++{
++    (void)unused;
++    if (command == 1 && pa && !(pa & 4095) && pa < (1ull << 48) && !bytes)
++        return invoke(0x42000201,0x82,13,pa,0);
++    if (command == 2 && pa && !(pa & 4095) && bytes && !(bytes & 4095) &&
++        bytes <= 0x100000 && pa < (1ull << 48) && bytes <= (1ull << 48)-pa)
++        return invoke(0x42000202,3,13,pa,bytes);
++    if (command == 5 && !pa && !bytes) return invoke(0x42000205,1,13,0,0);
++    return (struct mg_scm_result){.status = -1};
 +}
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_smmu.c
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,208 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * SMMUv2 stage-1 stream-5 setup. Register ABI: Nothing 031e8669eb19
 + * drivers/iommu/arm/arm-smmu/{arm-smmu.h,arm-smmu.c}, io-pgtable-arm.c.
@@ -2221,15 +4394,15 @@
 +    return MG_TIMEOUT;
 +}
 +
-+int mg_smmu_attach(const struct mg_smmu_io *io, struct mg_smmu_domain *s,
-+    const struct mg_page_tables *t)
++int mg_smmu_attach_stream(const struct mg_smmu_io *io, struct mg_smmu_domain *s,
++    const struct mg_page_tables *t, uint32_t stream)
 +{
-+    if (!s || !io || !io->read || !io->write || !io->write64 ||
++    if ((stream != 0 && stream != 5) || !s || !io || !io->read || !io->write || !io->write64 ||
 +        !io->delay || !io->publish || !t || !t->built || !t->memory ||
 +        !t->used || t->used > MG_PT_MAX_PAGES || t->used * 4096u > t->bytes)
 +        return MG_INVALID;
 +    if (s->attempted) return MG_BUSY;
-+    *s = (struct mg_smmu_domain){.attempted = true};
++    *s = (struct mg_smmu_domain){.attempted = true, .stream = stream};
 +    uint32_t id0 = rd(io, s, 0x20), id1 = rd(io, s, 0x24), id2 = rd(io, s, 0x28);
 +    uint32_t cr0 = rd(io, s, 0);
 +    if (!id0 || id0 == UINT32_MAX || !id1 || id1 == UINT32_MAX || id2 == UINT32_MAX ||
@@ -2258,9 +4431,9 @@
 +        uint32_t m = rd(io, s, 0x800 + i * 4), c = rd(io, s, 0xc00 + i * 4);
 +        if (m == UINT32_MAX || c == UINT32_MAX) return MG_IO;
 +        if (!(m & BIT(31))) { if (free_smr == UINT32_MAX) free_smr = i; continue; }
-+        if (!(((m & 0xffff) ^ 5u) & ~((m >> 16) & 0x7fff))) {
++        if (!(((m & 0xffff) ^ stream) & ~((m >> 16) & 0x7fff))) {
 +            /* A masked match could own other streams. Never narrow it. */
-+            if (m != (BIT(31) | 5) || ((c >> 16) & 3) != 2) return MG_BUSY;
++            if (m != (BIT(31) | stream) || ((c >> 16) & 3) != 2) return MG_BUSY;
 +            s->smr = i; matches++;
 +        }
 +        if (((c >> 16) & 3) == 0) {
@@ -2322,7 +4495,7 @@
 +    SET(b, BIT(12) | BIT(5) | BIT(2) | BIT(1) | 1,
 +        BIT(12) | BIT(7) | BIT(6) | BIT(5) | BIT(2) | BIT(1) | 1);
 +    SET(0xc00 + s->smr * 4, s->cb, (3u << 16) | (3u << 24) | 255);
-+    SET(0x800 + s->smr * 4, BIT(31) | 5, UINT32_MAX);
++    SET(0x800 + s->smr * 4, BIT(31) | stream, UINT32_MAX);
 +    s->attached = true;
 +    return MG_OK;
 +fail:
@@ -2332,6 +4505,10 @@
 +    return ret;
 +#undef SET
 +}
++
++int mg_smmu_attach(const struct mg_smmu_io *io, struct mg_smmu_domain *s,
++    const struct mg_page_tables *t)
++{ return mg_smmu_attach_stream(io, s, t, 5); }
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_start.c
 @@ -0,0 +1,131 @@
@@ -2468,7 +4645,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_start.h
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,107 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_START_H
 +#define METROID_GPU_START_H
@@ -2498,6 +4675,7 @@
 +};
 +struct mg_smmu_domain {
 +    uint32_t page_shift, gr1, cb_base, cb, smr, asid, ips;
++    uint32_t stream;
 +    bool attempted, touched, attached, quarantined;
 +    uint32_t offset, value;
 +};
@@ -2509,6 +4687,9 @@
 +int mg_smmu_tables(struct mg_page_tables *, const struct mg_dma_range *, size_t);
 +int mg_smmu_attach(const struct mg_smmu_io *, struct mg_smmu_domain *,
 +    const struct mg_page_tables *);
++/* Separate stream-0 GPU and stream-5 GMU domains. Never retarget a live route. */
++int mg_smmu_attach_stream(const struct mg_smmu_io *, struct mg_smmu_domain *,
++    const struct mg_page_tables *, uint32_t stream);
 +
 +struct mg_gmu_backing { uint32_t iova, bytes; void *cpu; };
 +struct mg_gmu_loader {
@@ -3085,4 +5266,417 @@
 + */
 +int mg_gen8_context_close(struct mg_gen8_backend *);
 +
++#endif
+--- /dev/null
++++ b/bsd/dev/metroid_gpu_vm.c
+@@ -0,0 +1,221 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include "metroid_gpu_vm.h"
++#ifdef MG_HOST_TEST
++#include <string.h>
++#else
++#include <libkern/libkern.h>
++#endif
++#define ADDR 0x0000fffffffff000ull
++#define BIT(n) (1u << (n))
++
++static bool extent(uint32_t va, unsigned count)
++{
++    return va && !(va & 4095) && count && count <= MG_VM_MAX_PAGES &&
++        (uint64_t)va + (uint64_t)count * MG_VM_PAGE <= (1ull << 32);
++}
++static uint64_t *child(const struct mg_vm *v, uint64_t entry)
++{
++    uint64_t pa = entry & ADDR;
++    if ((entry & 3) != 3 || pa < v->tables.pa ||
++        pa - v->tables.pa >= v->tables.used * (uint64_t)MG_VM_PAGE) return NULL;
++    return (uint64_t *)((uint8_t *)v->tables.memory + pa - v->tables.pa);
++}
++static uint64_t *pte(const struct mg_vm *v, uint32_t va)
++{
++    uint64_t *root = v->tables.memory;
++    uint64_t *middle = child(v,root[va >> 30]);
++    if (!middle) return NULL;
++    uint64_t *leaf = child(v,middle[(va >> 21) & 511]);
++    return leaf ? &leaf[(va >> 12) & 511] : NULL;
++}
++static uint64_t descriptor(uint64_t pa, unsigned access)
++{
++    return pa | 3 | (access & MG_VM_PRIV ? 0 : BIT(6)) |
++        (access & MG_VM_WRITE ? 0 : BIT(7)) | (3u << 8) | BIT(10) | BIT(11) |
++        (access & MG_VM_EXEC ? 0 : (3ull << 53));
++}
++static int poison(struct mg_vm *v, int error)
++{
++    if (!v->error) v->error = error;
++    v->quarantined = true;
++    return error;
++}
++/* Verify that nobody replaced this domain before touching the live tables.
++ * Never infer idleness or DMA drain from a reset/disabled context alone. */
++int mg_vm_validate(struct mg_vm *v)
++{
++    if (!v || !v->initialized || !v->domain.attached || v->quarantined) return MG_UNBACKED;
++    if (!v->powered(v->context)) return poison(v,MG_IO);
++    const struct mg_smmu_io *io = &v->io;
++    const struct mg_smmu_domain *s = &v->domain;
++    uint32_t b = s->cb_base + (s->cb << s->page_shift);
++    uint64_t ttbr = v->tables.pa | ((uint64_t)s->asid << 48);
++    uint32_t ctl = io->read(io->context,b);
++    if (ctl == UINT32_MAX || (ctl & 0x10e7u) != 0x1027u ||
++        io->read(io->context,0x800 + s->smr*4) != (BIT(31) | s->stream) ||
++        io->read(io->context,0xc00 + s->smr*4) != s->cb ||
++        io->read(io->context,b + 0x20) != (uint32_t)ttbr ||
++        io->read(io->context,b + 0x24) != (uint32_t)(ttbr >> 32)) return poison(v,MG_STALE);
++    uint32_t fsr = io->read(io->context,b + 0x58);
++    if (fsr == UINT32_MAX || (fsr & 0xc00001feu)) return poison(v,MG_IO);
++    return MG_OK;
++}
++static int owned(struct mg_vm *v)
++{
++    int error = mg_vm_validate(v);
++    return error ? error : v->idle(v->context) ? MG_OK : MG_BUSY;
++}
++static int invalidate(struct mg_vm *v)
++{
++    const struct mg_smmu_domain *s = &v->domain;
++    const struct mg_smmu_io *io = &v->io;
++    uint32_t b = s->cb_base + (s->cb << s->page_shift);
++    io->publish(io->context,v->tables.memory,v->tables.used * MG_VM_PAGE);
++    io->write(io->context,b + 0x610,s->asid);
++    io->write(io->context,b + 0x7f0,0);
++    for (unsigned n = 0; n < 10000; n++) {
++        uint32_t value = io->read(io->context,b + 0x7f4);
++        if (value == UINT32_MAX) return poison(v,MG_IO);
++        if (!(value & 1)) return MG_OK;
++        io->delay(io->context,10);
++    }
++    return poison(v,MG_TIMEOUT);
++}
++int mg_vm_init(struct mg_vm *v, void *cpu, uint64_t pa, size_t bytes,
++    const struct mg_smmu_io *io, void *context, bool (*powered)(void *), bool (*idle)(void *))
++{
++    if (!v || !cpu || !pa || (((uintptr_t)cpu | pa | bytes) & 4095) ||
++        bytes < MG_VM_PAGE || bytes > MG_PT_MAX_PAGES * MG_VM_PAGE ||
++        bytes > UINTPTR_MAX - (uintptr_t)cpu ||
++        ((uintptr_t)cpu < (uintptr_t)v + sizeof(*v) &&
++         (uintptr_t)v < (uintptr_t)cpu + bytes) ||
++        pa >= (1ull << 48) || bytes > (1ull << 48) - pa || !io ||
++        !io->read || !io->write || !io->write64 || !io->publish || !io->delay ||
++        !powered || !idle) return MG_INVALID;
++    if (v->initialized || v->exposed) return MG_BUSY;
++    memset(cpu,0,bytes);
++    v->tables = (struct mg_page_tables){cpu,pa,bytes,1,true};
++    v->io = *io; v->context = context; v->powered = powered; v->idle = idle;
++    v->initialized = true;
++    return MG_OK;
++}
++int mg_vm_attach(struct mg_vm *v, unsigned stream)
++{
++    if (!v || !v->initialized || (stream != 0 && stream != 5)) return MG_INVALID;
++    if (v->exposed) return MG_BUSY;
++    if (!v->powered(v->context) || !v->idle(v->context)) return MG_UNBACKED;
++    v->exposed = true;
++    int error = mg_smmu_attach_stream(&v->io,&v->domain,&v->tables,stream);
++    return error ? poison(v,error) : MG_OK;
++}
++int mg_vm_adopt(struct mg_vm *v, const struct mg_page_tables *t,
++    const struct mg_smmu_domain *d, const struct mg_smmu_io *io, void *context,
++    bool (*powered)(void *), bool (*idle)(void *))
++{
++    if (!v || !t || !d || !io || !powered || !idle || !io->read || !io->write ||
++        !io->write64 || !io->delay || !io->publish || !t->built || !t->memory ||
++        !t->used || t->used > MG_PT_MAX_PAGES || t->used*4096ull > t->bytes ||
++        t->bytes > MG_PT_MAX_PAGES*4096ull || (((uintptr_t)t->memory | t->pa | t->bytes) & 4095) ||
++        !d->attached || d->quarantined || (d->stream != 0 && d->stream != 5)) return MG_INVALID;
++    if (v->initialized || v->exposed) return MG_BUSY;
++    v->tables = *t; v->domain = *d; v->io = *io;
++    v->context = context; v->powered = powered; v->idle = idle;
++    v->initialized = v->exposed = true;
++    int error = owned(v); if (error) return error;
++    bool visited[MG_PT_MAX_PAGES] = {true};
++    const uint64_t *root = t->memory;
++    /* Existing GMU bootstrap uses only four root slots for a 32-bit space. */
++    for (unsigned a = 0; a < 512; a++) {
++        if (!root[a]) continue;
++        uint64_t *middle = a < 4 ? child(v,root[a]) : NULL;
++        if (!middle) return poison(v,MG_INVALID);
++        unsigned m = (unsigned)(((uint8_t *)middle-(uint8_t *)t->memory)/4096);
++        if (visited[m]) return poison(v,MG_INVALID);
++        visited[m] = true;
++        for (unsigned b = 0; b < 512; b++) {
++            if (!middle[b]) continue;
++            uint64_t *leaf = child(v,middle[b]);
++            if (!leaf) return poison(v,MG_INVALID);
++            unsigned l = (unsigned)(((uint8_t *)leaf-(uint8_t *)t->memory)/4096);
++            if (visited[l]) return poison(v,MG_INVALID);
++            visited[l] = true;
++            for (unsigned c = 0; c < 512; c++) if (leaf[c]) {
++                if ((leaf[c] & 3) != 3) return poison(v,MG_INVALID);
++                v->mapped_pages++;
++            }
++        }
++    }
++    for (unsigned i = 0; i < t->used; i++) if (!visited[i]) return poison(v,MG_INVALID);
++    return MG_OK;
++}
++int mg_vm_map(struct mg_vm *v, uint32_t va, const uint64_t *pages,
++    unsigned count, unsigned access)
++{
++    if (!v || !extent(va,count) || !pages || !(access & MG_VM_READ) ||
++        access & ~(MG_VM_READ | MG_VM_WRITE | MG_VM_EXEC | MG_VM_PRIV)) return MG_INVALID;
++    int error = owned(v); if (error) return error;
++    static const unsigned bits[] = {32,36,40,42,44,48};
++    if (v->domain.ips >= sizeof(bits)/sizeof(bits[0])) return poison(v,MG_INVALID);
++    uint64_t limit = 1ull << bits[v->domain.ips];
++    bool middle_needed[4] = {0}, leaf_needed[2048] = {0};
++    unsigned needed = 0;
++    uint64_t *root = v->tables.memory;
++    for (unsigned i = 0; i < count; i++) {
++        uint32_t address = va + i * MG_VM_PAGE;
++        if (!pages[i] || (pages[i] & 4095) || pages[i] >= limit ||
++            (pages[i] < v->tables.pa + v->tables.bytes && v->tables.pa < pages[i] + MG_VM_PAGE))
++            return MG_INVALID;
++        unsigned a = address >> 30, b = address >> 21;
++        uint64_t *middle = NULL;
++        if (root[a]) {
++            middle = child(v,root[a]);
++            if (!middle) return poison(v,MG_INVALID);
++        } else if (!middle_needed[a]) { middle_needed[a] = true; needed++; }
++        if (middle && middle[b & 511]) {
++            uint64_t *leaf = child(v,middle[b & 511]);
++            if (!leaf) return poison(v,MG_INVALID);
++            if (leaf[(address >> 12) & 511]) return MG_BUSY;
++        } else if (!leaf_needed[b]) { leaf_needed[b] = true; needed++; }
++    }
++    if (needed > v->tables.bytes / MG_VM_PAGE - v->tables.used) return MG_LIMIT;
++    for (unsigned i = 0; i < count; i++) {
++        uint32_t address = va + i * MG_VM_PAGE;
++        unsigned a = address >> 30, b = (address >> 21) & 511;
++        if (!root[a]) root[a] = (v->tables.pa + MG_VM_PAGE * (uint64_t)v->tables.used++) | 3;
++        uint64_t *middle = child(v,root[a]);
++        if (!middle[b]) middle[b] = (v->tables.pa + MG_VM_PAGE * (uint64_t)v->tables.used++) | 3;
++        uint64_t *leaf = child(v,middle[b]);
++        leaf[(address >> 12) & 511] = descriptor(pages[i],access);
++    }
++    v->mapped_pages += count;
++    return invalidate(v);
++}
++int mg_vm_unmap(struct mg_vm *v, uint32_t va, unsigned count)
++{
++    if (!v || !extent(va,count)) return MG_INVALID;
++    int error = owned(v); if (error) return error;
++    for (unsigned i = 0; i < count; i++) {
++        uint64_t *entry = pte(v,va + i * MG_VM_PAGE);
++        if (!entry || !(*entry & 1)) return MG_UNBACKED;
++    }
++    for (unsigned i = 0; i < count; i++) *pte(v,va + i * MG_VM_PAGE) = 0;
++    v->mapped_pages -= count;
++    /* Reusing table pages is intentionally unsupported. Reusing data backing
++     * requires this invalidation to succeed, not just cleared descriptors. */
++    return invalidate(v);
++}
++bool mg_vm_contains(const struct mg_vm *v, uint32_t va, const uint64_t *pages,
++    unsigned count, unsigned access)
++{
++    if (!v || !v->initialized || !v->domain.attached || v->quarantined ||
++        !pages || !extent(va,count) || !(access & MG_VM_READ) ||
++        access & ~(MG_VM_READ | MG_VM_WRITE | MG_VM_EXEC | MG_VM_PRIV)) return false;
++    for (unsigned i = 0; i < count; i++) {
++        uint64_t *entry = pte(v,va + i * MG_VM_PAGE);
++        if (!entry || (*entry & 3) != 3 || (*entry & ADDR) != pages[i] ||
++            ((access & MG_VM_WRITE) && (*entry & BIT(7))) ||
++            ((access & MG_VM_EXEC) && (*entry & (3ull << 53))) ||
++            (((access & MG_VM_PRIV) != 0) != ((*entry & BIT(6)) == 0))) return false;
++    }
++    return true;
++}
+--- /dev/null
++++ b/bsd/dev/metroid_gpu_vm.h
+@@ -0,0 +1,50 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef METROID_GPU_VM_H
++#define METROID_GPU_VM_H
++#include "metroid_gpu_start.h"
++#define MG_VM_PAGE 4096u
++#define MG_VM_READ 1u
++#define MG_VM_WRITE 2u
++#define MG_VM_EXEC 4u
++#define MG_VM_PRIV 8u
++#define MG_VM_MAX_PAGES 16384u
++
++/* Independent 32-bit IOVA spaces, backed by XNU's wired 16K pages split
++ * into 4K translations. Physical pages may be scattered and above 4GB.
++ * One owner serializes all calls. Storage and every mapped physical page
++ * stay pinned until successful unmap/TLB synchronization. There is no
++ * remapping of valid entries and no implicit freeing after faults.
++ */
++struct mg_vm {
++    struct mg_page_tables tables;
++    struct mg_smmu_domain domain;
++    struct mg_smmu_io io;
++    void *context;
++    bool (*powered)(void *); /* prove SMMU access is safe before MMIO */
++    bool (*idle)(void *); /* all jobs fenced, or firmware awaiting new allocation */
++    unsigned mapped_pages;
++    int error;
++    bool initialized, exposed, quarantined;
++};
++int mg_vm_init(struct mg_vm *, void *cpu, uint64_t pa, size_t bytes,
++    const struct mg_smmu_io *, void *, bool (*powered)(void *), bool (*idle)(void *));
++int mg_vm_attach(struct mg_vm *, unsigned stream);
++/* Extend a domain already attached by the cold GMU owner. Never zeros,
++ * reattaches or changes the existing routes, ASID or boot mappings. */
++int mg_vm_adopt(struct mg_vm *, const struct mg_page_tables *,
++    const struct mg_smmu_domain *, const struct mg_smmu_io *, void *,
++    bool (*powered)(void *), bool (*idle)(void *));
++/* Mappings must avoid IOVA zero. pages[] contains page-aligned, pinned host
++ * physical addresses. It is host metadata, never read by the device.
++ * On an error after exposed becomes true, retain backing even if map failed.
++ */
++int mg_vm_map(struct mg_vm *, uint32_t iova, const uint64_t *pages,
++    unsigned count, unsigned access);
++int mg_vm_unmap(struct mg_vm *, uint32_t iova, unsigned count);
++/* Check live ownership/fault state without requiring an idle queue. */
++int mg_vm_validate(struct mg_vm *);
++/* Owner verification, used when validating jobs and memory requests. No MMIO.
++ * Checks the software page tables, not CPU cache visibility or GPU readiness. */
++bool mg_vm_contains(const struct mg_vm *, uint32_t iova, const uint64_t *pages,
++    unsigned count, unsigned access);
++#endif
+--- /dev/null
++++ b/bsd/dev/metroid_gpu_zap.c
+@@ -0,0 +1,108 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ * Qualcomm MDT/PAS sequence, Nothing031e8669 drivers/soc/qcom/mdt_loader.c.
++ * Authenticated metadata is ELF+PHDRs concatenated with the HASH segment,
++ * not the whole padded .mbn. Secure firmware performs signature validation.
++ */
++#include "metroid_gpu_zap.h"
++#ifdef MG_HOST_TEST
++#include <string.h>
++#else
++#include <libkern/libkern.h>
++#endif
++static uint32_t word(const uint8_t *p)
++{ return (uint32_t)p[0] | (uint32_t)p[1]<<8 | (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24; }
++static unsigned half(const uint8_t *p) { return p[0] | (unsigned)p[1]<<8; }
++static bool range(size_t size, uint32_t offset, uint32_t bytes)
++{ return offset <= size && bytes <= size-offset; }
++static bool overlaps(uint64_t a, size_t n, uint64_t b, size_t m)
++{ return a < b+m && b < a+n; }
++int mg_zap_parse(const void *image, size_t bytes, struct mg_zap_plan *plan)
++{
++    if (!image || !plan || bytes < 52 || bytes > MG_FW_MAX_BYTES) return MG_INVALID;
++    const uint8_t *p = image;
++    if (word(p) != 0x464c457f || p[4] != 1 || p[5] != 1 || p[6] != 1 ||
++        half(p+16) != 2 || half(p+18) != 0xa4 || word(p+20) != 1 ||
++        half(p+40) != 52 || half(p+42) != 32 || !half(p+44) || half(p+44) > 16)
++        return MG_UNSUPPORTED;
++    uint32_t phoff = word(p+28), count = half(p+44);
++    if (phoff < 52 || !range(bytes,phoff,count*32)) return MG_INVALID;
++    const uint8_t *first = p+phoff;
++    uint32_t headers = word(first+16);
++    if (word(first) == 1 || word(first+4) || headers < phoff+count*32 ||
++        !range(bytes,0,headers) || headers > MG_ZAP_METADATA) return MG_INVALID;
++    struct mg_zap_plan result = {.minimum = UINT32_MAX, .header_bytes = headers};
++    uint64_t end = 0;
++    for (unsigned i = 0; i < count; i++) {
++        const uint8_t *h = p+phoff+32*i;
++        uint32_t type = word(h), offset = word(h+4), physical = word(h+12),
++            file = word(h+16), memory = word(h+20), flags = word(h+24);
++        if ((flags & 0x07000000u) == 0x02000000u) {
++            if (result.hash_bytes || !file || !range(bytes,offset,file) || file > MG_ZAP_METADATA-headers)
++                return MG_INVALID;
++            result.hash_offset = offset; result.hash_bytes = file;
++        } else if (type == 1 && memory) {
++            if (!(flags & (1u << 27)) || file > memory || !range(bytes,offset,file) ||
++                (uint64_t)physical+memory > UINT32_MAX || result.count == 16) return MG_INVALID;
++            for (unsigned j = 0; j < result.count; j++) {
++                const struct mg_zap_segment *s = &result.segments[j];
++                if (physical < (uint64_t)s->physical+s->memory_bytes &&
++                    s->physical < (uint64_t)physical+memory) return MG_INVALID;
++            }
++            result.segments[result.count++] = (struct mg_zap_segment){offset,physical,file,memory};
++            if (physical < result.minimum) result.minimum = physical;
++            if ((uint64_t)physical+memory > end) end = (uint64_t)physical+memory;
++        }
++    }
++    end = (end+4095) & ~4095ull;
++    if (!result.count || !result.hash_bytes || (result.minimum & 4095) ||
++        end <= result.minimum || end-result.minimum > 0x100000) return MG_INVALID;
++    result.span = (uint32_t)(end-result.minimum); *plan = result;
++    return MG_OK;
++}
++int mg_zap_authenticate(struct mg_zap_status *s, const struct mg_zap_io *io,
++    const void *image, size_t bytes)
++{
++    if (!s || !io || !io->reserved || !io->metadata || !io->publish || !io->pas ||
++        !io->reserved_pa || !io->metadata_pa || (io->reserved_pa & 4095) ||
++        (((uintptr_t)io->metadata | io->metadata_pa) & 4095) || io->metadata_bytes < MG_ZAP_METADATA)
++        return MG_INVALID;
++    if (((uintptr_t)io->reserved & 4095) || !io->reserved_bytes || io->reserved_bytes > 0x100000 ||
++        io->reserved_bytes > UINTPTR_MAX-(uintptr_t)io->reserved ||
++        MG_ZAP_METADATA > UINTPTR_MAX-(uintptr_t)io->metadata ||
++        bytes > UINTPTR_MAX-(uintptr_t)image ||
++        io->reserved_pa >= (1ull << 48) || io->reserved_bytes > (1ull << 48)-io->reserved_pa ||
++        io->metadata_pa >= (1ull << 48) || MG_ZAP_METADATA > (1ull << 48)-io->metadata_pa ||
++        overlaps(io->reserved_pa,io->reserved_bytes,io->metadata_pa,MG_ZAP_METADATA) ||
++        overlaps((uintptr_t)io->metadata,MG_ZAP_METADATA,(uintptr_t)io->reserved,io->reserved_bytes) ||
++        overlaps((uintptr_t)image,bytes,(uintptr_t)io->reserved,io->reserved_bytes) ||
++        overlaps((uintptr_t)image,bytes,(uintptr_t)io->metadata,MG_ZAP_METADATA)) return MG_INVALID;
++    if (s->attempted) return MG_BUSY;
++    struct mg_zap_plan plan;
++    int error = mg_zap_parse(image,bytes,&plan);
++    if (error) return error;
++    if (plan.span > io->reserved_bytes) return MG_UNBACKED;
++    s->attempted = true;
++    const uint8_t *p = image;
++    memcpy(io->metadata,p,plan.header_bytes);
++    memcpy((uint8_t *)io->metadata+plan.header_bytes,p+plan.hash_offset,plan.hash_bytes);
++    io->publish(io->context,io->metadata,plan.header_bytes+plan.hash_bytes);
++    s->stage = 1; s->exposed = true;
++    struct mg_scm_result r = io->pas(io->context,1,io->metadata_pa,0);
++    if (r.status || r.value) { error = MG_IO; goto fail; }
++    s->stage = 2;
++    r = io->pas(io->context,2,io->reserved_pa,plan.span);
++    if (r.status || r.value) { error = MG_IO; goto fail; }
++    s->stage = 3;
++    memset(io->reserved,0,plan.span);
++    for (unsigned i = 0; i < plan.count; i++) {
++        const struct mg_zap_segment *v = &plan.segments[i];
++        memcpy((uint8_t *)io->reserved+v->physical-plan.minimum,p+v->offset,v->file_bytes);
++    }
++    io->publish(io->context,io->reserved,plan.span);
++    s->stage = 4;
++    r = io->pas(io->context,5,0,0);
++    if (r.status || r.value) { error = MG_IO; goto fail; }
++    s->stage = 5;
++    return MG_OK;
++fail: s->error = error; return error;
++}
+--- /dev/null
++++ b/bsd/dev/metroid_gpu_zap.h
+@@ -0,0 +1,22 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef METROID_GPU_ZAP_H
++#define METROID_GPU_ZAP_H
++#include "metroid_gpu_start.h"
++#define MG_ZAP_METADATA 16384u
++struct mg_zap_segment { uint32_t offset, physical, file_bytes, memory_bytes; };
++struct mg_zap_plan {
++    struct mg_zap_segment segments[16];
++    uint32_t count, minimum, span, header_bytes, hash_offset, hash_bytes;
++};
++struct mg_zap_io {
++    void *context, *reserved, *metadata;
++    uint64_t reserved_pa, metadata_pa;
++    size_t reserved_bytes, metadata_bytes;
++    void (*publish)(void *, const void *, size_t);
++    struct mg_scm_result (*pas)(void *, unsigned command, uint64_t, uint64_t);
++};
++struct mg_zap_status { unsigned stage; int error; bool attempted, exposed; };
++int mg_zap_parse(const void *, size_t, struct mg_zap_plan *);
++int mg_zap_authenticate(struct mg_zap_status *, const struct mg_zap_io *, const void *, size_t);
++struct mg_scm_result mg_scm_pas_native(void *, unsigned, uint64_t, uint64_t);
 +#endif
