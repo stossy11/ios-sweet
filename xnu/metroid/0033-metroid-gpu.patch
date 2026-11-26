@@ -2828,7 +2828,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_power.c
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,215 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Cold CX/GMU clock bring-up from Nothing 031e8669eb19 gpucc-tuna.c,
 + * gcc-tuna.c, gdsc.c, clk-alpha-pll.c (Lucid OLE/EVO) and clk-rcg2.c.
@@ -2868,19 +2868,27 @@
 +    return poll(io, s, bus, offset, mask, value);
 +}
 +
++enum clock_completion { CLOCK_HALT, CLOCK_DELAY, CLOCK_ENABLE, CLOCK_HWCG };
 +static int branch(const struct mg_power_io *io, struct mg_power_status *s,
-+    enum mg_bus bus, uint32_t offset, bool skip_halt)
++    enum mg_bus bus, uint32_t offset, enum clock_completion completion)
 +{
 +    uint32_t old = rd(io, s, bus, offset);
 +    if (old == UINT32_MAX) return MG_IO;
 +    s->touched = true;
 +    io->write(io->context, bus, offset, old | BIT(0));
 +    /* GCC DDRSS_GPU_AXI is BRANCH_HALT_SKIP. AHB uses HALT_DELAY. */
-+    if (skip_halt) { io->delay(io->context, 10); return MG_OK; }
++    if (completion == CLOCK_DELAY) { io->delay(io->context, 10); return MG_OK; }
++    /* GEMNOC_GFX has HWCG at bit 1 of this same register. Like Linux,
++     * do not demand a continuously running clock in hardware-gated mode. */
++    if (completion == CLOCK_HWCG && (old & BIT(1))) return MG_OK;
 +    for (unsigned us = 0; us < 1000; us++) {
 +        uint32_t value = rd(io, s, bus, offset);
 +        if (value == UINT32_MAX) return MG_IO;
-+        if (mg_clock_running(value)) return MG_OK;
++        /* GCC GPLL0_CPH uses BRANCH_HALT_ENABLE_VOTED: CLK_OFF is
++         * inverted for that branch. FSM ON remains an alternative. */
++        if (completion == CLOCK_ENABLE ?
++            ((value & BIT(31)) || ((value >> 28) & 7u) == 2u) :
++            mg_clock_running(value)) return MG_OK;
 +        io->delay(io->context, 1);
 +    }
 +    return MG_TIMEOUT;
@@ -3019,17 +3027,17 @@
 +    /* GPLL0 at 600 MHz feeds HUB /3. Verify its source rather than retuning
 +     * a shared PLL used by unrelated peripherals. L=31, alpha=0x4000.
 +     */
-+    TRY(branch(io, s, MG_GCC, 0x71150, false));
++    TRY(branch(io, s, MG_GCC, 0x71150, CLOCK_ENABLE));
 +    TRY(rcg(io, s, 0x93ec, 5, 5)); /* 600 / ((5+1)/2) = 200 */
 +    TRY(rcg(io, s, 0x9318, 2, 1)); /* PLL0 even /1 = 500 */
 +    s->stage = MG_POWER_HUB;
-+    TRY(branch(io, s, MG_GCC, 0x71158, true));
-+    TRY(branch(io, s, MG_GCC, 0x71010, false));
-+    TRY(branch(io, s, MG_CC, 0x93e8, false));
-+    TRY(branch(io, s, MG_CC, 0x90e8, false));
-+    TRY(branch(io, s, MG_CC, 0x90bc, true));
-+    TRY(branch(io, s, MG_CC, 0x90e4, false));
-+    TRY(branch(io, s, MG_CC, 0x90d4, false));
++    TRY(branch(io, s, MG_GCC, 0x71158, CLOCK_DELAY));
++    TRY(branch(io, s, MG_GCC, 0x71010, CLOCK_HWCG));
++    TRY(branch(io, s, MG_CC, 0x93e8, CLOCK_HALT));
++    TRY(branch(io, s, MG_CC, 0x90e8, CLOCK_HALT));
++    TRY(branch(io, s, MG_CC, 0x90bc, CLOCK_DELAY));
++    TRY(branch(io, s, MG_CC, 0x90e4, CLOCK_HALT));
++    TRY(branch(io, s, MG_CC, 0x90d4, CLOCK_HALT));
 +    s->stage = MG_POWER_CLOCKS;
 +    TRY(poll(io, s, MG_CC, 0x9314, BIT(0), 0));
 +    s->stage = MG_POWER_READY;
