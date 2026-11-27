@@ -1136,7 +1136,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_accel.c
-@@ -0,0 +1,363 @@
+@@ -0,0 +1,365 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_accel.h"
 +#ifdef MG_HOST_TEST
@@ -1444,6 +1444,8 @@
 +    if (error) return poison(a,error);
 +    error = mg_vm_init(&a->gpu,a->table.cpu,a->table.pa,a->table.bytes,&live->io.smmu,a,powered,idle);
 +    if (!error) error = mg_vm_attach(&a->gpu,0);
++    /* SID1 (gfx3d_lpac) must reach the same bank before the SQE ever starts. */
++    if (!error) error = mg_smmu_route_lpac(&a->gpu.io,&a->gpu.domain);
 +    if (!error) error = mg_vm_adopt(&a->gmu,&live->memory.tables,&live->domain,&live->io.smmu,a,powered,idle);
 +    if (error) return poison(a,error);
 +    a->stage = MG_ACCEL_DOMAINS;
@@ -4653,7 +4655,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_smmu.c
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,247 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * SMMUv2 stage-1 stream-5 setup. Register ABI: Nothing 031e8669eb19
 + * drivers/iommu/arm/arm-smmu/{arm-smmu.h,arm-smmu.c}, io-pgtable-arm.c.
@@ -4867,6 +4869,37 @@
 +#undef SET
 +}
 +
++int mg_smmu_route_lpac(const struct mg_smmu_io *io, struct mg_smmu_domain *s)
++{
++    if (!io || !io->read || !io->write || !s || !s->attached || s->quarantined ||
++        s->stream != 0) return MG_INVALID;
++    if (s->lpac_routed) return MG_BUSY;
++    uint32_t id0 = rd(io, s, 0x20), cr0 = rd(io, s, 0);
++    if (id0 == UINT32_MAX || cr0 == UINT32_MAX) return MG_IO;
++    /* Unmatched streams must fault, as attach requires: SID1 has no bypass owner. */
++    if (!(cr0 & BIT(10))) return MG_BUSY;
++    uint32_t nm = id0 & 255, free_smr = UINT32_MAX;
++    for (unsigned i = 0; i < nm; i++) {
++        uint32_t m = rd(io, s, 0x800 + i * 4);
++        if (m == UINT32_MAX) return MG_IO;
++        if (!(m & BIT(31))) { if (free_smr == UINT32_MAX) free_smr = i; continue; }
++        if (!(((m & 0xffff) ^ 1u) & ~((m >> 16) & 0x7fff))) return MG_BUSY;
++    }
++    if (free_smr == UINT32_MAX) return MG_LIMIT;
++    int ret;
++#define SET(o,v,m) do { ret = set(io,s,(o),(v),(m)); if (ret) goto fail; } while (0)
++    SET(0xc00 + free_smr * 4, s->cb, (3u << 16) | (3u << 24) | 255);
++    SET(0x800 + free_smr * 4, BIT(31) | 1u, UINT32_MAX);
++#undef SET
++    s->lpac_smr = free_smr; s->lpac_routed = true;
++    return MG_OK;
++fail:
++    /* Never leave a half-written SID1 route; the bank itself stays attached. */
++    io->write(io->context, 0x800 + free_smr * 4, 0);
++    s->quarantined = true;
++    return ret;
++}
++
 +int mg_smmu_attach(const struct mg_smmu_io *io, struct mg_smmu_domain *s,
 +    const struct mg_page_tables *t)
 +{ return mg_smmu_attach_stream(io, s, t, 5); }
@@ -5026,7 +5059,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_start.h
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,125 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_START_H
 +#define METROID_GPU_START_H
@@ -5059,6 +5092,8 @@
 +    uint32_t stream;
 +    bool attempted, touched, attached, quarantined;
 +    uint32_t offset, value;
++    uint32_t lpac_smr;
++    bool lpac_routed;
 +};
 +/* 4K SMMU granules, 32-bit IOVA, 3-level tables. CPU pages may be 16K.
 + * The caller supplies contiguous, aligned, private table storage and ranges
@@ -5073,6 +5108,11 @@
 + * Never retarget a live route or use stream2 as a normal-RAM fallback. */
 +int mg_smmu_attach_stream(const struct mg_smmu_io *, struct mg_smmu_domain *,
 +    const struct mg_page_tables *, uint32_t stream);
++/* KGSL gfx3d_lpac (tuna-gpu.dtsi SID1) shares the attached stream0 GPU bank.
++ * The CP issues SID1 transactions once the SQE runs real microcode; unrouted,
++ * they become unidentified-stream faults that reset the phone. Route it
++ * before the first CP submission. Never takes over an existing SID1 match. */
++int mg_smmu_route_lpac(const struct mg_smmu_io *, struct mg_smmu_domain *);
 +
 +struct mg_gmu_backing { uint32_t iova, bytes; void *cpu; };
 +struct mg_gmu_loader {
@@ -5664,7 +5704,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_vm.c
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,223 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_vm.h"
 +#ifdef MG_HOST_TEST
@@ -5722,7 +5762,9 @@
 +        io->read(io->context,0x800 + s->smr*4) != (BIT(31) | s->stream) ||
 +        io->read(io->context,0xc00 + s->smr*4) != s->cb ||
 +        io->read(io->context,b + 0x20) != (uint32_t)ttbr ||
-+        io->read(io->context,b + 0x24) != (uint32_t)(ttbr >> 32)) return poison(v,MG_STALE);
++        io->read(io->context,b + 0x24) != (uint32_t)(ttbr >> 32) ||
++        (s->lpac_routed && (io->read(io->context,0x800 + s->lpac_smr*4) != (BIT(31) | 1u) ||
++            io->read(io->context,0xc00 + s->lpac_smr*4) != s->cb))) return poison(v,MG_STALE);
 +    uint32_t fsr = io->read(io->context,b + 0x58);
 +    if (fsr == UINT32_MAX || (fsr & 0xc00001feu)) return poison(v,MG_IO);
 +    return MG_OK;
