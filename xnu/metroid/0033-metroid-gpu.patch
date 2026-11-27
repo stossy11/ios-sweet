@@ -318,7 +318,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/MetroidGEM.cpp
-@@ -0,0 +1,472 @@
+@@ -0,0 +1,505 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * HakiOS/MSM DRM 1.7 wire interface for the Metroid Gen8 backend.
 + * ABI reference: HakiOS62e09f85 BoardGPU.cpp and Linux uapi/drm/msm_drm.h.
@@ -376,6 +376,18 @@
 +/* On-screen pipeline counters (buffer create, IOSurface import, submit):
 + * [kind][0]=ok [kind][1]=failed, plus the last failing selector/IOReturn. */
 +static uint32_t gem_counts[3][2], gem_fail_selector, gem_fail_result;
++/* Why the last submission was refused, shown as rej=<reason>:<value>. */
++static uint32_t gem_reject_reason, gem_reject_value;
++enum { REJ_PENDING = 1, REJ_BOS, REJ_CMDS, REJ_FLAGS, REJ_QUEUE, REJ_SYNC, REJ_PAD,
++    REJ_BO, REJ_BO_FLAGS, REJ_BO_DUP, REJ_CMD, REJ_NO_IB };
++static IOReturn reject(uint32_t reason, uint32_t value)
++{
++    __atomic_store_n(&gem_reject_value,value,__ATOMIC_RELAXED);
++    __atomic_store_n(&gem_reject_reason,reason,__ATOMIC_RELAXED);
++    return kIOReturnBadArgument;
++}
++/* MSM_PIPE_3D0, NO_IMPLICIT, FENCE_FD_IN/OUT, SYNCOBJ_IN/OUT (no syncobjs). */
++#define GEM_SUBMIT_FLAGS (0x10u | 0x80000000u | 0x40000000u | 0x20000000u | 0x08000000u | 0x04000000u)
 +static unsigned installed;
 +
 +extern "C" bool metroid_gpu_gem_ready(void)
@@ -547,10 +559,18 @@
 +}
 +IOReturn HakiosGPUUserClient::submit(gem_submit *r)
 +{
-+    if (job_pending || !r->buffer_count || r->buffer_count > MG_GEN8_MAX_BUFFERS ||
-+        !r->command_count || r->command_count > MG_GEN8_MAX_IBS ||
-+        (r->flags & ~0x80000000u) != 0x10 || r->queue != 1 || r->in_sync || r->out_sync ||
-+        r->in_count || r->out_count || r->pad) return kIOReturnBadArgument;
++    /* As HakiOS BoardGPU::submit, which this Mesa shim was written against.
++     * Submission is synchronous (retired before return): an input fence fd
++     * names finished work and is ignored; an output fence fd is -1. No
++     * syncobjs exist on this port, so their counts must be zero; the stride
++     * and pointers Mesa always fills in are ignored. */
++    if (job_pending) return reject(REJ_PENDING,0);
++    if (!r->buffer_count || r->buffer_count > MG_GEN8_MAX_BUFFERS) return reject(REJ_BOS,r->buffer_count);
++    if (!r->command_count || r->command_count > MG_GEN8_MAX_IBS) return reject(REJ_CMDS,r->command_count);
++    if ((r->flags & ~GEM_SUBMIT_FLAGS) || (r->flags & 0xffffu) != 0x10) return reject(REJ_FLAGS,r->flags);
++    if (r->queue != 1) return reject(REJ_QUEUE,r->queue);
++    if (r->in_count || r->out_count) return reject(REJ_SYNC,r->in_count | (r->out_count << 16));
++    if (r->pad) return reject(REJ_PAD,r->pad);
 +    auto bos = IONew(gem_bo,r->buffer_count);
 +    auto cmds = IONew(gem_cmd,r->command_count);
 +    if (!bos || !cmds) {
@@ -567,26 +587,38 @@
 +        for (unsigned i = 0; i < r->buffer_count; i++) {
 +            gem_buffer *b = lookup(bos[i].handle);
 +            /* MSM_SUBMIT_BO_DUMP is a diagnostic hint, emitted by Mesa for
-+             * command BOs. It does not add a GPU access permission. */
-+            if (!b || !(bos[i].flags & 3) || (bos[i].flags & ~7u) ||
-+                ((bos[i].flags & 2) && (b->flags & GEM_READONLY)) ||
-+                (bos[i].presumed && bos[i].presumed != b->address)) { valid = false; break; }
++             * command BOs. It does not add a GPU access permission. Neither
++             * READ nor WRITE is taken as both, as HakiOS does. */
++            uint32_t access = bos[i].flags & 3 ? bos[i].flags & 3 : 3;
++            if (!b) { ret = reject(REJ_BO,bos[i].handle); valid = false; break; }
++            if ((bos[i].flags & ~7u) || ((access & 2) && (b->flags & GEM_READONLY)) ||
++                (bos[i].presumed && bos[i].presumed != b->address)) {
++                ret = reject(REJ_BO_FLAGS,bos[i].flags); valid = false; break;
++            }
 +            for (unsigned j = 0; j < i; j++) if (bos[i].handle == bos[j].handle) valid = false;
++            if (!valid) { ret = reject(REJ_BO_DUP,bos[i].handle); break; }
 +            job->buffers[i] = {b->cpu,b->address,b->bytes,
-+                static_cast<unsigned>((bos[i].flags & 1 ? MG_GPU_READ : 0) |
-+                    (bos[i].flags & 2 ? MG_GPU_WRITE : 0))};
++                static_cast<unsigned>((access & 1 ? MG_GPU_READ : 0) | (access & 2 ? MG_GPU_WRITE : 0))};
 +        }
 +        if (!valid) break;
++        unsigned ibs = 0;
 +        for (unsigned i = 0; i < r->command_count; i++) {
 +            const gem_cmd &c = cmds[i];
-+            if (c.type != 1 || c.index >= r->buffer_count || !c.bytes ||
++            /* Other kinds (IB target, context restore) are for a GPU shared
++             * between address spaces; skipped, as HakiOS does. */
++            if (c.type != 1) continue;
++            if (c.index >= r->buffer_count || !c.bytes ||
 +                ((c.offset | c.bytes) & 3) || c.relocations || c.relocs || c.pad ||
 +                c.offset > job->buffers[c.index].bytes ||
-+                c.bytes > job->buffers[c.index].bytes-c.offset) { valid = false; break; }
++                c.bytes > job->buffers[c.index].bytes-c.offset) {
++                ret = reject(REJ_CMD,i); valid = false; break;
++            }
 +            job->buffers[c.index].access |= MG_GPU_READ | MG_GPU_EXEC;
-+            job->ibs[i] = {c.index,c.offset,c.bytes};
++            job->ibs[ibs++] = {c.index,c.offset,c.bytes};
 +        }
 +        if (!valid) break;
++        if (!ibs) { ret = reject(REJ_NO_IB,r->command_count); break; }
++        job->ib_count = ibs;
 +        uint64_t fence = 0;
 +        int error = ops.submit(ops.context,job,&fence);
 +        if (fence) {
@@ -744,9 +776,10 @@
 +    uint32_t c[3][2];
 +    for (unsigned i = 0; i < 3; i++) for (unsigned j = 0; j < 2; j++)
 +        c[i][j] = __atomic_load_n(&gem_counts[i][j],__ATOMIC_RELAXED);
-+    snprintf(out,bytes,"%s; GEM bo=%u/%u surf=%u/%u sub=%u/%u fail=%x:%x",open,
++    snprintf(out,bytes,"%s; GEM bo=%u/%u surf=%u/%u sub=%u/%u fail=%x:%x rej=%u:%x",open,
 +        c[0][0],c[0][1],c[1][0],c[1][1],c[2][0],c[2][1],
-+        __atomic_load_n(&gem_fail_selector,__ATOMIC_RELAXED),__atomic_load_n(&gem_fail_result,__ATOMIC_RELAXED));
++        __atomic_load_n(&gem_fail_selector,__ATOMIC_RELAXED),__atomic_load_n(&gem_fail_result,__ATOMIC_RELAXED),
++        __atomic_load_n(&gem_reject_reason,__ATOMIC_RELAXED),__atomic_load_n(&gem_reject_value,__ATOMIC_RELAXED));
 +    return strlen(out);
 +}
 +IOReturn HakiosGPU::newUserClient(task_t task, void *security, UInt32 type,
@@ -5656,9 +5689,9 @@
 +#include "metroid_gpu_queue.h"
 +
 +#define MG_GEN8_CONTEXT_BYTES 4096u
-+#define MG_GEN8_MAX_BUFFERS 64u
++#define MG_GEN8_MAX_BUFFERS 1024u /* HakiOS allows 8192; CA frames exceed 64 */
 +#define MG_GEN8_MAX_IBS 64u
-+#define MG_GEN8_MAX_JOB_BYTES (64u * 1024u * 1024u)
++#define MG_GEN8_MAX_JOB_BYTES (512u * 1024u * 1024u)
 +#define MG_GEN8_ADDRESS_LIMIT (1ull << 49)
 +#define MG_GEN8_HOST2GMU 0x1f994u /* GPU-relative dword offset */
 +
