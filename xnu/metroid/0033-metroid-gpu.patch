@@ -318,7 +318,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/MetroidGEM.cpp
-@@ -0,0 +1,505 @@
+@@ -0,0 +1,506 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * HakiOS/MSM DRM 1.7 wire interface for the Metroid Gen8 backend.
 + * ABI reference: HakiOS62e09f85 BoardGPU.cpp and Linux uapi/drm/msm_drm.h.
@@ -446,7 +446,8 @@
 +{
 +    if (!metroid_gpu_gem_ready() || !IOUserClient::start(provider)) return false;
 +    buffers = IONewZero(gem_buffer,GEM_SLOTS);
-+    job = IONewZero(mg_gen8_job,1);
++    /* 33 KB with 1024 buffers: above the typed-kalloc 16 KB cap. */
++    job = (mg_gen8_job *)IOMallocZero(sizeof(*job));
 +    return buffers && job;
 +}
 +/* The descriptor and CPU mapping are retained even when a failed map might
@@ -490,7 +491,7 @@
 +    bool retained = false;
 +    if (buffers) for (unsigned i = 0; i < GEM_SLOTS; i++) retained |= buffers[i].memory != nullptr;
 +    if (!retained && buffers) IODelete(buffers,gem_buffer,GEM_SLOTS);
-+    if (!job_pending && job) IODelete(job,mg_gen8_job,1);
++    if (!job_pending && job) IOFree(job,sizeof(*job));
 +    IOUserClient::free();
 +}
 +IOReturn HakiosGPUUserClient::add(IOMemoryDescriptor *memory, SweetSurface *s,
