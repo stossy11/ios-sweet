@@ -318,7 +318,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/MetroidGEM.cpp
-@@ -0,0 +1,426 @@
+@@ -0,0 +1,456 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * HakiOS/MSM DRM 1.7 wire interface for the Metroid Gen8 backend.
 + * ABI reference: HakiOS62e09f85 BoardGPU.cpp and Linux uapi/drm/msm_drm.h.
@@ -335,6 +335,8 @@
 +#include <IOKit/IOKitKeys.h>
 +#include <kern/clock.h>
 +#include <sys/systm.h>
++#include <sys/proc.h>
++#include <sys/kauth.h>
 +#include "arm/SweetSurface.h"
 +#include "../../bsd/dev/metroid_gpu_gem.h"
 +
@@ -702,23 +704,51 @@
 +    IOReturn newUserClient(task_t, void *, UInt32, OSDictionary *, IOUserClient **) override;
 +};
 +OSDefineMetaClassAndStructors(HakiosGPU, IOService);
++/* Diagnostic only: the last open attempt is shown on the framebuffer status
++ * line, because Metal's compiler library hides a refused open behind
++ * "no msm device to open". newUserClient runs in the opening process. */
++static char gem_open_status[96];
++static IOSimpleLock *gem_open_lock;
++static void note_open(const char *result)
++{
++    char name[32], line[sizeof(gem_open_status)];
++    proc_selfname(name,sizeof(name));
++    snprintf(line,sizeof(line),"HakiosGPU open: %s[%d] uid=%u %s",name,proc_selfpid(),kauth_getuid(),result);
++    IOLog("METROID GPU: %s\n",line);
++    if (!gem_open_lock) return;
++    IOSimpleLockLock(gem_open_lock);
++    strlcpy(gem_open_status,line,sizeof(gem_open_status));
++    IOSimpleLockUnlock(gem_open_lock);
++}
++extern "C" size_t metroid_gpu_gem_open_status(char *out, size_t bytes)
++{
++    if (!out || !bytes) return 0;
++    out[0] = 0;
++    if (!gem_open_lock) return 0;
++    IOSimpleLockLock(gem_open_lock);
++    strlcpy(out,gem_open_status,bytes);
++    IOSimpleLockUnlock(gem_open_lock);
++    return strlen(out);
++}
 +IOReturn HakiosGPU::newUserClient(task_t task, void *security, UInt32 type,
 +    OSDictionary *properties, IOUserClient **out)
 +{
 +    if (!out) return kIOReturnBadArgument;
 +    *out = nullptr;
-+    if (type || !metroid_gpu_gem_ready()) return kIOReturnNotReady;
++    if (type || !metroid_gpu_gem_ready()) { note_open(type ? "REFUSED (bad type)" : "REFUSED (GPU not ready)"); return kIOReturnNotReady; }
 +    IOReturn privilege = IOUserClient::clientHasPrivilege(security,kIOClientPrivilegeAdministrator);
-+    if (privilege) return privilege;
++    if (privilege) { note_open("REFUSED (root only)"); return privilege; }
 +    auto client = new HakiosGPUUserClient;
 +    if (!client) return kIOReturnNoMemory;
 +    if (!client->initWithTask(task,security,type,properties)) { client->release(); return kIOReturnError; }
 +    if (!client->attach(this)) { client->release(); return kIOReturnError; }
 +    if (!client->start(this)) { client->detach(this); client->release(); return kIOReturnError; }
++    note_open("ok");
 +    *out = client; return kIOReturnSuccess;
 +}
 +extern "C" int metroid_gpu_gem_install(const mg_gem_ops *owner)
 +{
++    if (!gem_open_lock) gem_open_lock = IOSimpleLockAlloc();
 +    if (!owner || !owner->ready || !owner->map || !owner->unmap || !owner->submit ||
 +        !owner->wait || !owner->parameter || !owner->ready(owner->context)) return MG_UNBACKED;
 +    unsigned expected = 0;
@@ -1701,7 +1731,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_gem.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,41 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_GEM_H
 +#define METROID_GPU_GEM_H
@@ -1736,6 +1766,9 @@
 +#endif
 +int metroid_gpu_gem_install(const struct mg_gem_ops *);
 +bool metroid_gpu_gem_ready(void);
++/* Last HakiosGPU open attempt (process, pid, uid, result) for the on-screen
++ * status line; empty until a process tries to open the service. */
++size_t metroid_gpu_gem_open_status(char *, size_t);
 +#ifdef __cplusplus
 +}
 +#endif
@@ -2670,7 +2703,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_platform.c
-@@ -0,0 +1,330 @@
+@@ -0,0 +1,336 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * XNU adapter for the retained GMU owner. No inherited bandwidth assumption.
 + * Register sequences: Nothing 031e8669, gpucc-tuna.c/adreno_gen8.c.
@@ -2725,7 +2758,13 @@
 +    if (!out || !bytes) return false;
 +    out[0] = 0;
 +    if (!__atomic_load_n(&platform.report_ready,__ATOMIC_ACQUIRE) || !platform.show_status) return false;
-+    strlcpy(out,platform.status,bytes);
++    /* A refused Metal open is otherwise invisible on screen; put it first. */
++    char open[96];
++    if (metroid_gpu_gem_open_status(open,sizeof(open))) {
++        strlcpy(out,open,bytes);
++        strlcat(out,"; ",bytes);
++        strlcat(out,platform.status,bytes);
++    } else strlcpy(out,platform.status,bytes);
 +    return true;
 +}
 +static uint32_t rd(vm_offset_t base, uint32_t offset)
