@@ -318,7 +318,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/MetroidGEM.cpp
-@@ -0,0 +1,506 @@
+@@ -0,0 +1,509 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * HakiOS/MSM DRM 1.7 wire interface for the Metroid Gen8 backend.
 + * ABI reference: HakiOS62e09f85 BoardGPU.cpp and Linux uapi/drm/msm_drm.h.
@@ -379,7 +379,7 @@
 +/* Why the last submission was refused, shown as rej=<reason>:<value>. */
 +static uint32_t gem_reject_reason, gem_reject_value;
 +enum { REJ_PENDING = 1, REJ_BOS, REJ_CMDS, REJ_FLAGS, REJ_QUEUE, REJ_SYNC, REJ_PAD,
-+    REJ_BO, REJ_BO_FLAGS, REJ_BO_DUP, REJ_CMD, REJ_NO_IB };
++    REJ_BO, REJ_BO_FLAGS, REJ_BO_DUP, REJ_CMD, REJ_NO_IB, REJ_BO_IOVA };
 +static IOReturn reject(uint32_t reason, uint32_t value)
 +{
 +    __atomic_store_n(&gem_reject_value,value,__ATOMIC_RELAXED);
@@ -589,12 +589,15 @@
 +            gem_buffer *b = lookup(bos[i].handle);
 +            /* MSM_SUBMIT_BO_DUMP is a diagnostic hint, emitted by Mesa for
 +             * command BOs. It does not add a GPU access permission. Neither
-+             * READ nor WRITE is taken as both, as HakiOS does. */
++             * READ nor WRITE is taken as both, as HakiOS does. Mesa lists
++             * GPU-readonly command BOs as READ|WRITE; as Linux msm, that is
++             * not refused: the readonly mapping already denies GPU writes. */
 +            uint32_t access = bos[i].flags & 3 ? bos[i].flags & 3 : 3;
 +            if (!b) { ret = reject(REJ_BO,bos[i].handle); valid = false; break; }
-+            if ((bos[i].flags & ~7u) || ((access & 2) && (b->flags & GEM_READONLY)) ||
-+                (bos[i].presumed && bos[i].presumed != b->address)) {
-+                ret = reject(REJ_BO_FLAGS,bos[i].flags); valid = false; break;
++            if (bos[i].flags & ~7u) { ret = reject(REJ_BO_FLAGS,bos[i].flags); valid = false; break; }
++            if (b->flags & GEM_READONLY) access &= ~2u;
++            if (bos[i].presumed && bos[i].presumed != b->address) {
++                ret = reject(REJ_BO_IOVA,bos[i].handle); valid = false; break;
 +            }
 +            for (unsigned j = 0; j < i; j++) if (bos[i].handle == bos[j].handle) valid = false;
 +            if (!valid) { ret = reject(REJ_BO_DUP,bos[i].handle); break; }
