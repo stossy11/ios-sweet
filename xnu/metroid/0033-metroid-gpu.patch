@@ -3049,7 +3049,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_platform.c
-@@ -0,0 +1,338 @@
+@@ -0,0 +1,368 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * XNU adapter for the retained GMU owner. No inherited bandwidth assumption.
 + * Register sequences: Nothing 031e8669, gpucc-tuna.c/adreno_gen8.c.
@@ -3099,6 +3099,7 @@
 +    if (__atomic_load_n(&platform.report_ready, __ATOMIC_ACQUIRE))
 +        *out = platform.report;
 +}
++static void live_faults(char *out, size_t bytes);
 +bool metroid_gpu_copy_status(char *out, size_t bytes)
 +{
 +    if (!out || !bytes) return false;
@@ -3111,6 +3112,16 @@
 +        strlcat(out,"; ",bytes);
 +        strlcat(out,platform.status,bytes);
 +    } else strlcpy(out,platform.status,bytes);
++    /* Live fault state, resampled at every panel draw: the last frame before
++     * a hang shows what faulted first. Prepended so truncation keeps it. */
++    char live[96], rest[288];
++    live_faults(live,sizeof(live));
++    if (live[0]) {
++        strlcpy(rest,out,sizeof(rest));
++        strlcpy(out,live,bytes);
++        strlcat(out,"; ",bytes);
++        strlcat(out,rest,bytes);
++    }
 +    return true;
 +}
 +static uint32_t rd(vm_offset_t base, uint32_t offset)
@@ -3248,6 +3259,25 @@
 +        __asm__ volatile("dc ivac, %0" :: "r"(va) : "memory");
 +    __asm__ volatile("dsb sy" ::: "memory");
 +    return MG_OK;
++}
++/* Read-only sample of the SMMU global/context fault registers and GMU AO
++ * interrupt status. Only touched while the CX/SMMU clocks are proven on. */
++static uint32_t cb_fsr(const struct mg_vm *v, uint32_t offset)
++{
++    const struct mg_smmu_domain *d = &v->domain;
++    if (!v->initialized || !d->attached) return 0;
++    return smmu_read(NULL,d->cb_base + (d->cb << d->page_shift) + offset);
++}
++static void live_faults(char *out, size_t bytes)
++{
++    out[0] = 0;
++    if (!platform.smmu || !accelerator_powered(NULL)) return;
++    const struct mg_accel *a = &platform.accelerator;
++    uint32_t fsr0 = cb_fsr(&a->gpu,0x58), fsr2 = cb_fsr(&a->secure,0x58), fsr5 = cb_fsr(&a->gmu,0x58);
++    uint64_t far = fsr0 ? cb_fsr(&a->gpu,0x60) | (uint64_t)cb_fsr(&a->gpu,0x64) << 32 : 0;
++    snprintf(out,bytes,"LIVE gfsr=%x syn=%x fsr0=%x fsr2=%x fsr5=%x far=%llx ao=%x",
++        smmu_read(NULL,0x48),smmu_read(NULL,0x54),fsr0,fsr2,fsr5,
++        (unsigned long long)far,gpu_read(NULL,0x23b05));
 +}
 +static int scheduler_tables(void *p, uint32_t *perf, uint32_t *bw)
 +{ (void)p; return metroid_gpu_rpmh_scheduler_tables(perf,bw) ? MG_IO : MG_OK; }
