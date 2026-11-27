@@ -1,8 +1,6 @@
-diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 47bb6c3..e2d98f3 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -82,12 +82,35 @@ extern "C" void sweet_fb_gles_process_exit(const char *name, int pid, int signal
+@@ -82,12 +82,44 @@
      snprintf(text, sizeof(text), "%s pid %d exited: signal %d status %d", name, pid, signal, status);
      gles_panel_record(1, text, strlen(text));
  }
@@ -15,7 +13,15 @@ index 47bb6c3..e2d98f3 100644
 + * SwapEnd calls / refusals: a frame reaches present() only through SwapEnd. */
 +static uint64_t sweet_fb_selectors_seen;
 +static uint32_t sweet_fb_swapend_calls, sweet_fb_swapend_refused;
-+extern "C" void metroid_gpu_surface_wait(const void *surface);
++extern "C" bool metroid_gpu_surface_begin_read(void *surface);
++extern "C" void metroid_gpu_surface_end_read(void *surface);
++static uint64_t sweet_fb_copy_ns, sweet_fb_copy_samples;
++static void sweet_fb_copy_done(uint64_t began)
++{
++    uint64_t ns;
++    absolutetime_to_nanoseconds(mach_absolute_time()-began,&ns);
++    sweet_fb_copy_ns += ns; sweet_fb_copy_samples++;
++}
  static void gles_panel_draw(uintptr_t pixels, uint32_t width, uint32_t height, uint32_t stride)
  {
      if (__atomic_exchange_n(&gles_panel_lock, 1u, __ATOMIC_ACQUIRE)) return;
@@ -27,7 +33,8 @@ index 47bb6c3..e2d98f3 100644
 +    if (!snapshot.renderer[0]) {
 +        /* Always shown: "FB sw0" proves no client has swapped a frame yet. */
 +        char line[160];
-+        snprintf(line, sizeof(line), "FB sel%llx se%u/%u sw%llu p%u ok%u sk%u %s",
++        snprintf(line, sizeof(line), "FB cpu%llu sel%llx se%u/%u sw%llu p%u ok%u sk%u %s",
++            sweet_fb_copy_samples ? sweet_fb_copy_ns/sweet_fb_copy_samples/1000 : 0,
 +            __atomic_load_n(&sweet_fb_selectors_seen, __ATOMIC_RELAXED),
 +            __atomic_load_n(&sweet_fb_swapend_calls, __ATOMIC_RELAXED),
 +            __atomic_load_n(&sweet_fb_swapend_refused, __ATOMIC_RELAXED), sweet_fb_swap_count,
@@ -38,7 +45,42 @@ index 47bb6c3..e2d98f3 100644
      metroid_gles_panel_draw(&snapshot, (volatile uint32_t *)pixels, width, height, stride, iso_font);
  }
  
-@@ -356,7 +379,43 @@ get32(const uint8_t *p, uint32_t off)
+@@ -111,6 +143,16 @@
+ #define SWEET_FB_VSYNC_US               16667
+ #define SWEET_FB_DOT_PITCH              395     /* ppi, 6.67" 1080x2400 */
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
++
++/* Work done by the callback belongs inside the frame period. Scheduling a
++ * full 16.7ms after copying capped even a 10ms copy at about 37fps. */
++static uint32_t sweet_fb_next_delay(uint64_t began)
++{
++    uint64_t ns;
++    absolutetime_to_nanoseconds(mach_absolute_time()-began,&ns);
++    uint64_t us = ns/1000;
++    return us+1000 < SWEET_FB_VSYNC_US ? (uint32_t)(SWEET_FB_VSYNC_US-us) : 1000;
++}
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -311,7 +353,7 @@
+ 		 * hung UI is often followed by backboardd turning the display off,
+ 		 * which would otherwise hide the counters that explain the hang. */
+ 		gles_panel_draw(fb->fPixels, fb->fWidth, fb->fHeight, fb->fRowBytes);
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		sender->setTimeoutUS(sweet_fb_next_delay(now));
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -329,7 +371,7 @@
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	gles_panel_draw(fb->fPixels, fb->fWidth, fb->fHeight, fb->fRowBytes);
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	sender->setTimeoutUS(sweet_fb_next_delay(now));
+ }
+ 
+ void
+@@ -360,7 +402,43 @@
  }
  
  static uint32_t sweet_fb_swaps_logged;
@@ -83,47 +125,73 @@ index 47bb6c3..e2d98f3 100644
  
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  /*
-@@ -393,6 +452,8 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -397,6 +475,9 @@
  		}
  	}
  
 +	bool skip_noted = false;
++	bool retry = false;
 +	sweet_fb_presents++;
  	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
  		uint32_t id = get32(rec, 0x54 + 4 * layer);
  		const uint8_t *a = rec + 0x64 + 16 * layer;
-@@ -413,6 +474,9 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -417,19 +498,33 @@
  			    get32(a, 12), dx, dy, w, h);
  		}
-+		/* Queued GPU rendering into the surface finishes first (HakiOS). */
-+		if (s != NULL && s != fScanout) metroid_gpu_surface_wait(s);
  		if (s == NULL || s == fScanout) {
 +			sweet_fb_note_layer(layer, id, s, s ? "skip:scanout" : "skip:nosurf", 0, &skip_noted);
  			OSSafeReleaseNULL(s);
  			continue;
  		}
-@@ -425,6 +489,10 @@ AppleCLCD::present(const uint8_t *rec)
++		/* Do not copy a partial GPU frame. The lease prevents a new writer
++		 * from modifying these pixels until the whole CPU copy is done. */
++		if (!metroid_gpu_surface_begin_read(s)) {
++			sweet_fb_note_layer(layer, id, s, "skip:gpu", 0, &skip_noted);
++			retry = true; s->release(); continue;
++		}
++		uint64_t copy_began = mach_absolute_time();
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (fXMap != NULL) {
+ 			if (src && bpe == 4 && s->pixelFormat == SWEET_FB_FORMAT_BGRA &&
+ 			    s->elementWidth == 1 && s->elementHeight == 1 && s->memory) {
+-				(void)metroid_canvas_present((uint8_t *)fPixels, fScanout->memory->getLength(),
++				bool copied = metroid_canvas_present((uint8_t *)fPixels, fScanout->memory->getLength(),
  				    fWidth, fHeight, fRowBytes, (const uint8_t *)src, s->memory->getLength(),
  				    s->width, s->height, s->bytesPerRow, s->offset, fCanvasW, fCanvasH,
  				    sx, sy, dx, dy, w, h, fXMap, fScaledRow);
-+				sweet_fb_note_layer(layer, id, s, "copy", src, &skip_noted);
++				sweet_fb_note_layer(layer, id, s, copied ? "copy" : "skip:bounds", copied ? src : 0, &skip_noted);
 +			} else {
 +				sweet_fb_note_layer(layer, id, s, !src ? "skip:nomap" : !s->memory ? "skip:nomem" :
 +				    s->pixelFormat != SWEET_FB_FORMAT_BGRA ? "skip:format" : "skip:layout", 0, &skip_noted);
  			}
++			sweet_fb_copy_done(copy_began);
++			metroid_gpu_surface_end_read(s);
  			s->release();
  			continue;
-@@ -463,6 +531,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+@@ -467,8 +562,19 @@
  				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
  				    (size_t)w * 4);
  			}
+-		}
 +			sweet_fb_note_layer(layer, id, s, "copy", src, &skip_noted);
 +		} else {
 +			sweet_fb_note_layer(layer, id, s, bpe != 4 ? "skip:bpe" : "skip:bounds", 0, &skip_noted);
- 		}
++		}
++		sweet_fb_copy_done(copy_began);
++		metroid_gpu_surface_end_read(s);
  		s->release();
++	}
++	/* Retry a late frame, but never replace a newer swap from userspace. */
++	if (retry) {
++		IOLockLock(fLock);
++		if (!fDirty) { memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE); fDirty = true; }
++		IOLockUnlock(fLock);
  	}
-@@ -547,6 +618,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ }
+ 
+@@ -551,6 +657,9 @@
  	uint64_t out[2] = { 0, 0 };
  	uint32_t outCount = 0;
  
@@ -133,7 +201,7 @@ index 47bb6c3..e2d98f3 100644
  	switch (selector) {
  	case kSweetFBGetLayerDefaultSurface:
  		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
-@@ -560,8 +634,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -564,8 +673,10 @@
  		break;
  	case kSweetFBSwapEnd: {
  		uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
@@ -144,11 +212,9 @@ index 47bb6c3..e2d98f3 100644
  			ret = kIOReturnBadArgument;
  			break;
  		}
-diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index 7938314..82c991a 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -325,20 +325,42 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -325,20 +325,42 @@
  	s->elementWidth = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementWidth", 1);
  	s->elementHeight = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementHeight", 1);
  	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);

@@ -44,6 +44,22 @@
  	metroid_touch_init();
  	return true;
  }
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -40,7 +40,12 @@
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	/* Serialized by the GPU service lock, never the framebuffer lock. */
++	uint64_t gpuFence, gpuUseFence;
++	uint32_t gpuReaders;
++	bool init() APPLE_KEXT_OVERRIDE {
++		gpuFence = gpuUseFence = 0; gpuReaders = 0; return OSObject::init();
++	}
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
 --- a/osfmk/arm/io_map.c
 +++ b/osfmk/arm/io_map.c
 @@ -62,7 +62,13 @@
@@ -318,7 +334,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/MetroidGEM.cpp
-@@ -0,0 +1,705 @@
+@@ -0,0 +1,762 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * HakiOS/MSM DRM 1.7 wire interface for the Metroid Gen8 backend.
 + * ABI reference: HakiOS62e09f85 BoardGPU.cpp and Linux uapi/drm/msm_drm.h.
@@ -420,8 +436,10 @@
 +static unsigned installed;
 +/* Longest a single wait blocks a caller (HakiOS GPU_PATIENCE_MS-style). */
 +#define GEM_WAIT_US 2000000ull
-+/* Longest the display waits for a surface's rendering before showing it. */
-+#define GEM_PRESENT_WAIT_US 100000ull
++/* Keep display notifications responsive: a late surface is retried next tick.
++ * Writers can wait longer for an already-started CPU panel copy to finish. */
++#define GEM_PRESENT_WAIT_US 1000ull
++#define GEM_READER_WAIT_US 100000ull
 +/* Submitted jobs belong to the backend until retirement (KGSL keeps many
 + * ISSUE_CMDs in flight per context). A pool avoids a 33 KB allocation per
 + * frame. Touched only under device_lock, which every ops call holds. */
@@ -444,19 +462,20 @@
 +    }
 +    return job;
 +}
-+/* The last submission writing each IOSurface, as HakiOS's surface->drawn:
-+ * the framebuffer waits for it before putting the surface on the panel. */
-+#define GEM_DRAWN 256u
-+static struct { const void *surface; uint64_t fence; } gem_drawn[GEM_DRAWN];
++/* Fence/read ownership lives on the retained surface itself. A bounded
++ * pointer table can evict a live fence or confuse a newly allocated surface
++ * with an old object at the same address. device_lock protects these fields. */
 +static void gem_mark_drawn(const void *surface, uint64_t fence)
++{ static_cast<SweetSurface *>(const_cast<void *>(surface))->gpuFence = fence; }
++static uint64_t gem_time_ns(void)
 +{
-+    unsigned slot = 0;
-+    for (unsigned i = 0; i < GEM_DRAWN; i++) {
-+        if (gem_drawn[i].surface == surface) { slot = i; break; }
-+        if (gem_drawn[i].fence < gem_drawn[slot].fence) slot = i; /* oldest: done */
-+    }
-+    gem_drawn[slot].surface = surface; gem_drawn[slot].fence = fence;
++    uint64_t ns;
++    absolutetime_to_nanoseconds(mach_continuous_time(),&ns);
++    return ns;
 +}
++/* Total CPU time inside submission and fence polling, excluding the sleeps
++ * between polls. These distinguish cache/driver cost from waiting on GPU. */
++static uint64_t gem_submit_ns, gem_poll_ns, gem_submit_samples, gem_poll_samples;
 +/* Microseconds until an msm absolute CLOCK_MONOTONIC deadline (Darwin:
 + * mach_continuous_time), capped; 0 for now or past, which only polls. */
 +static uint64_t gem_until_us(int64_t seconds, int64_t nanoseconds)
@@ -479,7 +498,10 @@
 +{
 +    uint64_t waited = 0;
 +    for (unsigned spin = 0;; spin++) {
++        uint64_t began = gem_time_ns();
 +        int error = ops.wait(ops.context,fence,0);
++        __atomic_fetch_add(&gem_poll_ns,gem_time_ns()-began,__ATOMIC_RELAXED);
++        __atomic_fetch_add(&gem_poll_samples,1,__ATOMIC_RELAXED);
 +        if (error != MG_TIMEOUT) return error;
 +        if (waited >= us) {
 +            if (us) __atomic_fetch_add(&gem_wait_timeouts,1,__ATOMIC_RELAXED);
@@ -492,17 +514,30 @@
 +        IOLockLock(device_lock);
 +    }
 +}
-+/* The framebuffer calls this before showing a surface: rendering into it
-+ * that is still queued finishes first (HakiOS MiniIOSurfaceDrawn). On a
-+ * timeout the surface is shown anyway, as HakiOS. Workloop context. */
-+extern "C" void metroid_gpu_surface_wait(const void *surface)
++/* Claim a CPU read only after the latest writer retires. New GPU writers
++ * must wait until end_read; the device lock is NOT held across the panel
++ * copy. If a new fence appeared while waiting, poll it once rather than
++ * repeatedly extending the display's wait budget. */
++extern "C" bool metroid_gpu_surface_begin_read(void *surface)
++{
++    if (!surface) return false;
++    if (__atomic_load_n(&installed,__ATOMIC_ACQUIRE) != 2) return true;
++    SweetSurface *s = static_cast<SweetSurface *>(surface);
++    IOLockLock(device_lock);
++    uint64_t fence = s->gpuFence;
++    int error = fence ? gem_wait_fence(fence,GEM_PRESENT_WAIT_US) : MG_OK;
++    if (!error && s->gpuFence != fence) error = ops.wait(ops.context,s->gpuFence,0);
++    bool allowed = !error && s->gpuReaders != UINT32_MAX;
++    if (allowed) s->gpuReaders++;
++    IOLockUnlock(device_lock);
++    return allowed;
++}
++extern "C" void metroid_gpu_surface_end_read(void *surface)
 +{
 +    if (!surface || __atomic_load_n(&installed,__ATOMIC_ACQUIRE) != 2) return;
++    SweetSurface *s = static_cast<SweetSurface *>(surface);
 +    IOLockLock(device_lock);
-+    uint64_t fence = 0;
-+    for (unsigned i = 0; i < GEM_DRAWN; i++)
-+        if (gem_drawn[i].surface == surface) { fence = gem_drawn[i].fence; break; }
-+    if (fence && ops.ready(ops.context)) (void)gem_wait_fence(fence,GEM_PRESENT_WAIT_US);
++    if (s->gpuReaders) s->gpuReaders--;
 +    IOLockUnlock(device_lock);
 +}
 +
@@ -530,6 +565,12 @@
 +    uint32_t handle, flags;
 +    unsigned page_count;
 +};
++/* Another process may have submitted an alias of this same IOSurface. CPU
++ * access must wait for those GPU readers/writers too, not just this handle. */
++static uint64_t gem_cpu_fence(const gem_buffer *b)
++{
++    return b->surface && b->surface->gpuUseFence > b->fence ? b->surface->gpuUseFence : b->fence;
++}
 +
 +class HakiosGPUUserClient : public IOUserClient {
 +    OSDeclareDefaultStructors(HakiosGPUUserClient);
@@ -727,6 +768,29 @@
 +    do {
 +        if (copyin(r->buffers,bos,r->buffer_count*sizeof(*bos)) ||
 +            copyin(r->commands,cmds,r->command_count*sizeof(*cmds))) { ret = kIOReturnVMError; break; }
++        /* The display owns a read lease until its CPU copy finishes. Recheck
++         * every handle after dropping the lock: another thread may close it.
++         * Timeout rejects the batch; never write through a live CPU reader. */
++        uint64_t read_deadline = gem_time_ns() + GEM_READER_WAIT_US*NSEC_PER_USEC;
++        bool readers = false;
++        do {
++            readers = false;
++            for (unsigned i = 0; i < r->buffer_count; i++) {
++                gem_buffer *b = lookup(bos[i].handle);
++                unsigned access = bos[i].flags & 3 ? bos[i].flags & 3 : 3;
++                if (b && !(b->flags & GEM_READONLY) && (access & 2) && b->surface && b->surface->gpuReaders) {
++                    readers = true; break;
++                }
++            }
++            if (!readers || gem_time_ns() >= read_deadline) break;
++            IOLockUnlock(device_lock);
++            IOSleep(1);
++            IOLockLock(device_lock);
++            if (closed || !ops.ready(ops.context)) { ret = kIOReturnNotReady; break; }
++        } while (true);
++        if (closed) ret = kIOReturnNotReady;
++        if (ret == kIOReturnNotReady) break;
++        if (readers) { ret = kIOReturnBusy; break; }
 +        bool valid = true;
 +        unsigned count = 0;
 +        for (unsigned i = 0; i < r->buffer_count; i++) {
@@ -778,13 +842,17 @@
 +        if (!ibs) { ret = reject(REJ_NO_IB,r->command_count); break; }
 +        job->ib_count = ibs;
 +        uint64_t fence = 0;
++        uint64_t began = gem_time_ns();
 +        int error = ops.submit(ops.context,job,&fence);
++        __atomic_fetch_add(&gem_submit_ns,gem_time_ns()-began,__ATOMIC_RELAXED);
++        __atomic_fetch_add(&gem_submit_samples,1,__ATOMIC_RELAXED);
 +        if (fence) {
 +            job = nullptr; /* the backend owns it until retirement */
 +            last_fence = fence;
 +            for (unsigned i = 0; i < r->buffer_count; i++) {
 +                gem_buffer *g = lookup(bos[i].handle);
 +                g->fence = fence;
++                if (g->surface) g->surface->gpuUseFence = fence;
 +                /* As HakiOS: a surface written, or named with neither flag. */
 +                if (g->surface && ((bos[i].flags & 2) || !(bos[i].flags & 3))) gem_mark_drawn(g->surface,fence);
 +            }
@@ -877,8 +945,9 @@
 +        /* An unknown handle has no GPU work outstanding. MSM_PREP_NOSYNC (4)
 +         * only asks; a busy buffer is EBUSY, as Linux and HakiOS. */
 +        if (!b) { stub(REJ_IOCTL,selector); break; }
-+        if (b->fence) {
-+            int error = gem_wait_fence(b->fence,(r.prep.op & 4) ? 0 :
++        uint64_t fence = gem_cpu_fence(b);
++        if (fence) {
++            int error = gem_wait_fence(fence,(r.prep.op & 4) ? 0 :
 +                gem_until_us(r.prep.timeout.seconds,r.prep.timeout.nanoseconds));
 +            ret = error == MG_TIMEOUT ? kIOReturnBusy : result(error);
 +        }
@@ -968,13 +1037,17 @@
 +    uint32_t c[3][2];
 +    for (unsigned i = 0; i < 3; i++) for (unsigned j = 0; j < 2; j++)
 +        c[i][j] = __atomic_load_n(&gem_counts[i][j],__ATOMIC_RELAXED);
-+    snprintf(out,bytes,"%s; GEM bo=%u/%u surf=%u/%u sub=%u/%u fail=%x:%x rej=%u:%x stub=%u/%u:%x wt=%u",open,
++    snprintf(out,bytes,"%s; GEM bo=%u/%u surf=%u/%u sub=%u/%u fail=%x:%x rej=%u:%x stub=%u/%u:%x wt=%u cpu=%llu/%llu",open,
 +        c[0][0],c[0][1],c[1][0],c[1][1],c[2][0],c[2][1],
 +        __atomic_load_n(&gem_fail_selector,__ATOMIC_RELAXED),__atomic_load_n(&gem_fail_result,__ATOMIC_RELAXED),
 +        __atomic_load_n(&gem_reject_reason,__ATOMIC_RELAXED),__atomic_load_n(&gem_reject_value,__ATOMIC_RELAXED),
 +        __atomic_load_n(&gem_stub_count,__ATOMIC_RELAXED),__atomic_load_n(&gem_stub_reason,__ATOMIC_RELAXED),
 +        __atomic_load_n(&gem_stub_value,__ATOMIC_RELAXED),
-+        __atomic_load_n(&gem_wait_timeouts,__ATOMIC_RELAXED));
++        __atomic_load_n(&gem_wait_timeouts,__ATOMIC_RELAXED),
++        (unsigned long long)(__atomic_load_n(&gem_submit_ns,__ATOMIC_RELAXED) /
++            (__atomic_load_n(&gem_submit_samples,__ATOMIC_RELAXED) ?: 1) / NSEC_PER_USEC),
++        (unsigned long long)(__atomic_load_n(&gem_poll_ns,__ATOMIC_RELAXED) /
++            (__atomic_load_n(&gem_poll_samples,__ATOMIC_RELAXED) ?: 1) / NSEC_PER_USEC));
 +    size_t used = strlen(out);
 +    if (__atomic_load_n(&installed,__ATOMIC_ACQUIRE) == 2 && ops.describe && used + 2 < bytes) {
 +        strlcat(out,"; ",bytes); used += 2;
@@ -1415,7 +1488,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_accel.c
-@@ -0,0 +1,376 @@
+@@ -0,0 +1,382 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_accel.h"
 +#ifdef MG_HOST_TEST
@@ -1466,7 +1539,13 @@
 +static void publish(void *p, const void *cpu, size_t bytes)
 +{ struct mg_accel *a = p; a->live->io.publish(a->live->io.context,cpu,bytes); }
 +static int sync_memory(void *p, enum mg_gpu_sync direction, const void *cpu, size_t bytes)
-+{ struct mg_accel *a = p; return running(a) ? a->io.sync(a->io.context,direction,cpu,bytes) : MG_UNBACKED; }
++{
++    /* Cache maintenance only accesses retained CPU RAM. Submission/progress/
++     * retirement validate the hardware at their boundaries; validating every
++     * BO here used to reread all three SMMU domains per buffer. */
++    struct mg_accel *a = p;
++    return a->io.sync(a->io.context,direction,cpu,bytes);
++}
 +static size_t rounded(size_t bytes) { return (bytes+MG_MEMORY_PAGE-1) & ~(size_t)(MG_MEMORY_PAGE-1); }
 +static int allocate(struct mg_accel *a, size_t bytes, struct mg_accel_block **out)
 +{
@@ -1991,7 +2070,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_gem.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,48 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_GEM_H
 +#define METROID_GPU_GEM_H
@@ -2032,6 +2111,10 @@
 +/* Last HakiosGPU open attempt (process, pid, uid, result) for the on-screen
 + * status line; empty until a process tries to open the service. */
 +size_t metroid_gpu_gem_open_status(char *, size_t);
++/* A retained SweetSurface must remain alive between successful begin/end.
++ * Failed begin leaves the previous panel contents visible. */
++bool metroid_gpu_surface_begin_read(void *);
++void metroid_gpu_surface_end_read(void *);
 +#ifdef __cplusplus
 +}
 +#endif
@@ -2966,7 +3049,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_platform.c
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,338 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * XNU adapter for the retained GMU owner. No inherited bandwidth assumption.
 + * Register sequences: Nothing 031e8669, gpucc-tuna.c/adreno_gen8.c.
@@ -3151,7 +3234,9 @@
 +static int synchronize(void *p, enum mg_gpu_sync direction, const void *cpu, size_t bytes)
 +{
 +    (void)p;
-+    if (!cpu || !bytes || bytes > UINTPTR_MAX-(uintptr_t)cpu || !accelerator_powered(NULL)) return MG_UNBACKED;
++    /* No GPU MMIO here: these are CPU cache operations on pinned backing.
++     * The backend checks execution readiness before/after the cache batch. */
++    if (!cpu || !bytes || bytes > UINTPTR_MAX-(uintptr_t)cpu) return MG_UNBACKED;
 +    if (direction == MG_GPU_TO_DEVICE) { publish(NULL,cpu,bytes); return MG_OK; }
 +    if (direction != MG_GPU_TO_CPU) return MG_INVALID;
 +    uint64_t ctr;
@@ -5598,7 +5683,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_submit.c
-@@ -0,0 +1,425 @@
+@@ -0,0 +1,428 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Gen8.6.0 HFI submission backend. Wire contracts follow NothingOSS
 + * 031e8669eb198d93e69532b01af973a1c2a82710 graphics-kernel:
@@ -5802,6 +5887,9 @@
 +     * a full-system barrier before the doorbell. */
 +    if (drain && (ret = b->io.sync(b->io.context, MG_GPU_TO_DEVICE, drain->cpu, 4)))
 +        return poison(b, ret);
++    /* Hardware can fault while a large CPU cache batch runs. Check once more
++     * before exposing commands, rather than once for every buffer. */
++    ret = health(b); if (ret) return ret;
 +    unsigned words = 8 + 3 * job->ib_count;
 +    ret = mg_hfi_message(ISSUE, 0, (++b->issue_sequence) & 4095, words, packet);
 +    if (ret) return poison(b, ret);
