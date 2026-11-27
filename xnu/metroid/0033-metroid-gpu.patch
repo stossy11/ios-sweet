@@ -318,7 +318,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/MetroidGEM.cpp
-@@ -0,0 +1,509 @@
+@@ -0,0 +1,573 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * HakiOS/MSM DRM 1.7 wire interface for the Metroid Gen8 backend.
 + * ABI reference: HakiOS62e09f85 BoardGPU.cpp and Linux uapi/drm/msm_drm.h.
@@ -362,13 +362,18 @@
 +struct gem_close { uint32_t handle, pad; };
 +struct gem_queue { uint32_t flags, priority, id; };
 +struct gem_madvise { uint32_t handle, advice, retained; };
++struct gem_query { uint64_t data; uint32_t param, id, len, pad; };
 +static_assert(sizeof(gem_param) == 24 && sizeof(gem_new) == 16 &&
 +    sizeof(gem_info) == 24 && sizeof(gem_submit) == 72 &&
 +    sizeof(gem_cmd) == 32 && sizeof(gem_surface) == 40 && sizeof(gem_wait) == 32,"MSM/HakiOS ABI");
 +
-+#define GEM_SLOTS 512u
-+#define GEM_CLIENT_BYTES (128u * 1024u * 1024u)
-+#define GEM_MAX_BYTES (64u * 1024u * 1024u)
++/* HakiOS: 8192 handles, 256 MB buffers, no client total. CoreAnimation
++ * imports many full-screen IOSurfaces, which count against the total. */
++#define GEM_SLOTS 4096u
++#define GEM_INDEX_BITS 13u
++#define GEM_CLIENT_BYTES (1024ull * 1024u * 1024u)
++#define GEM_MAX_BYTES (256u * 1024u * 1024u)
++#define GEM_IB_MAX_BYTES (0xfffffu * 4u) /* CP_INDIRECT_BUFFER: 20-bit dwords */
 +#define GEM_READONLY 2u
 +extern "C" void metroid_gpu_metal_ready(void);
 +static mg_gem_ops ops;
@@ -379,7 +384,17 @@
 +/* Why the last submission was refused, shown as rej=<reason>:<value>. */
 +static uint32_t gem_reject_reason, gem_reject_value;
 +enum { REJ_PENDING = 1, REJ_BOS, REJ_CMDS, REJ_FLAGS, REJ_QUEUE, REJ_SYNC, REJ_PAD,
-+    REJ_BO, REJ_BO_FLAGS, REJ_BO_DUP, REJ_CMD, REJ_NO_IB, REJ_BO_IOVA };
++    REJ_BO, REJ_BO_FLAGS, REJ_BO_DUP, REJ_CMD, REJ_NO_IB, REJ_BO_IOVA,
++    REJ_IOCTL /* stub only: value is the selector */ };
++/* A refused field that is safe to ignore or work around is stubbed instead,
++ * and the last such case shown as stub=<count>/<reason>:<value>. */
++static uint32_t gem_stub_count, gem_stub_reason, gem_stub_value;
++static void stub(uint32_t reason, uint32_t value)
++{
++    __atomic_store_n(&gem_stub_value,value,__ATOMIC_RELAXED);
++    __atomic_store_n(&gem_stub_reason,reason,__ATOMIC_RELAXED);
++    __atomic_fetch_add(&gem_stub_count,1,__ATOMIC_RELAXED);
++}
 +static IOReturn reject(uint32_t reason, uint32_t value)
 +{
 +    __atomic_store_n(&gem_reject_value,value,__ATOMIC_RELAXED);
@@ -437,7 +452,7 @@
 +OSDefineMetaClassAndStructors(HakiosGPUUserClient, IOUserClient);
 +gem_buffer *HakiosGPUUserClient::lookup(uint32_t handle)
 +{
-+    unsigned index = handle & 1023u;
++    unsigned index = handle & ((1u << GEM_INDEX_BITS) - 1);
 +    if (!index || index > GEM_SLOTS || !buffers) return nullptr;
 +    gem_buffer *b = &buffers[index-1];
 +    return b->memory && b->handle == handle ? b : nullptr;
@@ -502,7 +517,7 @@
 +        (flags & ~GEM_READONLY) || job_pending) return kIOReturnBadArgument;
 +    unsigned index;
 +    for (index = 0; index < GEM_SLOTS; index++) if (!buffers[index].memory) break;
-+    if (index == GEM_SLOTS || generation == 0x3fffffu) return kIOReturnNoResources;
++    if (index == GEM_SLOTS || generation == (1u << (32 - GEM_INDEX_BITS)) - 1) return kIOReturnNoResources;
 +    if (memory->prepare() != kIOReturnSuccess) return kIOReturnVMError;
 +    auto mapping = memory->map();
 +    unsigned count = static_cast<unsigned>(bytes/4096);
@@ -524,7 +539,7 @@
 +    b.memory = memory; b.mapping = mapping; b.surface = s; b.pages = pages;
 +    b.cpu = reinterpret_cast<void *>(mapping->getVirtualAddress());
 +    b.bytes = bytes; b.page_count = count; b.flags = flags;
-+    b.handle = (++generation << 10) | (index+1);
++    b.handle = (++generation << GEM_INDEX_BITS) | (index+1);
 +    mg_gem_backing backing = {b.cpu,pages,count,bytes,
 +        static_cast<unsigned>(MG_GPU_READ | MG_GPU_EXEC | (flags & GEM_READONLY ? 0 : MG_GPU_WRITE))};
 +    int error = ops.map(ops.context,&backing,&b.address);
@@ -563,65 +578,89 @@
 +    /* As HakiOS BoardGPU::submit, which this Mesa shim was written against.
 +     * Submission is synchronous (retired before return): an input fence fd
 +     * names finished work and is ignored; an output fence fd is -1. No
-+     * syncobjs exist on this port, so their counts must be zero; the stride
-+     * and pointers Mesa always fills in are ignored. */
++     * syncobjs exist on this port; their counts, stride and pointers are
++     * ignored.
++     * Refused only where continuing could make the GPU touch memory it
++     * should not: a pending job, an unknown buffer, more than a job holds.
++     * Everything else is stubbed (ignored, merged or skipped) and noted. */
 +    if (job_pending) return reject(REJ_PENDING,0);
-+    if (!r->buffer_count || r->buffer_count > MG_GEN8_MAX_BUFFERS) return reject(REJ_BOS,r->buffer_count);
-+    if (!r->command_count || r->command_count > MG_GEN8_MAX_IBS) return reject(REJ_CMDS,r->command_count);
-+    if ((r->flags & ~GEM_SUBMIT_FLAGS) || (r->flags & 0xffffu) != 0x10) return reject(REJ_FLAGS,r->flags);
-+    if (r->queue != 1) return reject(REJ_QUEUE,r->queue);
-+    if (r->in_count || r->out_count) return reject(REJ_SYNC,r->in_count | (r->out_count << 16));
-+    if (r->pad) return reject(REJ_PAD,r->pad);
++    if (r->buffer_count > MG_GEN8_MAX_BUFFERS) return reject(REJ_BOS,r->buffer_count);
++    if (r->command_count > MG_GEN8_MAX_IBS) return reject(REJ_CMDS,r->command_count);
++    if ((r->flags & ~GEM_SUBMIT_FLAGS) || (r->flags & 0xffffu) != 0x10) stub(REJ_FLAGS,r->flags);
++    if (r->queue > 1) stub(REJ_QUEUE,r->queue); /* one hardware queue */
++    /* No syncobjs can be created here; submission retires before return. */
++    if (r->in_count || r->out_count) stub(REJ_SYNC,r->in_count | (r->out_count << 16));
++    if (r->pad) stub(REJ_PAD,r->pad);
++    if (!r->buffer_count || !r->command_count) {
++        /* Nothing to execute: already complete, as the last fence. */
++        stub(r->buffer_count ? REJ_CMDS : REJ_BOS,0);
++        r->fence = static_cast<uint32_t>(last_fence); r->fence_fd = -1;
++        return kIOReturnSuccess;
++    }
 +    auto bos = IONew(gem_bo,r->buffer_count);
 +    auto cmds = IONew(gem_cmd,r->command_count);
-+    if (!bos || !cmds) {
++    auto slot = IONew(uint32_t,r->buffer_count); /* request BO index -> job buffer */
++    if (!bos || !cmds || !slot) {
 +        if (bos) IODelete(bos,gem_bo,r->buffer_count);
 +        if (cmds) IODelete(cmds,gem_cmd,r->command_count);
++        if (slot) IODelete(slot,uint32_t,r->buffer_count);
 +        return kIOReturnNoMemory;
 +    }
 +    IOReturn ret = kIOReturnBadArgument;
 +    do {
 +        if (copyin(r->buffers,bos,r->buffer_count*sizeof(*bos)) ||
 +            copyin(r->commands,cmds,r->command_count*sizeof(*cmds))) { ret = kIOReturnVMError; break; }
-+        *job = {}; job->buffer_count = r->buffer_count; job->ib_count = r->command_count;
++        *job = {};
 +        bool valid = true;
++        unsigned count = 0;
 +        for (unsigned i = 0; i < r->buffer_count; i++) {
 +            gem_buffer *b = lookup(bos[i].handle);
-+            /* MSM_SUBMIT_BO_DUMP is a diagnostic hint, emitted by Mesa for
-+             * command BOs. It does not add a GPU access permission. Neither
-+             * READ nor WRITE is taken as both, as HakiOS does. Mesa lists
-+             * GPU-readonly command BOs as READ|WRITE; as Linux msm, that is
-+             * not refused: the readonly mapping already denies GPU writes. */
-+            uint32_t access = bos[i].flags & 3 ? bos[i].flags & 3 : 3;
 +            if (!b) { ret = reject(REJ_BO,bos[i].handle); valid = false; break; }
-+            if (bos[i].flags & ~7u) { ret = reject(REJ_BO_FLAGS,bos[i].flags); valid = false; break; }
-+            if (b->flags & GEM_READONLY) access &= ~2u;
-+            if (bos[i].presumed && bos[i].presumed != b->address) {
-+                ret = reject(REJ_BO_IOVA,bos[i].handle); valid = false; break;
-+            }
-+            for (unsigned j = 0; j < i; j++) if (bos[i].handle == bos[j].handle) valid = false;
-+            if (!valid) { ret = reject(REJ_BO_DUP,bos[i].handle); break; }
-+            job->buffers[i] = {b->cpu,b->address,b->bytes,
-+                static_cast<unsigned>((access & 1 ? MG_GPU_READ : 0) | (access & 2 ? MG_GPU_WRITE : 0))};
++            /* MSM_SUBMIT_BO_DUMP is a diagnostic hint. Neither READ nor WRITE
++             * is taken as both, as HakiOS does. Mesa lists GPU-readonly
++             * command BOs as READ|WRITE: as Linux, not refused, the readonly
++             * mapping already denies GPU writes. Unknown bits are ignored. */
++            if (bos[i].flags & ~7u) stub(REJ_BO_FLAGS,bos[i].flags);
++            uint32_t access = bos[i].flags & 3 ? bos[i].flags & 3 : 3;
++            if (b->flags & GEM_READONLY) access = 1; /* write-only listing: read */
++            unsigned gpu = (access & 1 ? MG_GPU_READ : 0) | (access & 2 ? MG_GPU_WRITE : 0);
++            /* Softpin: the command stream already holds the address the
++             * kernel chose. Linux and HakiOS proceed on a stale presumed. */
++            if (bos[i].presumed && bos[i].presumed != b->address) stub(REJ_BO_IOVA,bos[i].handle);
++            /* Linux refuses a BO listed twice; merged instead. */
++            unsigned j;
++            for (j = 0; j < i && bos[j].handle != bos[i].handle; j++) {}
++            if (j < i) { stub(REJ_BO_DUP,bos[i].handle); slot[i] = slot[j]; job->buffers[slot[j]].access |= gpu; continue; }
++            slot[i] = count;
++            job->buffers[count++] = {b->cpu,b->address,b->bytes,gpu};
 +        }
 +        if (!valid) break;
++        job->buffer_count = count;
 +        unsigned ibs = 0;
 +        for (unsigned i = 0; i < r->command_count; i++) {
 +            const gem_cmd &c = cmds[i];
 +            /* Other kinds (IB target, context restore) are for a GPU shared
 +             * between address spaces; skipped, as HakiOS does. */
-+            if (c.type != 1) continue;
-+            if (c.index >= r->buffer_count || !c.bytes ||
-+                ((c.offset | c.bytes) & 3) || c.relocations || c.relocs || c.pad ||
-+                c.offset > job->buffers[c.index].bytes ||
-+                c.bytes > job->buffers[c.index].bytes-c.offset) {
-+                ret = reject(REJ_CMD,i); valid = false; break;
-+            }
-+            job->buffers[c.index].access |= MG_GPU_READ | MG_GPU_EXEC;
-+            job->ibs[ibs++] = {c.index,c.offset,c.bytes};
++            if (c.type != 1 || !c.bytes) continue; /* an empty IB fetches nothing */
++            /* Mesa leaves the relocs pointer uninitialized: ignored, as Linux
++             * and HakiOS. Relocations cannot apply to softpin addresses. */
++            if (c.relocations || c.pad) stub(REJ_CMD,(c.relocations ? 4 : 5) << 8 | i);
++            /* An IB that cannot be fetched from its own buffer is skipped:
++             * value is cause<<8 | command index. */
++            unsigned cause = c.index >= r->buffer_count ? 1 : c.bytes > GEM_IB_MAX_BYTES ? 2 :
++                ((c.offset | c.bytes) & 3) ? 3 : 0;
++            const mg_gen8_buffer *ib = cause ? nullptr : &job->buffers[slot[c.index]];
++            if (!cause && (c.offset > ib->bytes || c.bytes > ib->bytes-c.offset)) cause = 6;
++            if (cause) { stub(REJ_CMD,cause << 8 | i); continue; }
++            job->buffers[slot[c.index]].access |= MG_GPU_READ | MG_GPU_EXEC;
++            job->ibs[ibs++] = {slot[c.index],c.offset,c.bytes};
 +        }
-+        if (!valid) break;
-+        if (!ibs) { ret = reject(REJ_NO_IB,r->command_count); break; }
++        if (!ibs) {
++            /* Nothing for this GPU: complete, as the last fence. */
++            stub(REJ_NO_IB,r->command_count);
++            r->fence = static_cast<uint32_t>(last_fence); r->fence_fd = -1;
++            ret = kIOReturnSuccess; break;
++        }
 +        job->ib_count = ibs;
 +        uint64_t fence = 0;
 +        int error = ops.submit(ops.context,job,&fence);
@@ -639,6 +678,7 @@
 +        if (!error) { r->fence = static_cast<uint32_t>(fence); r->fence_fd = -1; }
 +    } while (false);
 +    IODelete(bos,gem_bo,r->buffer_count); IODelete(cmds,gem_cmd,r->command_count);
++    IODelete(slot,uint32_t,r->buffer_count);
 +    return ret;
 +}
 +IOReturn HakiosGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
@@ -657,7 +697,7 @@
 +{
 +    union request { gem_param param; gem_new create; gem_info info; gem_prep prep;
 +        gem_wait wait; gem_submit submit; gem_surface surface; gem_close close;
-+        gem_queue queue; gem_madvise advice; } r = {};
++        gem_queue queue; gem_madvise advice; gem_query query; } r = {};
 +    size_t bytes;
 +    switch (selector) {
 +    case 0x40: case 0x41: bytes = sizeof(r.param); break;
@@ -670,6 +710,7 @@
 +    case 0x48: bytes = sizeof(r.advice); break;
 +    case 0x4a: bytes = sizeof(r.queue); break;
 +    case 0x4b: bytes = 4; break;
++    case 0x4c: bytes = sizeof(r.query); break;
 +    case 0x09: bytes = sizeof(r.close); break;
 +    case 0x7e: bytes = sizeof(r.surface); break;
 +    default: return kIOReturnUnsupported;
@@ -683,13 +724,15 @@
 +    if (closed || isInactive() || !metroid_gpu_gem_ready()) ret = kIOReturnNotReady;
 +    else switch (selector) {
 +    case 0x40:
-+        if (r.param.pipe != 0x10 || r.param.len || r.param.pad ||
-+            !ops.parameter(ops.context,r.param.param,&r.param.value)) ret = kIOReturnUnsupported;
++        /* Unknown parameters stay EINVAL: Mesa probes optional ones. */
++        if (r.param.pipe != 0x10 || r.param.len || r.param.pad) stub(REJ_IOCTL,selector);
++        if (!ops.parameter(ops.context,r.param.param,&r.param.value)) ret = kIOReturnBadArgument;
 +        break;
 +    case 0x41: break; /* optional diagnostic process name */
 +    case 0x42: {
-+        if (!r.create.bytes || r.create.bytes > GEM_MAX_BYTES ||
-+            (r.create.flags & ~(GEM_READONLY | 0xf0000u | 1u | 4u))) { ret = kIOReturnBadArgument; break; }
++        if (!r.create.bytes || r.create.bytes > GEM_MAX_BYTES) { ret = kIOReturnBadArgument; break; }
++        /* Only GPU_READONLY changes the buffer; other flags are hints. */
++        if (r.create.flags & ~(GEM_READONLY | 0xf0000u | 1u | 4u)) stub(REJ_IOCTL,selector);
 +        size_t capacity = static_cast<size_t>((r.create.bytes+PAGE_MASK) & ~(uint64_t)PAGE_MASK);
 +        auto memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
 +            kIODirectionInOut | kIOMemoryMapperNone | kIOMemoryKernelUserShared | kIOMapWriteCombineCache,
@@ -702,7 +745,8 @@
 +    }
 +    case 0x43: {
 +        gem_buffer *b = lookup(r.info.handle);
-+        if (!b || r.info.pad) ret = kIOReturnBadArgument;
++        if (b && r.info.pad) stub(REJ_IOCTL,selector);
++        if (!b) ret = kIOReturnBadArgument;
 +        else if (r.info.info == 0) r.info.value = b->handle;
 +        else if (r.info.info == 1) r.info.value = b->address;
 +        else if (r.info.info == 2) { /* advisory debugger name; not retained or dereferenced */ }
@@ -712,24 +756,42 @@
 +    }
 +    case 0x44: {
 +        gem_buffer *b = lookup(r.prep.handle);
-+        ret = b ? result(b->fence ? ops.wait(ops.context,b->fence,MG_QUEUE_MAX_WAIT_US) : MG_OK) : kIOReturnBadArgument;
++        /* An unknown handle has no GPU work outstanding. */
++        if (!b) stub(REJ_IOCTL,selector);
++        else if (b->fence) ret = result(ops.wait(ops.context,b->fence,MG_QUEUE_MAX_WAIT_US));
 +        break;
 +    }
 +    case 0x45: break; /* synchronous submit owns cache transitions */
 +    case 0x46: ret = submit(&r.submit); break;
 +    case 0x47:
-+        ret = (!r.wait.fence || r.wait.fence > last_fence || r.wait.flags || r.wait.queue != 1) ?
-+            kIOReturnBadArgument : result(ops.wait(ops.context,r.wait.fence,MG_QUEUE_MAX_WAIT_US));
++        /* As Linux: fence 0 is already signalled, MSM_WAIT_FENCE_BOOST (1) is a
++         * hint, queue 0 is the default queue. A never-issued fence is refused. */
++        if ((r.wait.flags & ~1u) || r.wait.queue > 1) stub(REJ_IOCTL,selector);
++        if (r.wait.fence > last_fence) ret = kIOReturnBadArgument;
++        else if (r.wait.fence) ret = result(ops.wait(ops.context,r.wait.fence,MG_QUEUE_MAX_WAIT_US));
 +        if (!ret && r.wait.fence == last_fence) job_pending = false;
 +        break;
-+    case 0x48: if (!lookup(r.advice.handle)) ret = kIOReturnBadArgument; else r.advice.retained = 1; break;
++    case 0x48: if (!lookup(r.advice.handle)) stub(REJ_IOCTL,selector); r.advice.retained = 1; break;
 +    case 0x4a:
-+        if (r.queue.flags || r.queue.priority) ret = kIOReturnUnsupported; else r.queue.id = 1;
++        /* One hardware queue: ALLOW_PREEMPT (1) and the priority are hints. */
++        if (r.queue.flags & ~1u) stub(REJ_IOCTL,selector);
++        r.queue.id = 1;
 +        break;
-+    case 0x4b: if (r.close.handle != 1) ret = kIOReturnBadArgument; break;
++    case 0x4b: if (r.close.handle != 1) stub(REJ_IOCTL,selector); break;
++    case 0x4c: { /* MSM_SUBMITQUEUE_PARAM_FAULTS: none recorded */
++        uint64_t zero = 0;
++        if (r.query.id > 1 || r.query.pad) stub(REJ_IOCTL,selector);
++        if (r.query.param != 0) ret = kIOReturnBadArgument;
++        else if (r.query.data && r.query.len >= sizeof(zero) &&
++            copyout(&zero,r.query.data,sizeof(zero))) ret = kIOReturnVMError;
++        else r.query.len = sizeof(zero);
++        break;
++    }
 +    case 0x09: {
 +        gem_buffer *b = lookup(r.close.handle);
-+        ret = b && !r.close.pad ? (drop(b) ? kIOReturnSuccess : kIOReturnBusy) : kIOReturnBadArgument;
++        /* Closing an unknown handle frees nothing. */
++        if (!b || r.close.pad) stub(REJ_IOCTL,selector);
++        if (b && !drop(b)) ret = kIOReturnBusy;
 +        break;
 +    }
 +    case 0x7e: ret = surface(&r.surface); break;
@@ -780,10 +842,12 @@
 +    uint32_t c[3][2];
 +    for (unsigned i = 0; i < 3; i++) for (unsigned j = 0; j < 2; j++)
 +        c[i][j] = __atomic_load_n(&gem_counts[i][j],__ATOMIC_RELAXED);
-+    snprintf(out,bytes,"%s; GEM bo=%u/%u surf=%u/%u sub=%u/%u fail=%x:%x rej=%u:%x",open,
++    snprintf(out,bytes,"%s; GEM bo=%u/%u surf=%u/%u sub=%u/%u fail=%x:%x rej=%u:%x stub=%u/%u:%x",open,
 +        c[0][0],c[0][1],c[1][0],c[1][1],c[2][0],c[2][1],
 +        __atomic_load_n(&gem_fail_selector,__ATOMIC_RELAXED),__atomic_load_n(&gem_fail_result,__ATOMIC_RELAXED),
-+        __atomic_load_n(&gem_reject_reason,__ATOMIC_RELAXED),__atomic_load_n(&gem_reject_value,__ATOMIC_RELAXED));
++        __atomic_load_n(&gem_reject_reason,__ATOMIC_RELAXED),__atomic_load_n(&gem_reject_value,__ATOMIC_RELAXED),
++        __atomic_load_n(&gem_stub_count,__ATOMIC_RELAXED),__atomic_load_n(&gem_stub_reason,__ATOMIC_RELAXED),
++        __atomic_load_n(&gem_stub_value,__ATOMIC_RELAXED));
 +    return strlen(out);
 +}
 +IOReturn HakiosGPU::newUserClient(task_t task, void *security, UInt32 type,
@@ -2812,7 +2876,7 @@
 +    out[0] = 0;
 +    if (!__atomic_load_n(&platform.report_ready,__ATOMIC_ACQUIRE) || !platform.show_status) return false;
 +    /* A refused Metal open is otherwise invisible on screen; put it first. */
-+    char open[176];
++    char open[224];
 +    if (metroid_gpu_gem_open_status(open,sizeof(open))) {
 +        strlcpy(out,open,bytes);
 +        strlcat(out,"; ",bytes);
@@ -3847,7 +3911,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_render.c
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,192 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_render.h"
 +#ifdef MG_HOST_TEST
@@ -3855,6 +3919,7 @@
 +#else
 +#include <libkern/libkern.h>
 +#endif
++#include <mach/mach_time.h>
 +#define VA_FIRST 0x10000000u
 +#define VA_END 0x50000000u
 +static bool running(struct mg_render *r)
@@ -3983,6 +4048,9 @@
 +    case 7: *value = 1; break;
 +    case 16: *value = 16; break;
 +    case 20: *value = 0x1fffffffff000ull; break; /* actual UCHE trap base */
++    case 5: *value = mach_absolute_time(); break; /* TIMESTAMP, as HakiOS */
++    case 18: *value = 6; break; /* UBWC_SWIZZLE, as HakiOS */
++    case 19: *value = 1; break; /* MACROTILE_MODE, as HakiOS */
 +    default: return false;
 +    }
 +    return true;

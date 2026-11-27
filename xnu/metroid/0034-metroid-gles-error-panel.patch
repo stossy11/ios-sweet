@@ -102,7 +102,7 @@
 +struct metroid_gles_panel {
 +    char renderer[96];
 +    char process[96];
-+    char gpu[256];
++    char gpu[320];
 +};
 +
 +static inline void
