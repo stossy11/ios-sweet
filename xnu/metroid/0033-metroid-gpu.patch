@@ -460,7 +460,7 @@
 +/* Waits up to `us` for a fence, polling the retirement timestamp with
 + * device_lock released so other clients keep submitting while the GPU works.
 + * Called and returns with device_lock held. MG_TIMEOUT if still pending. */
-+static int gem_wait(uint64_t fence, uint64_t us)
++static int gem_wait_fence(uint64_t fence, uint64_t us)
 +{
 +    uint64_t waited = 0;
 +    for (unsigned spin = 0;; spin++) {
@@ -483,7 +483,7 @@
 +    uint64_t fence = 0;
 +    for (unsigned i = 0; i < GEM_DRAWN; i++)
 +        if (gem_drawn[i].surface == surface) { fence = gem_drawn[i].fence; break; }
-+    if (fence && ops.ready(ops.context)) (void)gem_wait(fence,GEM_PRESENT_WAIT_US);
++    if (fence && ops.ready(ops.context)) (void)gem_wait_fence(fence,GEM_PRESENT_WAIT_US);
 +    IOLockUnlock(device_lock);
 +}
 +
@@ -566,7 +566,7 @@
 +    if (!closed) {
 +        closed = true;
 +        /* Let this client's queued work finish before unmapping it. */
-+        if (last_fence) (void)gem_wait(last_fence,GEM_WAIT_US);
++        if (last_fence) (void)gem_wait_fence(last_fence,GEM_WAIT_US);
 +        if (buffers) for (unsigned i = 0; i < GEM_SLOTS; i++) {
 +            if (buffers[i].memory && !drop(&buffers[i])) {
 +                /* Keep the metadata, descriptor and map alive too: the owner
@@ -844,7 +844,7 @@
 +         * only asks; a busy buffer is EBUSY, as Linux and HakiOS. */
 +        if (!b) { stub(REJ_IOCTL,selector); break; }
 +        if (b->fence) {
-+            int error = gem_wait(b->fence,(r.prep.op & 4) ? 0 :
++            int error = gem_wait_fence(b->fence,(r.prep.op & 4) ? 0 :
 +                gem_until_us(r.prep.timeout.seconds,r.prep.timeout.nanoseconds));
 +            ret = error == MG_TIMEOUT ? kIOReturnBusy : result(error);
 +        }
@@ -857,7 +857,7 @@
 +         * hint, queue 0 is the default queue. A never-issued fence is refused. */
 +        if ((r.wait.flags & ~1u) || r.wait.queue > 1) stub(REJ_IOCTL,selector);
 +        if (r.wait.fence > last_fence) ret = kIOReturnBadArgument;
-+        else if (r.wait.fence) ret = result(gem_wait(r.wait.fence,
++        else if (r.wait.fence) ret = result(gem_wait_fence(r.wait.fence,
 +            gem_until_us(r.wait.timeout.seconds,r.wait.timeout.nanoseconds)));
 +        break;
 +    case 0x48: if (!lookup(r.advice.handle)) stub(REJ_IOCTL,selector); r.advice.retained = 1; break;
@@ -880,7 +880,7 @@
 +        gem_buffer *b = lookup(r.close.handle);
 +        /* Linux defers freeing a busy BO; this waits for its work instead,
 +         * then looks the handle up again (the lock was dropped). */
-+        if (b && b->fence) { (void)gem_wait(b->fence,GEM_WAIT_US); b = lookup(r.close.handle); }
++        if (b && b->fence) { (void)gem_wait_fence(b->fence,GEM_WAIT_US); b = lookup(r.close.handle); }
 +        /* Closing an unknown handle frees nothing. */
 +        if (!b || r.close.pad) stub(REJ_IOCTL,selector);
 +        if (b && !drop(b)) ret = kIOReturnBusy;
