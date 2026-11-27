@@ -318,7 +318,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/MetroidGEM.cpp
-@@ -0,0 +1,573 @@
+@@ -0,0 +1,665 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * HakiOS/MSM DRM 1.7 wire interface for the Metroid Gen8 backend.
 + * ABI reference: HakiOS62e09f85 BoardGPU.cpp and Linux uapi/drm/msm_drm.h.
@@ -341,6 +341,7 @@
 +#include <sys/kauth.h>
 +#include "arm/SweetSurface.h"
 +#include "../../bsd/dev/metroid_gpu_gem.h"
++#include <mach/mach_time.h>
 +
 +struct gem_param { uint32_t pipe, param; uint64_t value; uint32_t len, pad; };
 +struct gem_new { uint64_t bytes; uint32_t flags, handle; };
@@ -404,6 +405,87 @@
 +/* MSM_PIPE_3D0, NO_IMPLICIT, FENCE_FD_IN/OUT, SYNCOBJ_IN/OUT (no syncobjs). */
 +#define GEM_SUBMIT_FLAGS (0x10u | 0x80000000u | 0x40000000u | 0x20000000u | 0x08000000u | 0x04000000u)
 +static unsigned installed;
++/* Longest a single wait blocks a caller (HakiOS GPU_PATIENCE_MS-style). */
++#define GEM_WAIT_US 2000000ull
++/* Longest the display waits for a surface's rendering before showing it. */
++#define GEM_PRESENT_WAIT_US 100000ull
++/* Submitted jobs belong to the backend until retirement (KGSL keeps many
++ * ISSUE_CMDs in flight per context). A pool avoids a 33 KB allocation per
++ * frame. Touched only under device_lock, which every ops call holds. */
++#define GEM_JOB_POOL (MG_QUEUE_DEPTH + 4u)
++static mg_gen8_job *gem_jobs[GEM_JOB_POOL];
++static unsigned gem_job_count;
++static void gem_job_release(mg_gen8_job *job)
++{
++    if (gem_job_count < GEM_JOB_POOL) gem_jobs[gem_job_count++] = job;
++    else IOFree(job,sizeof(*job));
++}
++static mg_gen8_job *gem_job_get(void)
++{
++    /* 33 KB with 1024 buffers: above the typed-kalloc 16 KB cap. */
++    mg_gen8_job *job = gem_job_count ? gem_jobs[--gem_job_count] :
++        static_cast<mg_gen8_job *>(IOMallocZero(sizeof(mg_gen8_job)));
++    if (job) {
++        job->buffer_count = job->ib_count = 0; job->end_of_frame = false;
++        job->release = gem_job_release;
++    }
++    return job;
++}
++/* The last submission writing each IOSurface, as HakiOS's surface->drawn:
++ * the framebuffer waits for it before putting the surface on the panel. */
++#define GEM_DRAWN 256u
++static struct { const void *surface; uint64_t fence; } gem_drawn[GEM_DRAWN];
++static void gem_mark_drawn(const void *surface, uint64_t fence)
++{
++    unsigned slot = 0;
++    for (unsigned i = 0; i < GEM_DRAWN; i++) {
++        if (gem_drawn[i].surface == surface) { slot = i; break; }
++        if (gem_drawn[i].fence < gem_drawn[slot].fence) slot = i; /* oldest: done */
++    }
++    gem_drawn[slot].surface = surface; gem_drawn[slot].fence = fence;
++}
++/* Microseconds until an msm absolute CLOCK_MONOTONIC deadline (Darwin:
++ * mach_continuous_time), capped; 0 for now or past, which only polls. */
++static uint64_t gem_until_us(int64_t seconds, int64_t nanoseconds)
++{
++    uint64_t now;
++    int64_t end;
++    absolutetime_to_nanoseconds(mach_continuous_time(),&now);
++    if (__builtin_mul_overflow(seconds,(int64_t)NSEC_PER_SEC,&end) ||
++        __builtin_add_overflow(end,nanoseconds,&end)) return seconds > 0 ? GEM_WAIT_US : 0;
++    if (end <= (int64_t)now) return 0;
++    uint64_t left = (uint64_t)(end - (int64_t)now) / NSEC_PER_USEC;
++    return left > GEM_WAIT_US ? GEM_WAIT_US : left;
++}
++/* Waits up to `us` for a fence, polling the retirement timestamp with
++ * device_lock released so other clients keep submitting while the GPU works.
++ * Called and returns with device_lock held. MG_TIMEOUT if still pending. */
++static int gem_wait(uint64_t fence, uint64_t us)
++{
++    uint64_t waited = 0;
++    for (unsigned spin = 0;; spin++) {
++        int error = ops.wait(ops.context,fence,0);
++        if (error != MG_TIMEOUT || waited >= us) return error;
++        IOLockUnlock(device_lock);
++        /* Short frames finish within a millisecond: spin briefly, then sleep. */
++        if (spin < 50) { IODelay(20); waited += 20; }
++        else { IOSleep(1); waited += 1000; }
++        IOLockLock(device_lock);
++    }
++}
++/* The framebuffer calls this before showing a surface: rendering into it
++ * that is still queued finishes first (HakiOS MiniIOSurfaceDrawn). On a
++ * timeout the surface is shown anyway, as HakiOS. Workloop context. */
++extern "C" void metroid_gpu_surface_wait(const void *surface)
++{
++    if (!surface || __atomic_load_n(&installed,__ATOMIC_ACQUIRE) != 2) return;
++    IOLockLock(device_lock);
++    uint64_t fence = 0;
++    for (unsigned i = 0; i < GEM_DRAWN; i++)
++        if (gem_drawn[i].surface == surface) { fence = gem_drawn[i].fence; break; }
++    if (fence && ops.ready(ops.context)) (void)gem_wait(fence,GEM_PRESENT_WAIT_US);
++    IOLockUnlock(device_lock);
++}
 +
 +extern "C" bool metroid_gpu_gem_ready(void)
 +{ return __atomic_load_n(&installed,__ATOMIC_ACQUIRE) == 2 && ops.ready(ops.context); }
@@ -433,10 +515,9 @@
 +class HakiosGPUUserClient : public IOUserClient {
 +    OSDeclareDefaultStructors(HakiosGPUUserClient);
 +    gem_buffer *buffers;
-+    mg_gen8_job *job;
 +    uint64_t wired, last_fence;
 +    uint32_t generation;
-+    bool closed, job_pending;
++    bool closed;
 +    gem_buffer *lookup(uint32_t);
 +    IOReturn add(IOMemoryDescriptor *, SweetSurface *, uint32_t, uint32_t *);
 +    bool drop(gem_buffer *);
@@ -461,9 +542,7 @@
 +{
 +    if (!metroid_gpu_gem_ready() || !IOUserClient::start(provider)) return false;
 +    buffers = IONewZero(gem_buffer,GEM_SLOTS);
-+    /* 33 KB with 1024 buffers: above the typed-kalloc 16 KB cap. */
-+    job = (mg_gen8_job *)IOMallocZero(sizeof(*job));
-+    return buffers && job;
++    return buffers != nullptr;
 +}
 +/* The descriptor and CPU mapping are retained even when a failed map might
 + * have posted a PTE. Refusing to free is deliberate DMA quarantine. */
@@ -486,7 +565,8 @@
 +    IOLockLock(device_lock);
 +    if (!closed) {
 +        closed = true;
-+        if (job_pending && !ops.wait(ops.context,last_fence,MG_QUEUE_MAX_WAIT_US)) job_pending = false;
++        /* Let this client's queued work finish before unmapping it. */
++        if (last_fence) (void)gem_wait(last_fence,GEM_WAIT_US);
 +        if (buffers) for (unsigned i = 0; i < GEM_SLOTS; i++) {
 +            if (buffers[i].memory && !drop(&buffers[i])) {
 +                /* Keep the metadata, descriptor and map alive too: the owner
@@ -506,7 +586,6 @@
 +    bool retained = false;
 +    if (buffers) for (unsigned i = 0; i < GEM_SLOTS; i++) retained |= buffers[i].memory != nullptr;
 +    if (!retained && buffers) IODelete(buffers,gem_buffer,GEM_SLOTS);
-+    if (!job_pending && job) IOFree(job,sizeof(*job));
 +    IOUserClient::free();
 +}
 +IOReturn HakiosGPUUserClient::add(IOMemoryDescriptor *memory, SweetSurface *s,
@@ -514,7 +593,7 @@
 +{
 +    size_t bytes = static_cast<size_t>(memory->getLength());
 +    if (!bytes || bytes > GEM_MAX_BYTES || (bytes & 4095) || bytes > GEM_CLIENT_BYTES-wired ||
-+        (flags & ~GEM_READONLY) || job_pending) return kIOReturnBadArgument;
++        (flags & ~GEM_READONLY)) return kIOReturnBadArgument;
 +    unsigned index;
 +    for (index = 0; index < GEM_SLOTS; index++) if (!buffers[index].memory) break;
 +    if (index == GEM_SLOTS || generation == (1u << (32 - GEM_INDEX_BITS)) - 1) return kIOReturnNoResources;
@@ -576,14 +655,14 @@
 +IOReturn HakiosGPUUserClient::submit(gem_submit *r)
 +{
 +    /* As HakiOS BoardGPU::submit, which this Mesa shim was written against.
-+     * Submission is synchronous (retired before return): an input fence fd
-+     * names finished work and is ignored; an output fence fd is -1. No
++     * Submission is asynchronous, as KGSL and Linux msm: the fence returned
++     * retires later and is waited on with WAIT_FENCE/CPU_PREP. An input
++     * fence fd is ignored (one in-order queue); an output fence fd is -1. No
 +     * syncobjs exist on this port; their counts, stride and pointers are
 +     * ignored.
 +     * Refused only where continuing could make the GPU touch memory it
-+     * should not: a pending job, an unknown buffer, more than a job holds.
++     * should not: an unknown buffer, more than a job holds.
 +     * Everything else is stubbed (ignored, merged or skipped) and noted. */
-+    if (job_pending) return reject(REJ_PENDING,0);
 +    if (r->buffer_count > MG_GEN8_MAX_BUFFERS) return reject(REJ_BOS,r->buffer_count);
 +    if (r->command_count > MG_GEN8_MAX_IBS) return reject(REJ_CMDS,r->command_count);
 +    if ((r->flags & ~GEM_SUBMIT_FLAGS) || (r->flags & 0xffffu) != 0x10) stub(REJ_FLAGS,r->flags);
@@ -600,17 +679,18 @@
 +    auto bos = IONew(gem_bo,r->buffer_count);
 +    auto cmds = IONew(gem_cmd,r->command_count);
 +    auto slot = IONew(uint32_t,r->buffer_count); /* request BO index -> job buffer */
-+    if (!bos || !cmds || !slot) {
++    mg_gen8_job *job = gem_job_get();
++    if (!bos || !cmds || !slot || !job) {
 +        if (bos) IODelete(bos,gem_bo,r->buffer_count);
 +        if (cmds) IODelete(cmds,gem_cmd,r->command_count);
 +        if (slot) IODelete(slot,uint32_t,r->buffer_count);
++        if (job) gem_job_release(job);
 +        return kIOReturnNoMemory;
 +    }
 +    IOReturn ret = kIOReturnBadArgument;
 +    do {
 +        if (copyin(r->buffers,bos,r->buffer_count*sizeof(*bos)) ||
 +            copyin(r->commands,cmds,r->command_count*sizeof(*cmds))) { ret = kIOReturnVMError; break; }
-+        *job = {};
 +        bool valid = true;
 +        unsigned count = 0;
 +        for (unsigned i = 0; i < r->buffer_count; i++) {
@@ -632,7 +712,8 @@
 +            for (j = 0; j < i && bos[j].handle != bos[i].handle; j++) {}
 +            if (j < i) { stub(REJ_BO_DUP,bos[i].handle); slot[i] = slot[j]; job->buffers[slot[j]].access |= gpu; continue; }
 +            slot[i] = count;
-+            job->buffers[count++] = {b->cpu,b->address,b->bytes,gpu};
++            /* GEM_NEW memory is write-combined; IOSurfaces may be cached. */
++            job->buffers[count++] = {b->cpu,b->address,b->bytes,gpu,b->surface == nullptr};
 +        }
 +        if (!valid) break;
 +        job->buffer_count = count;
@@ -665,18 +746,21 @@
 +        uint64_t fence = 0;
 +        int error = ops.submit(ops.context,job,&fence);
 +        if (fence) {
-+            last_fence = fence; job_pending = true;
-+            for (unsigned i = 0; i < r->buffer_count; i++) lookup(bos[i].handle)->fence = fence;
++            job = nullptr; /* the backend owns it until retirement */
++            last_fence = fence;
++            for (unsigned i = 0; i < r->buffer_count; i++) {
++                gem_buffer *g = lookup(bos[i].handle);
++                g->fence = fence;
++                /* As HakiOS: a surface written, or named with neither flag. */
++                if (g->surface && ((bos[i].flags & 2) || !(bos[i].flags & 3))) gem_mark_drawn(g->surface,fence);
++            }
 +        }
 +        if (error) { ret = result(error); break; }
 +        if (!fence || fence > UINT32_MAX) { ret = kIOReturnInternalError; break; }
-+        /* Deliberately synchronous bring-up: no buffer reuse or presentation
-+         * can outrun the real retirement/CPU-visibility proof. */
-+        error = ops.wait(ops.context,fence,MG_QUEUE_MAX_WAIT_US);
-+        if (!error) job_pending = false;
-+        ret = result(error);
-+        if (!error) { r->fence = static_cast<uint32_t>(fence); r->fence_fd = -1; }
++        r->fence = static_cast<uint32_t>(fence); r->fence_fd = -1;
++        ret = kIOReturnSuccess;
 +    } while (false);
++    if (job) gem_job_release(job);
 +    IODelete(bos,gem_bo,r->buffer_count); IODelete(cmds,gem_cmd,r->command_count);
 +    IODelete(slot,uint32_t,r->buffer_count);
 +    return ret;
@@ -756,20 +840,25 @@
 +    }
 +    case 0x44: {
 +        gem_buffer *b = lookup(r.prep.handle);
-+        /* An unknown handle has no GPU work outstanding. */
-+        if (!b) stub(REJ_IOCTL,selector);
-+        else if (b->fence) ret = result(ops.wait(ops.context,b->fence,MG_QUEUE_MAX_WAIT_US));
++        /* An unknown handle has no GPU work outstanding. MSM_PREP_NOSYNC (4)
++         * only asks; a busy buffer is EBUSY, as Linux and HakiOS. */
++        if (!b) { stub(REJ_IOCTL,selector); break; }
++        if (b->fence) {
++            int error = gem_wait(b->fence,(r.prep.op & 4) ? 0 :
++                gem_until_us(r.prep.timeout.seconds,r.prep.timeout.nanoseconds));
++            ret = error == MG_TIMEOUT ? kIOReturnBusy : result(error);
++        }
 +        break;
 +    }
-+    case 0x45: break; /* synchronous submit owns cache transitions */
++    case 0x45: break; /* retirement owns cache transitions */
 +    case 0x46: ret = submit(&r.submit); break;
 +    case 0x47:
 +        /* As Linux: fence 0 is already signalled, MSM_WAIT_FENCE_BOOST (1) is a
 +         * hint, queue 0 is the default queue. A never-issued fence is refused. */
 +        if ((r.wait.flags & ~1u) || r.wait.queue > 1) stub(REJ_IOCTL,selector);
 +        if (r.wait.fence > last_fence) ret = kIOReturnBadArgument;
-+        else if (r.wait.fence) ret = result(ops.wait(ops.context,r.wait.fence,MG_QUEUE_MAX_WAIT_US));
-+        if (!ret && r.wait.fence == last_fence) job_pending = false;
++        else if (r.wait.fence) ret = result(gem_wait(r.wait.fence,
++            gem_until_us(r.wait.timeout.seconds,r.wait.timeout.nanoseconds)));
 +        break;
 +    case 0x48: if (!lookup(r.advice.handle)) stub(REJ_IOCTL,selector); r.advice.retained = 1; break;
 +    case 0x4a:
@@ -789,6 +878,9 @@
 +    }
 +    case 0x09: {
 +        gem_buffer *b = lookup(r.close.handle);
++        /* Linux defers freeing a busy BO; this waits for its work instead,
++         * then looks the handle up again (the lock was dropped). */
++        if (b && b->fence) { (void)gem_wait(b->fence,GEM_WAIT_US); b = lookup(r.close.handle); }
 +        /* Closing an unknown handle frees nothing. */
 +        if (!b || r.close.pad) stub(REJ_IOCTL,selector);
 +        if (b && !drop(b)) ret = kIOReturnBusy;
@@ -1283,7 +1375,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_accel.c
-@@ -0,0 +1,365 @@
+@@ -0,0 +1,373 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_accel.h"
 +#ifdef MG_HOST_TEST
@@ -1303,7 +1395,14 @@
 +        a->live->domain.attached && a->io.powered(a->io.context) &&
 +        a->live->io.fabric_ready(a->live->io.context);
 +}
-+static bool idle(void *p) { return !((struct mg_accel *)p)->render.active; }
++/* GMU/secure tables change only at startup or a firmware request: the
++ * whole queue must be idle. */
++static bool idle(void *p)
++{ const struct mg_queue *q = &((struct mg_accel *)p)->backend.queue; return q->completed == q->issued; }
++/* Stream0 user mappings change with jobs in flight, as Linux msm: render
++ * unmaps only VA no in-flight job references, maps only fresh VA, and the
++ * VM invalidates the TLB after every change. */
++static bool guarded(void *p) { (void)p; return true; }
 +static bool domains(void *p)
 +{
 +    struct mg_accel *a = p;
@@ -1564,7 +1663,8 @@
 +        io->read(io->context,0x800+d->smr*4) == 0x80000000 && io->read(io->context,0xc00+d->smr*4) == cb &&
 +        io->read(io->context,b+0x20) == (uint32_t)ttbr && io->read(io->context,b+0x24) == (uint32_t)(ttbr >> 32);
 +}
-+static void retire(void *p, struct mg_gen8_job *job) { (void)p; (void)job; /* wait owns the persistent job */ }
++/* A job's owner frees or reuses it; the selftest job has no release. */
++static void retire(void *p, struct mg_gen8_job *job) { (void)p; if (job && job->release) job->release(job); }
 +static void *hfi_pointer(struct mg_accel *a)
 +{
 +    for (unsigned i = 0; i < a->live->memory.count; i++)
@@ -1587,9 +1687,9 @@
 +    if (!powered(a)) return poison(a,MG_UNBACKED);
 +    error = io->tables(io->context,a->performance,a->bandwidth); if (error) return poison(a,error);
 +    trace(a,"attach GPU stream0 and extend GMU mappings");
-+    error = live->io.memory.allocate(live->io.memory.context,MG_PT_MAX_PAGES*4096,&a->table);
++    error = live->io.memory.allocate(live->io.memory.context,MG_GPU_PT_PAGES*4096,&a->table);
 +    if (error) return poison(a,error);
-+    error = mg_vm_init(&a->gpu,a->table.cpu,a->table.pa,a->table.bytes,&live->io.smmu,a,powered,idle);
++    error = mg_vm_init(&a->gpu,a->table.cpu,a->table.pa,a->table.bytes,&live->io.smmu,a,powered,guarded);
 +    if (!error) error = mg_vm_attach(&a->gpu,0);
 +    /* SID1 (gfx3d_lpac) must reach the same bank before the SQE ever starts. */
 +    if (!error) error = mg_smmu_route_lpac(&a->gpu.io,&a->gpu.domain);
@@ -3670,11 +3770,18 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_queue.c
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,111 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_queue.h"
 +
 +#define MG_QUEUE_POLL_US 10u
++
++_Static_assert((MG_QUEUE_DEPTH & (MG_QUEUE_DEPTH - 1)) == 0, "queue depth");
++
++static bool usable(const struct mg_queue_io *io)
++{
++    return io && io->ready && io->dispatch && io->progress && io->retire && io->delay;
++}
 +
 +int
 +mg_queue_submit(struct mg_queue *queue, const struct mg_queue_io *io,
@@ -3683,22 +3790,26 @@
 +    if (!fence)
 +        return MG_INVALID;
 +    *fence = 0;
-+    if (!queue || !io || !io->ready || !io->dispatch || !io->complete ||
-+        !io->retire || !io->delay || !job)
++    if (!queue || !usable(io) || !job)
 +        return MG_INVALID;
 +    if (queue->quarantined)
 +        return MG_IO;
-+    if (queue->job)
-+        return MG_BUSY;
 +    if (queue->issued == UINT64_MAX)
 +        return MG_LIMIT;
++    if (queue->issued - queue->completed >= MG_QUEUE_DEPTH) {
++        int result = mg_queue_reap(queue, io);
++        if (result)
++            return result;
++        if (queue->issued - queue->completed >= MG_QUEUE_DEPTH)
++            return MG_BUSY;
++    }
 +    if (!io->ready(io->context))
 +        return MG_UNSUPPORTED;
 +
 +    /* Once dispatch begins, an error cannot prove the device missed the job. */
-+    queue->job = job;
 +    *fence = ++queue->issued;
-+    int result = io->dispatch(io->context, job, queue->issued);
++    queue->jobs[*fence % MG_QUEUE_DEPTH] = job;
++    int result = io->dispatch(io->context, job, *fence);
 +    if (result != MG_OK) {
 +        queue->quarantined = true;
 +        return result;
@@ -3707,11 +3818,42 @@
 +}
 +
 +int
++mg_queue_reap(struct mg_queue *queue, const struct mg_queue_io *io)
++{
++    if (!queue || !usable(io))
++        return MG_INVALID;
++    if (queue->quarantined)
++        return MG_IO;
++    if (queue->completed == queue->issued)
++        return MG_OK;
++    uint64_t done = 0;
++    int result = io->progress(io->context, &done);
++    if (result == MG_OK && (done < queue->completed || done > queue->issued))
++        result = MG_STALE;
++    if (result != MG_OK) {
++        queue->quarantined = true;
++        return result;
++    }
++    while (queue->completed < done) {
++        uint64_t fence = queue->completed + 1;
++        void **slot = &queue->jobs[fence % MG_QUEUE_DEPTH];
++        result = io->retire(io->context, *slot);
++        if (result != MG_OK) {
++            queue->quarantined = true;
++            return result;
++        }
++        *slot = NULL;
++        queue->completed = fence;
++    }
++    return MG_OK;
++}
++
++int
 +mg_queue_wait(struct mg_queue *queue, const struct mg_queue_io *io,
 +    uint64_t fence, unsigned timeout_us)
 +{
-+    if (!queue || !io || !io->complete || !io->retire || !io->delay ||
-+        !fence || fence > queue->issued || timeout_us > MG_QUEUE_MAX_WAIT_US)
++    if (!queue || !usable(io) || !fence || fence > queue->issued ||
++        timeout_us > MG_QUEUE_MAX_WAIT_US)
 +        return MG_INVALID;
 +    if (fence <= queue->completed)
 +        return MG_OK;
@@ -3719,17 +3861,11 @@
 +        return MG_IO;
 +
 +    for (;;) {
-+        int result = io->complete(io->context, fence);
-+        if (result == MG_OK) {
-+            io->retire(io->context, queue->job);
-+            queue->job = NULL;
-+            queue->completed = fence;
-+            return MG_OK;
-+        }
-+        if (result != MG_EMPTY) {
-+            queue->quarantined = true;
++        int result = mg_queue_reap(queue, io);
++        if (result != MG_OK)
 +            return result;
-+        }
++        if (fence <= queue->completed)
++            return MG_OK;
 +        /* Timeout leaves the job in flight. A later wait can still retire it. */
 +        if (!timeout_us)
 +            return MG_TIMEOUT;
@@ -3738,9 +3874,17 @@
 +        timeout_us -= delay;
 +    }
 +}
++
++void *
++mg_queue_job(const struct mg_queue *queue, uint64_t fence)
++{
++    if (!queue || fence <= queue->completed || fence > queue->issued)
++        return NULL;
++    return queue->jobs[fence % MG_QUEUE_DEPTH];
++}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_queue.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,52 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_QUEUE_H
 +#define METROID_GPU_QUEUE_H
@@ -3748,17 +3892,21 @@
 +#include "metroid_gpu.h"
 +
 +#define MG_QUEUE_MAX_WAIT_US 100000u
++/* Jobs in flight at once, as KGSL hwsched keeps many ISSUE_CMDs in one
++ * context queue and retires them by timestamp. Power of two. */
++#define MG_QUEUE_DEPTH 32u
 +
-+/* Single in-flight kernel job. Zero-initialize once per hardware lifetime.
-+ * The caller serializes submit/wait and uses the same immutable backend for
-+ * the life of the queue. Callbacks must never re-enter the queue. Jobs must be validated, pinned and retained before
-+ * submission. Once dispatch is called the queue owns that reference, even
-+ * on error. A nonzero output fence indicates that ownership transferred.
-+ * Quarantined jobs remain pinned until hardware DMA is drained.
-+ * This interface must only receive trusted kernel-generated jobs.
++/* In-order queue of in-flight kernel jobs. Zero-initialize once per hardware
++ * lifetime. The caller serializes every call and uses the same immutable
++ * backend for the life of the queue. Callbacks must never re-enter the queue.
++ * Jobs must be validated, pinned and retained before submission. Once
++ * dispatch is called the queue owns that reference, even on error. A
++ * nonzero output fence indicates that ownership transferred. Jobs retire
++ * strictly in fence order. Quarantined jobs remain pinned until hardware DMA
++ * is drained. This interface must only receive trusted kernel-generated jobs.
 + */
 +struct mg_queue {
-+    void *job;
++    void *jobs[MG_QUEUE_DEPTH]; /* fence f lives at jobs[f % MG_QUEUE_DEPTH] */
 +    uint64_t issued, completed;
 +    bool quarantined;
 +};
@@ -3768,18 +3916,25 @@
 +    bool (*ready)(void *);
 +    /* Publish command/data buffers, then enqueue with this fence value. */
 +    int (*dispatch)(void *, void *job, uint64_t fence);
-+    /* Nonblocking. MG_EMPTY if pending. MG_OK only after all job DMA is
-+     * complete and device writes are CPU-visible. Other results quarantine.
-+     */
-+    int (*complete)(void *, uint64_t fence);
-+    void (*retire)(void *, void *job);
++    /* Nonblocking. The highest fence whose DMA is complete, which must lie in
++     * [completed, issued]. Other results quarantine. */
++    int (*progress)(void *, uint64_t *done);
++    /* A completed job: make its device writes CPU-visible, then release it.
++     * Failure quarantines. */
++    int (*retire)(void *, void *job);
 +    void (*delay)(void *, unsigned microseconds);
 +};
 +
++/* MG_BUSY with a zero fence: MG_QUEUE_DEPTH jobs are in flight; wait for
++ * the oldest and retry. */
 +int mg_queue_submit(struct mg_queue *, const struct mg_queue_io *, void *job,
 +    uint64_t *fence);
++/* Nonblocking: retire every job the hardware has finished. */
++int mg_queue_reap(struct mg_queue *, const struct mg_queue_io *);
 +int mg_queue_wait(struct mg_queue *, const struct mg_queue_io *, uint64_t fence,
 +    unsigned timeout_us);
++/* The job of an in-flight fence, or NULL. */
++void *mg_queue_job(const struct mg_queue *, uint64_t fence);
 +
 +#endif
 --- /dev/null
@@ -3911,7 +4066,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_render.c
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,211 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_render.h"
 +#ifdef MG_HOST_TEST
@@ -3930,6 +4085,19 @@
 +static bool ready(void *p) { struct mg_render *r = p; return r->verified && running(r) &&
 +    r->backend->bound && r->backend->registered && !r->backend->closed; }
 +static int poison(struct mg_render *r, int error) { r->quarantined = true; return error; }
++/* Whether an in-flight job may still touch [address, address+bytes).
++ * Finished jobs are retired first, so only unfinished work counts. */
++static bool in_flight(struct mg_render *r, uint64_t address, size_t bytes)
++{
++    const struct mg_queue *q = &r->backend->queue;
++    for (uint64_t f = q->completed + 1; f <= q->issued; f++) {
++        const struct mg_gen8_job *job = mg_queue_job(q,f);
++        for (unsigned i = 0; job && i < job->buffer_count; i++)
++            if (job->buffers[i].gpu < address+bytes && address < job->buffers[i].gpu+job->buffers[i].bytes)
++                return true;
++    }
++    return false;
++}
 +static int map(void *p, const struct mg_gem_backing *b, uint64_t *address)
 +{
 +    struct mg_render *r = p;
@@ -3940,7 +4108,7 @@
 +        b->page_count != b->bytes/4096 || b->page_count > MG_VM_MAX_PAGES ||
 +        !(b->access & MG_GPU_READ) || (b->access & ~7u)) return MG_INVALID;
 +    if (!running(r)) return MG_UNBACKED;
-+    if (r->active) return MG_BUSY;
++    /* New VA never overlaps in-flight work: unmap waits for it to finish. */
 +    if (b->bytes > MG_RENDER_BYTES-r->allocated) return MG_LIMIT;
 +    unsigned slot;
 +    for (slot = 0; slot < MG_RENDER_BUFFERS; slot++) if (!r->mappings[slot].address) break;
@@ -3979,7 +4147,9 @@
 +{
 +    struct mg_render *r = p;
 +    if (!running(r)) return MG_UNBACKED;
-+    if (r->active) return MG_BUSY;
++    int busy = mg_gen8_reap(r->backend);
++    if (r->backend->quarantined) return poison(r,busy ? busy : MG_IO);
++    if (in_flight(r,address,bytes)) return MG_BUSY;
 +    for (unsigned i = 0; i < MG_RENDER_BUFFERS; i++) {
 +        struct mg_render_mapping *m = &r->mappings[i];
 +        if (m->address != address || m->backing.bytes != bytes) continue;
@@ -4015,13 +4185,17 @@
 +    if (!fence) return MG_INVALID;
 +    *fence = 0;
 +    if (!running(r) || !r->backend->registered) return MG_UNBACKED;
-+    if (r->active) return MG_BUSY;
-+    for (unsigned i = 0; job && i < job->buffer_count && i < MG_GEN8_MAX_BUFFERS; i++) {
-+        const struct mg_gen8_buffer *b = &job->buffers[i];
-+        if (!mg_render_mapped(r,b->cpu,b->gpu,b->bytes,b->access)) return MG_UNBACKED;
-+    }
++    /* Every buffer's pages are verified by validate_job via io.mapped. */
 +    int error = mg_gen8_submit(r->backend,job,fence);
-+    if (*fence) { r->active = job; r->fence = *fence; }
++    if (!*fence && (error == MG_BUSY || error == MG_FULL)) {
++        /* Queue or ring full: wait for the oldest job, then retry once. */
++        const struct mg_queue *q = &r->backend->queue;
++        if (q->completed < q->issued) {
++            int waited = mg_gen8_wait(r->backend,q->completed+1,MG_QUEUE_MAX_WAIT_US);
++            if (!waited) error = mg_gen8_submit(r->backend,job,fence);
++            else if (!r->backend->quarantined) error = waited;
++        }
++    }
 +    if (r->backend->quarantined) return poison(r,error ? error : MG_IO);
 +    return error;
 +}
@@ -4031,7 +4205,6 @@
 +    if (!running(r)) return MG_UNBACKED;
 +    if (!fence || fence > r->backend->queue.issued) return MG_INVALID;
 +    int error = mg_gen8_wait(r->backend,fence,us);
-+    if (!error && r->active && fence >= r->fence) r->active = NULL;
 +    if (r->backend->quarantined) return poison(r,error ? error : MG_IO);
 +    return error;
 +}
@@ -4076,7 +4249,8 @@
 +}
 +int mg_render_selftest(struct mg_render *r, uint32_t *commands, uint32_t *output)
 +{
-+    if (!r || !running(r) || r->verified || r->active || !commands || !output) return MG_INVALID;
++    if (!r || !running(r) || r->verified || r->backend->queue.completed != r->backend->queue.issued ||
++        !commands || !output) return MG_INVALID;
 +    const struct mg_render_mapping *cmd = NULL, *out = NULL;
 +    for (unsigned i = 0; i < MG_RENDER_BUFFERS; i++) {
 +        const struct mg_render_mapping *m = &r->mappings[i];
@@ -4094,8 +4268,8 @@
 +    commands[7] = packet7(0x26,0); /* CP_WAIT_FOR_IDLE */
 +    struct mg_gen8_job *job = &r->selftest_job;
 +    *job = (struct mg_gen8_job){.buffer_count = 2, .ib_count = 1};
-+    job->buffers[0] = (struct mg_gen8_buffer){commands,cmd->address,cmd->backing.bytes,MG_GPU_READ | MG_GPU_EXEC};
-+    job->buffers[1] = (struct mg_gen8_buffer){output,out->address,out->backing.bytes,MG_GPU_READ | MG_GPU_WRITE};
++    job->buffers[0] = (struct mg_gen8_buffer){commands,cmd->address,cmd->backing.bytes,MG_GPU_READ | MG_GPU_EXEC,false};
++    job->buffers[1] = (struct mg_gen8_buffer){output,out->address,out->backing.bytes,MG_GPU_READ | MG_GPU_WRITE,false};
 +    job->ibs[0] = (struct mg_gen8_ib){0,0,32};
 +    uint64_t fence = 0;
 +    int error = submit(r,job,&fence); if (error) return error;
@@ -4112,8 +4286,10 @@
 +#define METROID_GPU_RENDER_H
 +#include "metroid_gpu_gem.h"
 +#include "metroid_gpu_vm.h"
-+#define MG_RENDER_BUFFERS 512u
-+#define MG_RENDER_BYTES (96u * 1024u * 1024u)
++#define MG_RENDER_BUFFERS 4096u
++/* Shared by every client. 96 MB held ~20 full-screen surfaces, exhausted
++ * by backboardd + SpringBoard + one app. 768 MB = 384 leaf tables. */
++#define MG_RENDER_BYTES (768u * 1024u * 1024u)
 +struct mg_render_mapping {
 +    struct mg_gem_backing backing;
 +    uint32_t address;
@@ -4126,8 +4302,6 @@
 +    void *context;
 +    bool (*running)(void *); /* real scheduler/GX/SQE/AQE/ZAP owner */
 +    struct mg_gen8_job selftest_job;
-+    struct mg_gen8_job *active;
-+    uint64_t fence;
 +    size_t allocated;
 +    uint32_t frequency;
 +    bool initialized, verified, quarantined;
@@ -4841,7 +5015,7 @@
 +    t->used = 0;
 +    if (!t->memory || ((uintptr_t)t->memory & 4095) || (t->pa & 4095) ||
 +        !t->pa || !t->bytes || (t->bytes & 4095) ||
-+        t->bytes > MG_PT_MAX_PAGES * 4096u || t->pa >= (1ull << 48) ||
++        t->bytes > MG_PT_LIMIT_PAGES * 4096u || t->pa >= (1ull << 48) ||
 +        t->bytes > (1ull << 48) - t->pa || !r || !n || n > MG_DMA_MAX_RANGES)
 +        return MG_INVALID;
 +    bool middle[4] = {0}, leaf[2048] = {0};
@@ -4921,7 +5095,7 @@
 +{
 +    if ((stream != 0 && stream != 2 && stream != 5) || !s || !io || !io->read || !io->write || !io->write64 ||
 +        !io->delay || !io->publish || !t || !t->built || !t->memory ||
-+        !t->used || t->used > MG_PT_MAX_PAGES || t->used * 4096u > t->bytes)
++        !t->used || t->used > MG_PT_LIMIT_PAGES || t->used * 4096u > t->bytes)
 +        return MG_INVALID;
 +    if (s->attempted) return MG_BUSY;
 +    *s = (struct mg_smmu_domain){.attempted = true, .stream = stream};
@@ -5220,7 +5394,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_start.h
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,129 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_START_H
 +#define METROID_GPU_START_H
@@ -5241,6 +5415,10 @@
 +    void (*publish)(void *, const void *, size_t);
 +};
 +#define MG_PT_MAX_PAGES 64u
++/* The GPU's own stream0 table backs MG_RENDER_BYTES of VA: 2 MB a leaf,
++ * plus root and middles. Other tables keep MG_PT_MAX_PAGES. */
++#define MG_GPU_PT_PAGES 512u
++#define MG_PT_LIMIT_PAGES MG_GPU_PT_PAGES
 +#define MG_DMA_MAX_RANGES 64u
 +struct mg_dma_range { uint32_t iova, bytes; uint64_t pa; bool executable; };
 +struct mg_page_tables {
@@ -5348,7 +5526,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_submit.c
-@@ -0,0 +1,403 @@
+@@ -0,0 +1,425 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Gen8.6.0 HFI submission backend. Wire contracts follow NothingOSS
 + * 031e8669eb198d93e69532b01af973a1c2a82710 graphics-kernel:
@@ -5539,13 +5717,19 @@
 +    uint32_t packet[8 + 3 * MG_GEN8_MAX_IBS] = {0};
 +    if (fence > UINT32_MAX) return poison(b, MG_LIMIT);
 +    int ret = health(b); if (ret) return ret;
++    const struct mg_gen8_buffer *drain = NULL;
 +    for (unsigned i = 0; i < job->buffer_count; i++) {
 +        const struct mg_gen8_buffer *v = &job->buffers[i];
++        if (v->uncached) { drain = v; continue; }
 +        /* Publishing writes too prevents dirty CPU cache lines from later
 +         * overwriting GPU results. Caller must stop all CPU access in flight. */
 +        ret = b->io.sync(b->io.context, MG_GPU_TO_DEVICE, v->cpu, v->bytes);
 +        if (ret) return poison(b, ret);
 +    }
++    /* Write-combined stores need only draining: one line's publish ends in
++     * a full-system barrier before the doorbell. */
++    if (drain && (ret = b->io.sync(b->io.context, MG_GPU_TO_DEVICE, drain->cpu, 4)))
++        return poison(b, ret);
 +    unsigned words = 8 + 3 * job->ib_count;
 +    ret = mg_hfi_message(ISSUE, 0, (++b->issue_sequence) & 4095, words, packet);
 +    if (ret) return poison(b, ret);
@@ -5574,36 +5758,44 @@
 +    return MG_OK;
 +}
 +
-+static int complete(void *p, uint64_t fence)
++/* As KGSL hwsched: the context's EOP timestamp in GPU memory is the last
++ * retired submission; SOP is the last started. Both lie in [completed,
++ * issued] and SOP >= EOP, otherwise the timestamps are not ours. */
++static int progress(void *p, uint64_t *done)
 +{
 +    struct mg_gen8_backend *b = p;
-+    int ret = service(b); if (ret) return ret == MG_BUSY ? MG_EMPTY : ret;
-+    uint32_t r, w;
-+    ret = indices(b, &r, &w); if (ret) return poison(b, ret);
++    int ret = service(b);
++    /* Unread firmware messages may report a fault for these jobs: retire
++     * nothing until they are read. */
++    if (ret == MG_BUSY) { *done = b->queue.completed; return MG_OK; }
++    if (ret) return ret;
 +    ret = b->io.sync(b->io.context, MG_GPU_TO_CPU, (const void *)b->config.eop, 4);
 +    if (ret) return poison(b, ret);
 +    BARRIER(); uint32_t eop = *b->config.eop;
-+    if (eop > fence || eop < b->queue.completed) return poison(b, MG_STALE);
-+    if (eop != fence) return MG_EMPTY;
 +    ret = b->io.sync(b->io.context, MG_GPU_TO_CPU, (const void *)b->config.sop, 4);
 +    if (ret) return poison(b, ret);
-+    BARRIER();
-+    if (*b->config.sop != fence) return poison(b,MG_STALE);
-+    if (r != w) return MG_EMPTY;
-+    struct mg_gen8_job *job = b->queue.job;
++    BARRIER(); uint32_t sop = *b->config.sop;
++    if (eop < b->queue.completed || eop > b->queue.issued ||
++        sop < eop || sop > b->queue.issued) return poison(b, MG_STALE);
++    *done = eop;
++    return MG_OK;
++}
++static int retire(void *p, void *data)
++{
++    struct mg_gen8_backend *b = p;
++    struct mg_gen8_job *job = data;
 +    for (unsigned i = 0; i < job->buffer_count; i++) {
 +        const struct mg_gen8_buffer *v = &job->buffers[i];
-+        if (v->access & MG_GPU_WRITE) {
-+            ret = b->io.sync(b->io.context, MG_GPU_TO_CPU, v->cpu, v->bytes);
++        if ((v->access & MG_GPU_WRITE) && !v->uncached) {
++            int ret = b->io.sync(b->io.context, MG_GPU_TO_CPU, v->cpu, v->bytes);
 +            if (ret) return poison(b, ret);
 +        }
 +    }
-+    /* Check for a fault discovered while output cache ownership changed. */
-+    ret = service(b);
-+    return ret == MG_BUSY ? MG_EMPTY : ret;
++    /* A fault discovered while output cache ownership changed. */
++    int ret = service(b); if (ret && ret != MG_BUSY) return ret;
++    b->io.retire(b->io.context, job);
++    return MG_OK;
 +}
-+static void retire(void *p, void *job)
-+{ struct mg_gen8_backend *b = p; b->io.retire(b->io.context, job); }
 +static void wait_delay(void *p, unsigned us)
 +{ struct mg_gen8_backend *b = p; b->io.delay(b->io.context, us); }
 +
@@ -5655,7 +5847,7 @@
 +    volatile struct mg_gen8_context_header *h = c->context_memory;
 +    h->address = c->context_address + sizeof(*h); h->words = CONTEXT_WORDS;
 +    BARRIER();
-+    b->queue_io = (struct mg_queue_io){b,queue_ready,dispatch,complete,retire,wait_delay};
++    b->queue_io = (struct mg_queue_io){b,queue_ready,dispatch,progress,retire,wait_delay};
 +    b->bound = true;
 +    return MG_OK;
 +}
@@ -5719,13 +5911,21 @@
 +    if (!b || !b->bound) return MG_INVALID;
 +    if (b->quarantined) return MG_IO;
 +    if (!b->registered || b->closed) return MG_UNSUPPORTED;
-+    if (b->queue.job) return MG_BUSY;
 +    if (b->queue.issued >= UINT32_MAX) return MG_LIMIT; /* No timestamp reuse/wrap. */
 +    int ret = validate_job(b,job); if (ret) return ret;
 +    ret = service(b); if (ret) return ret;
 +    ret = room(b,8+3*job->ib_count);
 +    if (ret) return ret == MG_FULL ? ret : poison(b,ret);
 +    ret = mg_queue_submit(&b->queue,&b->queue_io,job,fence);
++    if (b->queue.quarantined) b->quarantined = true;
++    return ret;
++}
++
++int mg_gen8_reap(struct mg_gen8_backend *b)
++{
++    if (!b || !b->bound) return MG_INVALID;
++    if (b->quarantined) return MG_IO;
++    int ret = mg_queue_reap(&b->queue,&b->queue_io);
 +    if (b->queue.quarantined) b->quarantined = true;
 +    return ret;
 +}
@@ -5743,7 +5943,7 @@
 +{
 +    if (!b || !b->bound) return MG_INVALID;
 +    if (b->quarantined) return MG_IO;
-+    if (!b->registered || b->closed || b->queue.job) return MG_BUSY;
++    if (!b->registered || b->closed || b->queue.completed != b->queue.issued) return MG_BUSY;
 +    uint32_t r,w;
 +    int ret = indices(b,&r,&w); if (ret) return poison(b,ret);
 +    if (r != w) return MG_BUSY;
@@ -5754,7 +5954,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_submit.h
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,115 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_SUBMIT_H
 +#define METROID_GPU_SUBMIT_H
@@ -5769,11 +5969,16 @@
 +
 +enum mg_gpu_access { MG_GPU_READ = 1, MG_GPU_WRITE = 2, MG_GPU_EXEC = 4 };
 +enum mg_gpu_sync { MG_GPU_TO_DEVICE, MG_GPU_TO_CPU };
-+struct mg_gen8_buffer { void *cpu; uint64_t gpu; size_t bytes; unsigned access; };
++/* uncached: the CPU maps it write-combined/uncached, so no cache lines
++ * need publishing before or discarding after a job (ordering only). */
++struct mg_gen8_buffer { void *cpu; uint64_t gpu; size_t bytes; unsigned access; bool uncached; };
 +struct mg_gen8_ib { unsigned buffer; uint32_t offset, bytes; };
 +struct mg_gen8_job {
 +    unsigned buffer_count, ib_count;
 +    bool end_of_frame;
++    /* Called by the owner's retire() once the job completed, or never if the
++     * backend quarantines (the job then stays pinned with its DMA). */
++    void (*release)(struct mg_gen8_job *);
 +    struct mg_gen8_buffer buffers[MG_GEN8_MAX_BUFFERS];
 +    struct mg_gen8_ib ibs[MG_GEN8_MAX_IBS];
 +};
@@ -5843,7 +6048,7 @@
 +    bool bound, exposed, registered, closed, quarantined, ack_received;
 +};
 +
-+/* Dedicated single-context, single-in-flight-job backend. Consumes an
++/* Dedicated single-context backend with up to MG_QUEUE_DEPTH jobs in flight. Consumes an
 + * already-running Gen8 scheduler, never starts or claims to start it.
 + * Zero-initialize the backend once. init binds the existing HFI transport and prepares only the fresh context
 + * ring. It refuses nonempty startup queues and stale timestamps. All these
@@ -5856,6 +6061,8 @@
 + * A zero fence leaves that job reference with the caller. */
 +int mg_gen8_submit(struct mg_gen8_backend *, struct mg_gen8_job *, uint64_t *fence);
 +int mg_gen8_wait(struct mg_gen8_backend *, uint64_t fence, unsigned timeout_us);
++/* Nonblocking: retire every finished job. */
++int mg_gen8_reap(struct mg_gen8_backend *);
 +/* Requires no job in flight and a successful UNREGISTER_CONTEXT ACK.
 + * Does not stop the GPU, detach SMMUs or free global mappings. No reopen or
 + * reset recovery: a lost ACK/GMU fault quarantines until reboot/drained DMA.
@@ -5955,7 +6162,7 @@
 +    const struct mg_smmu_io *io, void *context, bool (*powered)(void *), bool (*idle)(void *))
 +{
 +    if (!v || !cpu || !pa || (((uintptr_t)cpu | pa | bytes) & 4095) ||
-+        bytes < MG_VM_PAGE || bytes > MG_PT_MAX_PAGES * MG_VM_PAGE ||
++        bytes < MG_VM_PAGE || bytes > MG_PT_LIMIT_PAGES * MG_VM_PAGE ||
 +        bytes > UINTPTR_MAX - (uintptr_t)cpu ||
 +        ((uintptr_t)cpu < (uintptr_t)v + sizeof(*v) &&
 +         (uintptr_t)v < (uintptr_t)cpu + bytes) ||
@@ -5984,15 +6191,15 @@
 +{
 +    if (!v || !t || !d || !io || !powered || !idle || !io->read || !io->write ||
 +        !io->write64 || !io->delay || !io->publish || !t->built || !t->memory ||
-+        !t->used || t->used > MG_PT_MAX_PAGES || t->used*4096ull > t->bytes ||
-+        t->bytes > MG_PT_MAX_PAGES*4096ull || (((uintptr_t)t->memory | t->pa | t->bytes) & 4095) ||
++        !t->used || t->used > MG_PT_LIMIT_PAGES || t->used*4096ull > t->bytes ||
++        t->bytes > MG_PT_LIMIT_PAGES*4096ull || (((uintptr_t)t->memory | t->pa | t->bytes) & 4095) ||
 +        !d->attached || d->quarantined || (d->stream != 0 && d->stream != 5)) return MG_INVALID;
 +    if (v->initialized || v->exposed) return MG_BUSY;
 +    v->tables = *t; v->domain = *d; v->io = *io;
 +    v->context = context; v->powered = powered; v->idle = idle;
 +    v->initialized = v->exposed = true;
 +    int error = owned(v); if (error) return error;
-+    bool visited[MG_PT_MAX_PAGES] = {true};
++    bool visited[MG_PT_LIMIT_PAGES] = {true};
 +    const uint64_t *root = t->memory;
 +    /* Existing GMU bootstrap uses only four root slots for a 32-bit space. */
 +    for (unsigned a = 0; a < 512; a++) {

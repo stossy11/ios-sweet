@@ -2,7 +2,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 index 47bb6c3..e2d98f3 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -82,12 +82,34 @@ extern "C" void sweet_fb_gles_process_exit(const char *name, int pid, int signal
+@@ -82,12 +82,35 @@ extern "C" void sweet_fb_gles_process_exit(const char *name, int pid, int signal
      snprintf(text, sizeof(text), "%s pid %d exited: signal %d status %d", name, pid, signal, status);
      gles_panel_record(1, text, strlen(text));
  }
@@ -15,6 +15,7 @@ index 47bb6c3..e2d98f3 100644
 + * SwapEnd calls / refusals: a frame reaches present() only through SwapEnd. */
 +static uint64_t sweet_fb_selectors_seen;
 +static uint32_t sweet_fb_swapend_calls, sweet_fb_swapend_refused;
++extern "C" void metroid_gpu_surface_wait(const void *surface);
  static void gles_panel_draw(uintptr_t pixels, uint32_t width, uint32_t height, uint32_t stride)
  {
      if (__atomic_exchange_n(&gles_panel_lock, 1u, __ATOMIC_ACQUIRE)) return;
@@ -37,7 +38,7 @@ index 47bb6c3..e2d98f3 100644
      metroid_gles_panel_draw(&snapshot, (volatile uint32_t *)pixels, width, height, stride, iso_font);
  }
  
-@@ -356,7 +378,43 @@ get32(const uint8_t *p, uint32_t off)
+@@ -356,7 +379,43 @@ get32(const uint8_t *p, uint32_t off)
  }
  
  static uint32_t sweet_fb_swaps_logged;
@@ -82,7 +83,7 @@ index 47bb6c3..e2d98f3 100644
  
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  /*
-@@ -393,6 +451,8 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -393,6 +452,8 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  	}
  
@@ -91,15 +92,17 @@ index 47bb6c3..e2d98f3 100644
  	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
  		uint32_t id = get32(rec, 0x54 + 4 * layer);
  		const uint8_t *a = rec + 0x64 + 16 * layer;
-@@ -413,6 +473,7 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -413,6 +474,9 @@ AppleCLCD::present(const uint8_t *rec)
  			    get32(a, 12), dx, dy, w, h);
  		}
++		/* Queued GPU rendering into the surface finishes first (HakiOS). */
++		if (s != NULL && s != fScanout) metroid_gpu_surface_wait(s);
  		if (s == NULL || s == fScanout) {
 +			sweet_fb_note_layer(layer, id, s, s ? "skip:scanout" : "skip:nosurf", 0, &skip_noted);
  			OSSafeReleaseNULL(s);
  			continue;
  		}
-@@ -425,6 +486,10 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -425,6 +489,10 @@ AppleCLCD::present(const uint8_t *rec)
  				    fWidth, fHeight, fRowBytes, (const uint8_t *)src, s->memory->getLength(),
  				    s->width, s->height, s->bytesPerRow, s->offset, fCanvasW, fCanvasH,
  				    sx, sy, dx, dy, w, h, fXMap, fScaledRow);
@@ -110,7 +113,7 @@ index 47bb6c3..e2d98f3 100644
  			}
  			s->release();
  			continue;
-@@ -463,6 +528,9 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -463,6 +531,9 @@ AppleCLCD::present(const uint8_t *rec)
  				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
  				    (size_t)w * 4);
  			}
@@ -120,7 +123,7 @@ index 47bb6c3..e2d98f3 100644
  		}
  		s->release();
  	}
-@@ -547,6 +615,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -547,6 +618,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  	uint64_t out[2] = { 0, 0 };
  	uint32_t outCount = 0;
  
@@ -130,7 +133,7 @@ index 47bb6c3..e2d98f3 100644
  	switch (selector) {
  	case kSweetFBGetLayerDefaultSurface:
  		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
-@@ -560,8 +631,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -560,8 +634,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  		break;
  	case kSweetFBSwapEnd: {
  		uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
