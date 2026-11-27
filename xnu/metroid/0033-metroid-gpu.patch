@@ -318,12 +318,14 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/MetroidGEM.cpp
-@@ -0,0 +1,456 @@
+@@ -0,0 +1,455 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * HakiOS/MSM DRM 1.7 wire interface for the Metroid Gen8 backend.
 + * ABI reference: HakiOS62e09f85 BoardGPU.cpp and Linux uapi/drm/msm_drm.h.
-+ * Bring-up is restricted to administrator clients: untrusted PM4 validation
-+ * and separate per-process GPU page tables are not implemented here.
++ * Any process may open it (the user removed the bring-up root-only check so
++ * backboardd, which runs as mobile, can use Metal). Untrusted PM4 validation
++ * and separate per-process GPU page tables are not implemented here: every
++ * client shares one GPU address space and can submit arbitrary commands.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <IOKit/IOService.h>
@@ -736,8 +738,6 @@
 +    if (!out) return kIOReturnBadArgument;
 +    *out = nullptr;
 +    if (type || !metroid_gpu_gem_ready()) { note_open(type ? "REFUSED (bad type)" : "REFUSED (GPU not ready)"); return kIOReturnNotReady; }
-+    IOReturn privilege = IOUserClient::clientHasPrivilege(security,kIOClientPrivilegeAdministrator);
-+    if (privilege) { note_open("REFUSED (root only)"); return privilege; }
 +    auto client = new HakiosGPUUserClient;
 +    if (!client) return kIOReturnNoMemory;
 +    if (!client->initWithTask(task,security,type,properties)) { client->release(); return kIOReturnError; }
@@ -767,7 +767,6 @@
 +    service->setName("HakiosGPU");
 +    service->setProperty("GPUChipID",MG_CHIP_ID,32);
 +    service->setProperty("SynchronousSubmission",true);
-+    service->setProperty("AdministratorClientsOnly",true);
 +    __atomic_store_n(&installed,2,__ATOMIC_RELEASE);
 +    service->registerService(); service->release();
 +    metroid_gpu_metal_ready();
