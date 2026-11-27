@@ -318,7 +318,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/MetroidGEM.cpp
-@@ -0,0 +1,455 @@
+@@ -0,0 +1,472 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * HakiOS/MSM DRM 1.7 wire interface for the Metroid Gen8 backend.
 + * ABI reference: HakiOS62e09f85 BoardGPU.cpp and Linux uapi/drm/msm_drm.h.
@@ -373,6 +373,9 @@
 +extern "C" void metroid_gpu_metal_ready(void);
 +static mg_gem_ops ops;
 +static IOLock *device_lock;
++/* On-screen pipeline counters (buffer create, IOSurface import, submit):
++ * [kind][0]=ok [kind][1]=failed, plus the last failing selector/IOReturn. */
++static uint32_t gem_counts[3][2], gem_fail_selector, gem_fail_result;
 +static unsigned installed;
 +
 +extern "C" bool metroid_gpu_gem_ready(void)
@@ -695,6 +698,12 @@
 +    }
 +    case 0x7e: ret = surface(&r.surface); break;
 +    }
++    int kind = selector == 0x42 ? 0 : selector == 0x7e ? 1 : selector == 0x46 ? 2 : -1;
++    if (kind >= 0) __atomic_fetch_add(&gem_counts[kind][ret ? 1 : 0],1,__ATOMIC_RELAXED);
++    if (ret) {
++        __atomic_store_n(&gem_fail_selector,selector,__ATOMIC_RELAXED);
++        __atomic_store_n(&gem_fail_result,static_cast<uint32_t>(ret),__ATOMIC_RELAXED);
++    }
 +    if (!ret) memcpy(a->structureOutput,&r,bytes);
 +    IOLockUnlock(device_lock);
 +    return ret;
@@ -727,9 +736,17 @@
 +    if (!out || !bytes) return 0;
 +    out[0] = 0;
 +    if (!gem_open_lock) return 0;
++    char open[sizeof(gem_open_status)];
 +    IOSimpleLockLock(gem_open_lock);
-+    strlcpy(out,gem_open_status,bytes);
++    strlcpy(open,gem_open_status,sizeof(open));
 +    IOSimpleLockUnlock(gem_open_lock);
++    if (!open[0]) return 0;
++    uint32_t c[3][2];
++    for (unsigned i = 0; i < 3; i++) for (unsigned j = 0; j < 2; j++)
++        c[i][j] = __atomic_load_n(&gem_counts[i][j],__ATOMIC_RELAXED);
++    snprintf(out,bytes,"%s; GEM bo=%u/%u surf=%u/%u sub=%u/%u fail=%x:%x",open,
++        c[0][0],c[0][1],c[1][0],c[1][1],c[2][0],c[2][1],
++        __atomic_load_n(&gem_fail_selector,__ATOMIC_RELAXED),__atomic_load_n(&gem_fail_result,__ATOMIC_RELAXED));
 +    return strlen(out);
 +}
 +IOReturn HakiosGPU::newUserClient(task_t task, void *security, UInt32 type,
@@ -2758,7 +2775,7 @@
 +    out[0] = 0;
 +    if (!__atomic_load_n(&platform.report_ready,__ATOMIC_ACQUIRE) || !platform.show_status) return false;
 +    /* A refused Metal open is otherwise invisible on screen; put it first. */
-+    char open[96];
++    char open[176];
 +    if (metroid_gpu_gem_open_status(open,sizeof(open))) {
 +        strlcpy(out,open,bytes);
 +        strlcat(out,"; ",bytes);
