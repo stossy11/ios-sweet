@@ -1,8 +1,8 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 47bb6c3..6f5e2ca 100644
+index 47bb6c3..e2d98f3 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -82,12 +82,24 @@ extern "C" void sweet_fb_gles_process_exit(const char *name, int pid, int signal
+@@ -82,12 +82,34 @@ extern "C" void sweet_fb_gles_process_exit(const char *name, int pid, int signal
      snprintf(text, sizeof(text), "%s pid %d exited: signal %d status %d", name, pid, signal, status);
      gles_panel_record(1, text, strlen(text));
  }
@@ -10,6 +10,11 @@ index 47bb6c3..6f5e2ca 100644
 + * which runs present() and then the panel draw. */
 +static char sweet_fb_present_detail[80];
 +static uint32_t sweet_fb_presents, sweet_fb_copied, sweet_fb_skipped;
++static uint64_t sweet_fb_swap_count;
++/* Which IOMobileFramebuffer selectors (< 64) any client has called, and
++ * SwapEnd calls / refusals: a frame reaches present() only through SwapEnd. */
++static uint64_t sweet_fb_selectors_seen;
++static uint32_t sweet_fb_swapend_calls, sweet_fb_swapend_refused;
  static void gles_panel_draw(uintptr_t pixels, uint32_t width, uint32_t height, uint32_t stride)
  {
      if (__atomic_exchange_n(&gles_panel_lock, 1u, __ATOMIC_ACQUIRE)) return;
@@ -18,19 +23,26 @@ index 47bb6c3..6f5e2ca 100644
      __atomic_store_n(&gles_panel_lock, 0u, __ATOMIC_RELEASE);
 +    /* The renderer line carries SoftGLES errors; otherwise show what the
 +     * framebuffer did with the latest swap (a skipped layer is silent). */
-+    if (!snapshot.renderer[0] && sweet_fb_present_detail[0]) {
++    if (!snapshot.renderer[0]) {
++        /* Always shown: "FB sw0" proves no client has swapped a frame yet. */
 +        char line[160];
-+        snprintf(line, sizeof(line), "FB p%u ok%u sk%u %s", sweet_fb_presents,
-+            sweet_fb_copied, sweet_fb_skipped, sweet_fb_present_detail);
++        snprintf(line, sizeof(line), "FB sel%llx se%u/%u sw%llu p%u ok%u sk%u %s",
++            __atomic_load_n(&sweet_fb_selectors_seen, __ATOMIC_RELAXED),
++            __atomic_load_n(&sweet_fb_swapend_calls, __ATOMIC_RELAXED),
++            __atomic_load_n(&sweet_fb_swapend_refused, __ATOMIC_RELAXED), sweet_fb_swap_count,
++            sweet_fb_presents, sweet_fb_copied, sweet_fb_skipped,
++            sweet_fb_present_detail[0] ? sweet_fb_present_detail : "no layer yet");
 +        metroid_gles_panel_store(&snapshot, 0, line, strlen(line));
 +    }
      metroid_gles_panel_draw(&snapshot, (volatile uint32_t *)pixels, width, height, stride, iso_font);
  }
  
-@@ -358,6 +370,43 @@ get32(const uint8_t *p, uint32_t off)
- static uint32_t sweet_fb_swaps_logged;
- static uint64_t sweet_fb_swap_count;
+@@ -356,7 +378,43 @@ get32(const uint8_t *p, uint32_t off)
+ }
  
+ static uint32_t sweet_fb_swaps_logged;
+-static uint64_t sweet_fb_swap_count;
++
 +/* One layer's outcome for the panel. A skip of this frame wins over a copy. */
 +static void
 +sweet_fb_note_layer(uint32_t layer, uint32_t id, const SweetSurface *s, const char *what,
@@ -67,11 +79,10 @@ index 47bb6c3..6f5e2ca 100644
 +	    s ? s->width : 0, s ? s->height : 0, s ? s->bytesPerElement : 0,
 +	    s ? s->elementWidth : 0, s ? s->elementHeight : 0, what, pixel);
 +}
-+
+ 
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  /*
-  * A swap only records the frame: copying 10 MB into the panel on every
-@@ -393,6 +442,8 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -393,6 +451,8 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  	}
  
@@ -80,7 +91,7 @@ index 47bb6c3..6f5e2ca 100644
  	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
  		uint32_t id = get32(rec, 0x54 + 4 * layer);
  		const uint8_t *a = rec + 0x64 + 16 * layer;
-@@ -413,6 +464,7 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -413,6 +473,7 @@ AppleCLCD::present(const uint8_t *rec)
  			    get32(a, 12), dx, dy, w, h);
  		}
  		if (s == NULL || s == fScanout) {
@@ -88,7 +99,7 @@ index 47bb6c3..6f5e2ca 100644
  			OSSafeReleaseNULL(s);
  			continue;
  		}
-@@ -425,6 +477,10 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -425,6 +486,10 @@ AppleCLCD::present(const uint8_t *rec)
  				    fWidth, fHeight, fRowBytes, (const uint8_t *)src, s->memory->getLength(),
  				    s->width, s->height, s->bytesPerRow, s->offset, fCanvasW, fCanvasH,
  				    sx, sy, dx, dy, w, h, fXMap, fScaledRow);
@@ -99,7 +110,7 @@ index 47bb6c3..6f5e2ca 100644
  			}
  			s->release();
  			continue;
-@@ -463,6 +519,9 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -463,6 +528,9 @@ AppleCLCD::present(const uint8_t *rec)
  				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
  				    (size_t)w * 4);
  			}
@@ -109,3 +120,73 @@ index 47bb6c3..6f5e2ca 100644
  		}
  		s->release();
  	}
+@@ -547,6 +615,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	uint64_t out[2] = { 0, 0 };
+ 	uint32_t outCount = 0;
+ 
++	if (selector < 64) {
++		__atomic_fetch_or(&sweet_fb_selectors_seen, 1ULL << selector, __ATOMIC_RELAXED);
++	}
+ 	switch (selector) {
+ 	case kSweetFBGetLayerDefaultSurface:
+ 		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
+@@ -560,8 +631,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		break;
+ 	case kSweetFBSwapEnd: {
+ 		uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
++		__atomic_fetch_add(&sweet_fb_swapend_calls, 1, __ATOMIC_RELAXED);
+ 		if (args->structureInputDescriptor != NULL ||
+ 		    args->structureInputSize < SWEET_FB_SWAP_REC_SIZE) {
++			__atomic_fetch_add(&sweet_fb_swapend_refused, 1, __ATOMIC_RELAXED);
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7938314..82c991a 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -325,20 +325,42 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	s->elementWidth = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementWidth", 1);
+ 	s->elementHeight = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementHeight", 1);
+ 	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
++	/*
++	 * HakiOS MiniIOSurface surfaceCreate: CoreAnimation's GPU renderer makes
++	 * the screen's surfaces 'b3a8' (ten-bit XR, alpha in its own plane), and
++	 * asks for 'w30r'/'l10r'/'w30R'/'&BGA' too. The panel and this driver are
++	 * 8-bit BGRA: make one plane of BGRA of the same geometry and say so (the
++	 * format is read back from the surface). Otherwise present skips them.
++	 */
++	bool flatten = false;
++	switch (s->pixelFormat) {
++	case 0x62336138: /* 'b3a8' */
++	case 0x77333072: /* 'w30r' */
++	case 0x6c313072: /* 'l10r' */
++	case 0x77333052: /* 'w30R' */
++	case 0x26424741: /* '&BGA' */
++		s->pixelFormat = 0x42475241; /* 'BGRA' */
++		flatten = true;
++		break;
++	}
+ 	s->cacheMode = sweet_dict_u32(props, "IOSurfaceCacheMode", 0);
+ 	s->offset = sweet_dict_u32(props, "IOSurfaceOffset", 0);
++	if (flatten) {
++		s->bytesPerElement = 4;
++		s->elementWidth = s->elementHeight = 1;
++	}
+ 	if (s->width > SWEET_SURFACE_MAX_DIM || s->height > SWEET_SURFACE_MAX_DIM ||
+ 	    s->bytesPerElement > 64 || s->elementWidth == 0 || s->elementHeight == 0) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow",
++	s->bytesPerRow = flatten ? sweet_row_bytes(s->width, 1, 4) : sweet_dict_u32(props, "IOSurfaceBytesPerRow",
+ 	    sweet_row_bytes(s->width, s->elementWidth, s->bytesPerElement));
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+-	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++	OSArray *planes = flatten ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+ 	s->planeCount = 0;
+ 	if (planes != NULL) {
+ 		uint64_t next = s->offset;
