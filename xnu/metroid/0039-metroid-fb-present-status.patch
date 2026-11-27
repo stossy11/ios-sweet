@@ -1,0 +1,111 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 47bb6c3..6f5e2ca 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -82,12 +82,24 @@ extern "C" void sweet_fb_gles_process_exit(const char *name, int pid, int signal
+     snprintf(text, sizeof(text), "%s pid %d exited: signal %d status %d", name, pid, signal, status);
+     gles_panel_record(1, text, strlen(text));
+ }
++/* Last present outcome (0039): written and read only on the vsync timer,
++ * which runs present() and then the panel draw. */
++static char sweet_fb_present_detail[80];
++static uint32_t sweet_fb_presents, sweet_fb_copied, sweet_fb_skipped;
+ static void gles_panel_draw(uintptr_t pixels, uint32_t width, uint32_t height, uint32_t stride)
+ {
+     if (__atomic_exchange_n(&gles_panel_lock, 1u, __ATOMIC_ACQUIRE)) return;
+     (void)metroid_gpu_copy_status(gles_panel.gpu, sizeof(gles_panel.gpu));
+     struct metroid_gles_panel snapshot = gles_panel;
+     __atomic_store_n(&gles_panel_lock, 0u, __ATOMIC_RELEASE);
++    /* The renderer line carries SoftGLES errors; otherwise show what the
++     * framebuffer did with the latest swap (a skipped layer is silent). */
++    if (!snapshot.renderer[0] && sweet_fb_present_detail[0]) {
++        char line[160];
++        snprintf(line, sizeof(line), "FB p%u ok%u sk%u %s", sweet_fb_presents,
++            sweet_fb_copied, sweet_fb_skipped, sweet_fb_present_detail);
++        metroid_gles_panel_store(&snapshot, 0, line, strlen(line));
++    }
+     metroid_gles_panel_draw(&snapshot, (volatile uint32_t *)pixels, width, height, stride, iso_font);
+ }
+ 
+@@ -358,6 +370,43 @@ get32(const uint8_t *p, uint32_t off)
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
++/* One layer's outcome for the panel. A skip of this frame wins over a copy. */
++static void
++sweet_fb_note_layer(uint32_t layer, uint32_t id, const SweetSurface *s, const char *what,
++    uintptr_t src, bool *skip_noted)
++{
++	bool skip = strcmp(what, "copy") != 0;
++	if (skip) {
++		sweet_fb_skipped++;
++	} else {
++		sweet_fb_copied++;
++	}
++	if (*skip_noted && !skip) {
++		return;
++	}
++	*skip_noted = *skip_noted || skip;
++	char fmt[5] = "----";
++	uint32_t pixel = 0;
++	if (s != NULL) {
++		for (unsigned i = 0; i < 4; i++) {
++			char c = (char)(s->pixelFormat >> (24 - 8 * i));
++			fmt[i] = c >= 32 && c <= 126 ? c : '?';
++		}
++		/* Centre pixel of the source, when it was copied (bounds already proven). */
++		if (!skip && src && s->memory && s->width && s->height) {
++			uint64_t at = (uint64_t)s->offset + (uint64_t)(s->height / 2) * s->bytesPerRow +
++			    (uint64_t)(s->width / 2) * 4;
++			if (at + 4 <= s->memory->getLength()) {
++				pixel = *(const volatile uint32_t *)(src + at);
++			}
++		}
++	}
++	snprintf(sweet_fb_present_detail, sizeof(sweet_fb_present_detail),
++	    "L%u s%u %s %ux%u b%u e%ux%u %s %08x", layer, id, fmt,
++	    s ? s->width : 0, s ? s->height : 0, s ? s->bytesPerElement : 0,
++	    s ? s->elementWidth : 0, s ? s->elementHeight : 0, what, pixel);
++}
++
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+  * A swap only records the frame: copying 10 MB into the panel on every
+@@ -393,6 +442,8 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
++	bool skip_noted = false;
++	sweet_fb_presents++;
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -413,6 +464,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
+ 		if (s == NULL || s == fScanout) {
++			sweet_fb_note_layer(layer, id, s, s ? "skip:scanout" : "skip:nosurf", 0, &skip_noted);
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+@@ -425,6 +477,10 @@ AppleCLCD::present(const uint8_t *rec)
+ 				    fWidth, fHeight, fRowBytes, (const uint8_t *)src, s->memory->getLength(),
+ 				    s->width, s->height, s->bytesPerRow, s->offset, fCanvasW, fCanvasH,
+ 				    sx, sy, dx, dy, w, h, fXMap, fScaledRow);
++				sweet_fb_note_layer(layer, id, s, "copy", src, &skip_noted);
++			} else {
++				sweet_fb_note_layer(layer, id, s, !src ? "skip:nomap" : !s->memory ? "skip:nomem" :
++				    s->pixelFormat != SWEET_FB_FORMAT_BGRA ? "skip:format" : "skip:layout", 0, &skip_noted);
+ 			}
+ 			s->release();
+ 			continue;
+@@ -463,6 +519,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
++			sweet_fb_note_layer(layer, id, s, "copy", src, &skip_noted);
++		} else {
++			sweet_fb_note_layer(layer, id, s, bpe != 4 ? "skip:bpe" : "skip:bounds", 0, &skip_noted);
+ 		}
+ 		s->release();
+ 	}
