@@ -4308,7 +4308,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_scheduler.c
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,267 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Nothing 031e8669 adreno_gen8_hwsched_hfi.c's cold, polling control path.
 + * No warmboot, IFPC, preemption, LPAC, HW fences or interrupt ownership.
@@ -4448,11 +4448,13 @@
 +    unsigned messages = 0;
 +    for (unsigned us = 0; us < TIMEOUT_US; us += POLL_US) {
 +        error = health(s); if (error) return error;
-+        /* Drain debug faults before accepting an ACK. Bounded flood handling
-+         * quarantines instead of hiding a fault behind an endless backlog. */
++        /* Drain debug faults before accepting an ACK. Each queue is read until
++         * empty: the GMU can log a burst at CORE_FW_START, and treating more
++         * than a poll's worth as a flood failed boot intermittently (err -2,
++         * sched 3). The 4096-message cap per exchange bounds a real flood. */
 +        for (unsigned queue = 0; queue < 2; queue++) {
 +            struct mg_hfi_queue *q = queue == 0 ? &s->debug : &s->message;
-+            for (unsigned budget = 0; budget < 32; budget++) {
++            for (;;) {
 +                uint32_t in[MG_SCHED_PACKET_WORDS];
 +                int words = mg_hfi_read(q,in,MG_SCHED_PACKET_WORDS);
 +                if (words == MG_EMPTY) break;
@@ -4480,7 +4482,6 @@
 +                    if (error) return poison(s,error);
 +                } else return poison(s,MG_INVALID);
 +            }
-+            if (q->header->read != q->header->write) return poison(s,MG_LIMIT);
 +        }
 +        if (acknowledged) {
 +            error = health(s); if (error) return error;
