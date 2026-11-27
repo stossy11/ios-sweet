@@ -45,7 +45,18 @@
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -256,6 +292,7 @@
+@@ -219,6 +257,10 @@
+ 				}
+ 			}
+ 		}
++		/* Keep the GPU/process status visible while the display is off: a
++		 * hung UI is often followed by backboardd turning the display off,
++		 * which would otherwise hide the counters that explain the hang. */
++		gles_panel_draw(fb->fPixels, fb->fWidth, fb->fHeight, fb->fRowBytes);
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
+@@ -256,6 +296,7 @@
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
  	}

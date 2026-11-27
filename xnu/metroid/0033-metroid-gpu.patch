@@ -318,7 +318,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/MetroidGEM.cpp
-@@ -0,0 +1,665 @@
+@@ -0,0 +1,677 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * HakiOS/MSM DRM 1.7 wire interface for the Metroid Gen8 backend.
 + * ABI reference: HakiOS62e09f85 BoardGPU.cpp and Linux uapi/drm/msm_drm.h.
@@ -460,12 +460,18 @@
 +/* Waits up to `us` for a fence, polling the retirement timestamp with
 + * device_lock released so other clients keep submitting while the GPU works.
 + * Called and returns with device_lock held. MG_TIMEOUT if still pending. */
++/* Fence waits that ran out their whole budget, shown as wt=. */
++static uint32_t gem_wait_timeouts;
 +static int gem_wait_fence(uint64_t fence, uint64_t us)
 +{
 +    uint64_t waited = 0;
 +    for (unsigned spin = 0;; spin++) {
 +        int error = ops.wait(ops.context,fence,0);
-+        if (error != MG_TIMEOUT || waited >= us) return error;
++        if (error != MG_TIMEOUT) return error;
++        if (waited >= us) {
++            if (us) __atomic_fetch_add(&gem_wait_timeouts,1,__ATOMIC_RELAXED);
++            return error;
++        }
 +        IOLockUnlock(device_lock);
 +        /* Short frames finish within a millisecond: spin briefly, then sleep. */
 +        if (spin < 50) { IODelay(20); waited += 20; }
@@ -934,12 +940,18 @@
 +    uint32_t c[3][2];
 +    for (unsigned i = 0; i < 3; i++) for (unsigned j = 0; j < 2; j++)
 +        c[i][j] = __atomic_load_n(&gem_counts[i][j],__ATOMIC_RELAXED);
-+    snprintf(out,bytes,"%s; GEM bo=%u/%u surf=%u/%u sub=%u/%u fail=%x:%x rej=%u:%x stub=%u/%u:%x",open,
++    snprintf(out,bytes,"%s; GEM bo=%u/%u surf=%u/%u sub=%u/%u fail=%x:%x rej=%u:%x stub=%u/%u:%x wt=%u",open,
 +        c[0][0],c[0][1],c[1][0],c[1][1],c[2][0],c[2][1],
 +        __atomic_load_n(&gem_fail_selector,__ATOMIC_RELAXED),__atomic_load_n(&gem_fail_result,__ATOMIC_RELAXED),
 +        __atomic_load_n(&gem_reject_reason,__ATOMIC_RELAXED),__atomic_load_n(&gem_reject_value,__ATOMIC_RELAXED),
 +        __atomic_load_n(&gem_stub_count,__ATOMIC_RELAXED),__atomic_load_n(&gem_stub_reason,__ATOMIC_RELAXED),
-+        __atomic_load_n(&gem_stub_value,__ATOMIC_RELAXED));
++        __atomic_load_n(&gem_stub_value,__ATOMIC_RELAXED),
++        __atomic_load_n(&gem_wait_timeouts,__ATOMIC_RELAXED));
++    size_t used = strlen(out);
++    if (__atomic_load_n(&installed,__ATOMIC_ACQUIRE) == 2 && ops.describe && used + 2 < bytes) {
++        strlcat(out,"; ",bytes); used += 2;
++        (void)ops.describe(ops.context,out + used,bytes - used);
++    }
 +    return strlen(out);
 +}
 +IOReturn HakiosGPU::newUserClient(task_t task, void *security, UInt32 type,
@@ -1948,7 +1960,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_gem.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,44 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_GEM_H
 +#define METROID_GPU_GEM_H
@@ -1977,6 +1989,9 @@
 +    int (*submit)(void *, struct mg_gen8_job *, uint64_t *fence);
 +    int (*wait)(void *, uint64_t fence, unsigned microseconds);
 +    bool (*parameter)(void *, uint32_t, uint64_t *);
++    /* Lock-free live queue/backend snapshot for the on-screen status line.
++     * Diagnostic only: fields may be momentarily inconsistent. Optional. */
++    size_t (*describe)(void *, char *, size_t);
 +};
 +#ifdef __cplusplus
 +extern "C" {
@@ -2976,7 +2991,7 @@
 +    out[0] = 0;
 +    if (!__atomic_load_n(&platform.report_ready,__ATOMIC_ACQUIRE) || !platform.show_status) return false;
 +    /* A refused Metal open is otherwise invisible on screen; put it first. */
-+    char open[224];
++    char open[288];
 +    if (metroid_gpu_gem_open_status(open,sizeof(open))) {
 +        strlcpy(out,open,bytes);
 +        strlcat(out,"; ",bytes);
@@ -4066,10 +4081,11 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_render.c
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,226 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_render.h"
 +#ifdef MG_HOST_TEST
++#include <stdio.h>
 +#include <string.h>
 +#else
 +#include <libkern/libkern.h>
@@ -4228,6 +4244,20 @@
 +    }
 +    return true;
 +}
++/* Q<completed>/<issued> fences, n<last RETIRED notification>, DEAD when the
++ * backend (or R when render) is quarantined, e<first error>, h<last firmware
++ * message header>, r<faulting register>=<value>. Read without the lock. */
++static size_t describe(void *p, char *out, size_t bytes)
++{
++    const struct mg_render *r = p;
++    const volatile struct mg_gen8_backend *b = r->backend;
++    if (!out || !bytes) return 0;
++    int n = snprintf(out,bytes,"Q%llu/%llu n%u%s e%d h%x r%x=%x",
++        (unsigned long long)b->queue.completed,(unsigned long long)b->queue.issued,
++        b->notified,b->quarantined ? " DEAD" : r->quarantined || r->vm->quarantined ? " RDEAD" : "",
++        b->last_error,b->last_message_header,b->fault_register,b->fault_value);
++    return n < 0 ? 0 : (size_t)n < bytes ? (size_t)n : bytes - 1;
++}
 +int mg_render_init(struct mg_render *r, struct mg_vm *vm, struct mg_gen8_backend *backend,
 +    void *context, bool (*proof)(void *), uint32_t frequency)
 +{
@@ -4236,7 +4266,7 @@
 +    if (r->initialized) return MG_BUSY;
 +    r->vm = vm; r->backend = backend; r->context = context;
 +    r->running = proof; r->frequency = frequency;
-+    r->ops = (struct mg_gem_ops){r,ready,map,unmap,submit,wait,parameter};
++    r->ops = (struct mg_gem_ops){r,ready,map,unmap,submit,wait,parameter,describe};
 +    r->initialized = true;
 +    return MG_OK;
 +}
