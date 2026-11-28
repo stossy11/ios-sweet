@@ -334,7 +334,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/MetroidGEM.cpp
-@@ -0,0 +1,764 @@
+@@ -0,0 +1,788 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * HakiOS/MSM DRM 1.7 wire interface for the Metroid Gen8 backend.
 + * ABI reference: HakiOS62e09f85 BoardGPU.cpp and Linux uapi/drm/msm_drm.h.
@@ -352,6 +352,7 @@
 +#include <IOKit/IOBufferMemoryDescriptor.h>
 +#include <IOKit/IOMultiMemoryDescriptor.h>
 +#include <IOKit/IOKitKeys.h>
++#include <pexpert/pexpert.h>
 +#include <kern/clock.h>
 +#include <sys/systm.h>
 +#include <sys/proc.h>
@@ -408,6 +409,11 @@
 +extern "C" void metroid_gpu_metal_ready(void);
 +static mg_gem_ops ops;
 +static IOLock *device_lock;
++/* metroidgpucached=0 maps IOSurface imports Normal-NC like GEM_NEW memory
++ * instead of IO-coherent WB. CPU cache maintenance at dispatch/retire does
++ * not depend on this, so either setting stays correct. Bisection knob for
++ * the lock-screen (PosterBoard) freeze; default keeps the vendor policy. */
++static bool gem_surface_cached = true;
 +/* On-screen pipeline counters (buffer create, IOSurface import, submit):
 + * [kind][0]=ok [kind][1]=failed, plus the last failing selector/IOReturn. */
 +static uint32_t gem_counts[3][2], gem_fail_selector, gem_fail_result;
@@ -577,6 +583,7 @@
 +    gem_buffer *buffers;
 +    uint64_t wired, last_fence;
 +    uint32_t generation;
++    unsigned space; /* own GPU address space + firmware context; 0 = shared */
 +    bool closed;
 +    gem_buffer *lookup(uint32_t);
 +    IOReturn add(IOMemoryDescriptor *, SweetSurface *, uint32_t, uint32_t *);
@@ -602,7 +609,18 @@
 +{
 +    if (!metroid_gpu_gem_ready() || !IOUserClient::start(provider)) return false;
 +    buffers = IONewZero(gem_buffer,GEM_SLOTS);
-+    return buffers != nullptr;
++    if (!buffers) return false;
++    /* start runs in the opening process: its name labels GPU faults. */
++    char name[24];
++    proc_selfname(name,sizeof(name));
++    IOLockLock(device_lock);
++    int error = ops.open ? ops.open(ops.context,name,&space) : MG_UNSUPPORTED;
++    IOLockUnlock(device_lock);
++    if (error) {
++        space = 0;
++        IOLog("METROID GEM: %s[%d] shares the kernel GPU context (open=%d)\n",name,proc_selfpid(),error);
++    }
++    return true;
 +}
 +/* The descriptor and CPU mapping are retained even when a failed map might
 + * have posted a PTE. Refusing to free is deliberate DMA quarantine. */
@@ -610,7 +628,7 @@
 +{
 +    if (!b->memory) return true;
 +    if ((b->fence && ops.wait(ops.context,b->fence,0)) ||
-+        ops.unmap(ops.context,b->address,b->bytes)) return false;
++        ops.unmap(ops.context,space,b->address,b->bytes)) return false;
 +    b->memory->complete();
 +    if (b->mapping) b->mapping->release();
 +    b->memory->release();
@@ -634,6 +652,9 @@
 +                IOLog("METROID GEM: retaining client backing after uncertain GPU access\n");
 +            }
 +        }
++        /* With anything retained the space stays closing; later opens retry. */
++        if (space && ops.close(ops.context,space))
++            IOLog("METROID GEM: GPU space %u kept until its work drains\n",space);
 +    }
 +    IOLockUnlock(device_lock);
 +    terminate();
@@ -682,8 +703,8 @@
 +    /* GEM_NEW memory is write-combined; an IOSurface's default map() is cached. */
 +    mg_gem_backing backing = {b.cpu,pages,count,bytes,
 +        static_cast<unsigned>(MG_GPU_READ | MG_GPU_EXEC | (flags & GEM_READONLY ? 0 : MG_GPU_WRITE)),
-+        s != nullptr};
-+    int error = ops.map(ops.context,&backing,&b.address);
++        s != nullptr && gem_surface_cached};
++    int error = ops.map(ops.context,space,&backing,&b.address);
 +    if (error && !b.address) {
 +        mapping->release(); IODelete(pages,uint64_t,count); memory->complete();
 +        return result(error);
@@ -845,7 +866,7 @@
 +        job->ib_count = ibs;
 +        uint64_t fence = 0;
 +        uint64_t began = gem_time_ns();
-+        int error = ops.submit(ops.context,job,&fence);
++        int error = ops.submit(ops.context,space,job,&fence);
 +        __atomic_fetch_add(&gem_submit_ns,gem_time_ns()-began,__ATOMIC_RELAXED);
 +        __atomic_fetch_add(&gem_submit_samples,1,__ATOMIC_RELAXED);
 +        if (fence) {
@@ -1074,11 +1095,14 @@
 +extern "C" int metroid_gpu_gem_install(const mg_gem_ops *owner)
 +{
 +    if (!gem_open_lock) gem_open_lock = IOSimpleLockAlloc();
-+    if (!owner || !owner->ready || !owner->map || !owner->unmap || !owner->submit ||
++    if (!owner || !owner->ready || !owner->open || !owner->close || !owner->map || !owner->unmap || !owner->submit ||
 +        !owner->wait || !owner->parameter || !owner->ready(owner->context)) return MG_UNBACKED;
 +    unsigned expected = 0;
 +    if (!__atomic_compare_exchange_n(&installed,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) return MG_BUSY;
 +    ops = *owner;
++    unsigned cached = 1;
++    if (PE_parse_boot_argn("metroidgpucached",&cached,sizeof(cached))) gem_surface_cached = cached != 0;
++    IOLog("METROID GEM: IOSurface GPU mappings %s\n",gem_surface_cached ? "IO-coherent WB" : "Normal-NC");
 +    device_lock = IOLockAlloc();
 +    IOService *provider = IOService::getPlatform();
 +    auto service = new HakiosGPU;
@@ -1494,7 +1518,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_accel.c
-@@ -0,0 +1,399 @@
+@@ -0,0 +1,503 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_accel.h"
 +#ifdef MG_HOST_TEST
@@ -1741,11 +1765,12 @@
 +    const struct mg_hw_io io = {a,domains,read_reg,write_reg,delay,publish,authenticate_zap,hardware_trace};
 +    return mg_hardware_boot(&a->hardware,&io,&config,&a->scheduler);
 +}
-+static bool mapped(void *p, const void *cpu, uint64_t gpu, size_t bytes, unsigned access)
++static bool mapped(void *p, unsigned space, const void *cpu, uint64_t gpu, size_t bytes, unsigned access)
 +{
 +    struct mg_accel *a = p;
 +    if (!domains(a) || !cpu || !bytes || !access || (access & ~7u)) return false;
-+    for (unsigned i = 0; i < a->block_count; i++) {
++    /* Kernel buffers are the kernel context's; clients never list them. */
++    for (unsigned i = 0; !space && i < a->block_count; i++) {
 +        const struct mg_accel_block *b = &a->blocks[i];
 +        if (!b->gpu || gpu < b->gpu || gpu-b->gpu >= b->memory.bytes) continue;
 +        size_t offset = (size_t)(gpu-b->gpu);
@@ -1756,7 +1781,7 @@
 +        return mg_vm_contains(&a->gpu,(uint32_t)gpu & ~4095u,b->pages+offset/4096,
 +            (unsigned)(((offset & 4095)+bytes+4095)/4096),permissions);
 +    }
-+    return mg_render_mapped(&a->render,cpu,gpu,bytes,access);
++    return mg_render_mapped(&a->render,space,cpu,gpu,bytes,access);
 +}
 +static bool gmu_mapped(void *p, const void *cpu, uint32_t gmu, size_t bytes)
 +{
@@ -1775,6 +1800,26 @@
 +    }
 +    return false;
 +}
++/* TTBR0 values the CP may have switched CB0 to: the kernel table or any
++ * client table ever handed out (a removed context's table stays live in
++ * the bank until the next switch, and is never freed). */
++static bool ttbr_known(void *p, uint64_t ttbr)
++{
++    const struct mg_accel *a = p;
++    if (ttbr == (a->gpu.tables.pa | ((uint64_t)a->gpu.domain.asid << 48))) return true;
++    for (unsigned i = 1; i < MG_RENDER_SPACES; i++) {
++        const struct mg_accel_space *x = &a->spaces[i];
++        if (x->allocated && ttbr == (x->pool.pa | ((uint64_t)x->asid << 48))) return true;
++    }
++    return false;
++}
++static bool space_known(void *p, unsigned space, uint64_t pt, uint32_t asid)
++{
++    const struct mg_accel *a = p;
++    if (pt == a->gpu.tables.pa && asid == a->gpu.domain.asid) return true;
++    return space && space < MG_RENDER_SPACES && a->spaces[space].allocated &&
++        pt == a->spaces[space].pool.pa && asid == a->spaces[space].asid;
++}
 +static bool context_valid(void *p, uint64_t pt, uint32_t cb, uint32_t asid)
 +{
 +    struct mg_accel *a = p;
@@ -1782,11 +1827,85 @@
 +    const struct mg_smmu_io *io = &a->gpu.io;
 +    const struct mg_smmu_domain *d = &a->gpu.domain;
 +    uint32_t b = d->cb_base+(d->cb << d->page_shift);
-+    uint64_t ttbr = pt | ((uint64_t)asid << 48);
++    uint64_t ttbr = 0;
 +    uint32_t ctl = io->read(io->context,b), fsr = io->read(io->context,b+0x58);
 +    return ctl != UINT32_MAX && (ctl & 0x1e7) == 0x127 && fsr != UINT32_MAX && !(fsr & 0xc00001fe) &&
 +        io->read(io->context,0x800+d->smr*4) == 0x80000000 && io->read(io->context,0xc00+d->smr*4) == cb &&
-+        io->read(io->context,b+0x20) == (uint32_t)ttbr && io->read(io->context,b+0x24) == (uint32_t)(ttbr >> 32);
++        !mg_vm_ttbr(&a->gpu,&ttbr) && ttbr_known(a,ttbr);
++}
++static bool asid_taken(const struct mg_accel *a, uint32_t asid)
++{
++    if (asid == a->gpu.domain.asid || asid == a->gmu.domain.asid ||
++        (a->gpu.domain.asid_used[asid >> 3] & (1u << (asid & 7)))) return true;
++    for (unsigned i = 1; i < MG_RENDER_SPACES; i++)
++        if (a->spaces[i].allocated && a->spaces[i].asid == asid) return true;
++    return false;
++}
++/* A client's firmware context, and with spaces_tables its own page table.
++ * Every allocation is retained for reuse by a later client of this slot. */
++static int space_open(void *p, unsigned slot, struct mg_render_space *out)
++{
++    struct mg_accel *a = p;
++    if (!slot || slot >= MG_RENDER_SPACES || !out) return MG_INVALID;
++    if (!running(a)) return MG_UNBACKED;
++    struct mg_accel_space *x = &a->spaces[slot];
++    if (x->live) return MG_BUSY;
++    int error;
++    if (!a->space_timestamps) {
++        error = allocate(a,MG_RENDER_SPACES*8,&a->space_timestamps); if (error) return error;
++        /* Kernel GPU region: linked into every client table, the CP writes
++         * these under whichever table the context runs with. */
++        error = map_block(a,a->space_timestamps,&a->gpu,MG_VM_READ|MG_VM_WRITE,4096,false);
++        if (error) return poison(a,error);
++    }
++    if (!x->queue) {
++        error = allocate(a,4096,&x->queue); if (error) return error;
++        error = map_block(a,x->queue,&a->gmu,MG_VM_READ|MG_VM_WRITE,4096,false);
++        if (error) return poison(a,error);
++    }
++    if (a->spaces_tables && !x->allocated) {
++        uint32_t asid = 0;
++        for (unsigned i = 255; i && !asid; i--) if (!asid_taken(a,i)) asid = i;
++        if (!asid) return MG_LIMIT;
++        const struct mg_memory_io *io = &a->live->io.memory;
++        error = io->allocate(io->context,MG_SPACE_PT_PAGES*4096,&x->pool); if (error) return error;
++        if (!x->pool.cpu || !x->pool.pa || x->pool.bytes != MG_SPACE_PT_PAGES*4096 ||
++            (((uintptr_t)x->pool.cpu | x->pool.pa) & 4095)) return MG_UNBACKED;
++        x->asid = asid; x->allocated = true;
++    }
++    if (a->spaces_tables) {
++        error = mg_vm_space(&x->vm,&a->gpu,x->pool.cpu,x->pool.pa,x->pool.bytes,x->asid);
++        if (error) return error;
++    }
++    uint32_t *ts = (uint32_t *)a->space_timestamps->memory.cpu + slot*2;
++    memset(x->queue->memory.cpu,0,4096); ts[0] = ts[1] = 0;
++    publish(a,x->queue->memory.cpu,4096); publish(a,ts,8);
++    const struct mg_gen8_context c = {.bank = a->gpu.domain.cb,
++        .asid = a->spaces_tables ? x->asid : a->gpu.domain.asid,
++        .page_table = a->spaces_tables ? x->pool.pa : a->gpu.tables.pa, .space = slot,
++        .memory = x->queue->memory.cpu, .address = x->queue->gmu, .sop = ts, .eop = ts+1,
++        .sop_address = a->space_timestamps->gpu + slot*8, .eop_address = a->space_timestamps->gpu + slot*8 + 4};
++    error = mg_gen8_context_add(&a->backend,&c,&x->context);
++    if (error) {
++        /* Registration may have reached firmware: then never reuse the slot. */
++        for (unsigned i = 1; i < MG_GEN8_CONTEXTS; i++)
++            if (a->backend.contexts[i].exposed && a->backend.contexts[i].memory == c.memory) x->live = true;
++        return error;
++    }
++    x->live = true;
++    out->vm = a->spaces_tables ? &x->vm : &a->gpu;
++    out->context = x->context;
++    return MG_OK;
++}
++static int space_close(void *p, unsigned slot, struct mg_render_space *s)
++{
++    struct mg_accel *a = p;
++    (void)s;
++    if (!slot || slot >= MG_RENDER_SPACES || !a->spaces[slot].live) return MG_INVALID;
++    int error = mg_gen8_context_remove(&a->backend,a->spaces[slot].context);
++    if (error) return error;
++    a->spaces[slot].live = false;
++    return MG_OK;
 +}
 +/* A job's owner frees or reuses it; the selftest job has no release. */
 +static void retire(void *p, struct mg_gen8_job *job) { (void)p; if (job && job->release) job->release(job); }
@@ -1820,6 +1939,7 @@
 +    error = live->io.memory.allocate(live->io.memory.context,MG_GPU_PT_PAGES*4096,&a->table);
 +    if (error) return poison(a,error);
 +    error = mg_vm_init(&a->gpu,a->table.cpu,a->table.pa,a->table.bytes,&live->io.smmu,a,powered,guarded);
++    a->gpu.ttbr_known = ttbr_known;
 +    if (!error) error = mg_vm_attach(&a->gpu,0);
 +    /* SID1 (gfx3d_lpac) must reach the same bank before the SQE ever starts. */
 +    if (!error) error = mg_smmu_route_lpac(&a->gpu.io,&a->gpu.domain);
@@ -1833,6 +1953,9 @@
 +    a->aperture_result = io->aperture(io->context,a->gpu.domain.cb);
 +    if (a->aperture_result.status) return poison(a,MG_IO);
 +    if (a->aperture_result.value) trace(a,"CP SMMU aperture SCM unavailable; skipped");
++    /* Without the aperture the CP cannot switch CB0's table: per-process
++     * firmware contexts still work, all in the kernel table. */
++    a->spaces_tables = io->spaces >= MG_SPACES_TABLES && !a->aperture_result.value;
 +    a->stage = MG_ACCEL_DOMAINS;
 +    trace(a,"allocate SQE/AQE/context buffers");
 +    struct mg_accel_block **blocks[] = {&a->sqe,&a->aqe,&a->restore,&a->metadata,&a->context,&a->timestamps,&a->commands,&a->output};
@@ -1868,8 +1991,8 @@
 +        .hfi_memory=hfi_pointer(a),.hfi_bytes=MG_HFI_BYTES,.hfi_address=live->memory.config.hfi,
 +        .context_memory=a->context->memory.cpu,.context_address=a->context->gmu,
 +        .sop=timestamps,.eop=timestamps+1,.sop_address=a->timestamps->gpu,.eop_address=a->timestamps->gpu+4};
-+    const struct mg_gen8_io submission_io = {a,running,context_valid,gmu_mapped,mapped,sync_memory,
-+        read_reg,write_reg,delay,retire};
++    const struct mg_gen8_io submission_io = {a,running,context_valid,space_known,gmu_mapped,mapped,
++        sync_memory,read_reg,write_reg,delay,retire};
 +    error = mg_gen8_init(&a->backend,&submission,&submission_io); if (error) return poison(a,error);
 +    /* boot_gpu's acknowledged vote was table level 1. */
 +    a->backend.perf_levels = gx-1; a->backend.perf_level = 1;
@@ -1884,19 +2007,24 @@
 +        const struct mg_gem_backing backing = {b->memory.cpu,b->pages,(unsigned)(b->memory.bytes/4096),b->memory.bytes,
 +            MG_GPU_READ | (i ? MG_GPU_WRITE : MG_GPU_EXEC),false}; /* write-combined DMA */
 +        uint64_t address = 0;
-+        error = a->render.ops.map(a->render.ops.context,&backing,&address); if (error) return poison(a,error);
++        error = a->render.ops.map(a->render.ops.context,0,&backing,&address); if (error) return poison(a,error);
 +        /* Renderer owns these VAs. Leave kernel block GPU field zero so its
 +         * mapped callback validates through the renderer's lifetime records. */
 +    }
 +    trace(a,"verify fenced GPU writes");
 +    error = mg_render_selftest(&a->render,a->commands->memory.cpu,a->output->memory.cpu);
 +    if (error) return poison(a,error);
++    /* Clients get their own contexts only after the kernel one proved itself. */
++    if (io->spaces >= MG_SPACES_CONTEXTS) {
++        a->render.space_open = space_open;
++        a->render.space_close = space_close;
++    }
 +    a->stage = MG_ACCEL_PROOF;
 +    return MG_OK;
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_accel.h
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,88 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_ACCEL_H
 +#define METROID_GPU_ACCEL_H
@@ -1924,6 +2052,22 @@
 +     * Status 0 and value 0: set. Status 0 and value 1: TZ does not offer the
 +     * call, nothing was sent (upstream adreno_hw_init then skips it too). */
 +    struct mg_scm_result (*aperture)(void *, unsigned context_bank);
++    /* GPU clients: MG_SPACES_SHARED all use the kernel's context and table;
++     * MG_SPACES_CONTEXTS gives each its own firmware context in the kernel
++     * table; MG_SPACES_TABLES also gives each its own page table, switched
++     * by the CP (needs the aperture SCM, else falls back to CONTEXTS). */
++    unsigned spaces;
++};
++enum { MG_SPACES_SHARED, MG_SPACES_CONTEXTS, MG_SPACES_TABLES };
++/* Per-process stream0 table pool: 1 MB, 2 MB of compact client VA a leaf. */
++#define MG_SPACE_PT_PAGES 256u
++struct mg_accel_space {
++    struct mg_vm vm;
++    struct mg_memory_block pool;
++    struct mg_accel_block *queue; /* GMU-mapped firmware context queue */
++    uint32_t asid;
++    unsigned context;     /* backend slot while live */
++    bool allocated, live; /* pool+ASID owned; firmware context may be held */
 +};
 +struct mg_scm_result mg_scm_secure_native(void *, uint64_t control_pa);
 +struct mg_scm_result mg_scm_aperture_native(void *, unsigned context_bank);
@@ -1955,6 +2099,9 @@
 +    struct mg_zap_status zap;
 +    struct mg_gen8_backend backend;
 +    struct mg_render render;
++    struct mg_accel_space spaces[MG_RENDER_SPACES]; /* [0] unused: kernel */
++    struct mg_accel_block *space_timestamps; /* SOP/EOP pair per slot */
++    bool spaces_tables;
 +    uint32_t performance[MG_GPU_PERF_WORDS], bandwidth[160];
 +    enum mg_accel_stage stage;
 +    int error;
@@ -2098,7 +2245,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_gem.h
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,60 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_GEM_H
 +#define METROID_GPU_GEM_H
@@ -2124,11 +2271,19 @@
 +struct mg_gem_ops {
 +    void *context;
 +    bool (*ready)(void *);
-+    int (*map)(void *, const struct mg_gem_backing *, uint64_t *address);
-+    int (*unmap)(void *, uint64_t address, size_t bytes);
++    /* A GPU client's own address space and firmware context, so one
++     * process can neither see nor corrupt another's buffers and a fault
++     * names its owner. On error the caller uses space 0 (shared kernel
++     * space and context). close fails while the space still holds
++     * mappings or unretired jobs; it is retried on later opens. */
++    int (*open)(void *, const char *owner, unsigned *space);
++    int (*close)(void *, unsigned space);
++    int (*map)(void *, unsigned space, const struct mg_gem_backing *, uint64_t *address);
++    int (*unmap)(void *, unsigned space, uint64_t address, size_t bytes);
 +    /* Nonzero fence retains this persistent job even on failure. wait must
-+     * prove GPU retirement and CPU visibility before releasing that reference. */
-+    int (*submit)(void *, struct mg_gen8_job *, uint64_t *fence);
++     * prove GPU retirement and CPU visibility before releasing that reference.
++     * Fences are one global in-order sequence across every space. */
++    int (*submit)(void *, unsigned space, struct mg_gen8_job *, uint64_t *fence);
 +    int (*wait)(void *, uint64_t fence, unsigned microseconds);
 +    bool (*parameter)(void *, uint32_t, uint64_t *);
 +    /* Lock-free live queue/backend snapshot for the on-screen status line.
@@ -3081,7 +3236,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_platform.c
-@@ -0,0 +1,378 @@
+@@ -0,0 +1,384 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * XNU adapter for the retained GMU owner. No inherited bandwidth assumption.
 + * Register sequences: Nothing 031e8669, gpucc-tuna.c/adreno_gen8.c.
@@ -3394,14 +3549,20 @@
 +        platform.live.start.reg,platform.live.start.value);
 +    if (images && platform.live.stage == MG_LIVE_HFI) {
 +        void *zap = metroid_gpu_zap_reserved_map(0x94e9a000,0x2000);
++        /* metroidgpuspaces: 0 every client shares the kernel context and
++         * table, 1 own firmware context each, 2 (default) also own table. */
++        unsigned spaces = MG_SPACES_TABLES;
++        (void)PE_parse_boot_argn("metroidgpuspaces",&spaces,sizeof(spaces));
++        if (spaces > MG_SPACES_TABLES) spaces = MG_SPACES_TABLES;
 +        const struct mg_accel_io accelerator_io = {NULL,accelerator_powered,synchronize,
 +            scheduler_tables,zap,0x94e9a000,0x2000,mg_scm_pas_native,mg_scm_secure_native,
-+            mg_scm_aperture_native};
++            mg_scm_aperture_native,spaces};
 +        int error = zap ? mg_accel_boot(&platform.accelerator,&platform.live,&accelerator_io,images) : MG_UNBACKED;
-+        printf("METROID GPU: banks GPU=%u GMU=%u aperture SCM=%lld/%llu\n",
++        printf("METROID GPU: banks GPU=%u GMU=%u aperture SCM=%lld/%llu spaces=%u tables=%d\n",
 +            platform.accelerator.gpu.domain.cb,platform.accelerator.gmu.domain.cb,
 +            (long long)platform.accelerator.aperture_result.status,
-+            (unsigned long long)platform.accelerator.aperture_result.value);
++            (unsigned long long)platform.accelerator.aperture_result.value,
++            spaces,platform.accelerator.spaces_tables);
 +        printf("METROID GPU: secure stage=%u CB=%u SCM=%lld/%#llx\n",
 +            platform.accelerator.secure_stage,platform.accelerator.secure.domain.cb,
 +            (long long)platform.accelerator.secure_result.status,
@@ -4269,7 +4430,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_render.c
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,395 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_render.h"
 +#ifdef MG_HOST_TEST
@@ -4293,17 +4454,29 @@
 +    return r->initialized && !r->quarantined && !r->vm->quarantined &&
 +        !r->backend->quarantined && r->running(r->context);
 +}
++static struct mg_vm *space_vm(struct mg_render *r, unsigned space)
++{
++    if (space >= MG_RENDER_SPACES || !r->spaces[space].open || r->spaces[space].closing) return NULL;
++    struct mg_vm *vm = r->spaces[space].vm;
++    return vm && !vm->quarantined ? vm : NULL;
++}
 +static bool ready(void *p) { struct mg_render *r = p; return r->verified && running(r) &&
 +    r->backend->bound && r->backend->registered && !r->backend->closed; }
 +static int poison(struct mg_render *r, int error) { r->quarantined = true; return error; }
-+/* Whether an in-flight job may still touch [address, address+bytes).
-+ * Finished jobs are retired first, so only unfinished work counts. */
-+static bool in_flight(struct mg_render *r, uint64_t address, size_t bytes)
++/* Whether an in-flight job may still touch [address, address+bytes) of
++ * table vm. Finished jobs are retired first, so only unfinished work counts. */
++static bool in_flight(struct mg_render *r, const struct mg_vm *vm, uint64_t address, size_t bytes)
 +{
 +    const struct mg_queue *q = &r->backend->queue;
 +    for (uint64_t f = q->completed + 1; f <= q->issued; f++) {
 +        const struct mg_gen8_job *job = mg_queue_job(q,f);
-+        for (unsigned i = 0; job && i < job->buffer_count; i++)
++        if (!job) continue;
++        unsigned space = MG_RENDER_SPACES;
++        for (unsigned s = 0; s < MG_RENDER_SPACES; s++)
++            if (r->spaces[s].open && r->spaces[s].context == job->context) { space = s; break; }
++        /* A job whose space is unknown could be anywhere: assume it overlaps. */
++        if (space < MG_RENDER_SPACES && r->spaces[space].vm != vm) continue;
++        for (unsigned i = 0; i < job->buffer_count; i++)
 +            if (job->buffers[i].gpu < address+bytes && address < job->buffers[i].gpu+job->buffers[i].bytes)
 +                return true;
 +    }
@@ -4340,11 +4513,13 @@
 +    r->dcvs_votes++;
 +    return mg_gen8_perf_vote(b,next);
 +}
-+static int map(void *p, const struct mg_gem_backing *b, uint64_t *address)
++static int map(void *p, unsigned space, const struct mg_gem_backing *b, uint64_t *address)
 +{
 +    struct mg_render *r = p;
 +    if (!address) return MG_INVALID;
 +    *address = 0;
++    struct mg_vm *vm = space_vm(r,space);
++    if (!vm) return MG_INVALID;
 +    if (!b || !b->cpu || !b->pages || !b->bytes || (b->bytes & 4095) ||
 +        ((uintptr_t)b->cpu & 4095) || b->bytes > UINTPTR_MAX-(uintptr_t)b->cpu ||
 +        b->page_count != b->bytes/4096 || b->page_count > MG_VM_MAX_PAGES ||
@@ -4366,6 +4541,8 @@
 +            if (!m->address) continue;
 +            if ((uintptr_t)b->cpu < (uintptr_t)m->backing.cpu+m->backing.bytes &&
 +                (uintptr_t)m->backing.cpu < (uintptr_t)b->cpu+b->bytes) return MG_INVALID;
++            /* Each table has its own VA; spaces sharing one table share it. */
++            if (r->spaces[m->space].vm != vm) continue;
 +            if (va < (uint64_t)m->address+m->backing.bytes+4096 &&
 +                (uint64_t)m->address < va+b->bytes+4096) {
 +                va = (uint64_t)m->address+m->backing.bytes+4096;
@@ -4375,45 +4552,49 @@
 +        if (!moved) break;
 +    }
 +    struct mg_render_mapping *m = &r->mappings[slot];
-+    m->backing = *b; m->address = (uint32_t)va;
++    m->backing = *b; m->address = (uint32_t)va; m->space = space;
 +    unsigned access = MG_VM_READ | (b->access & MG_GPU_WRITE ? MG_VM_WRITE : 0) |
 +        (b->access & MG_GPU_EXEC ? MG_VM_EXEC : 0) | (b->cached ? MG_VM_CACHED : 0);
-+    int error = mg_vm_map(r->vm,m->address,b->pages,b->page_count,access);
-+    if (error && !r->vm->quarantined) { *m = (struct mg_render_mapping){0}; return error; }
++    int error = mg_vm_map(vm,m->address,b->pages,b->page_count,access);
++    if (error && !vm->quarantined) { *m = (struct mg_render_mapping){0}; return error; }
 +    r->allocated += b->bytes;
 +    *address = m->address;
 +    if (error) return poison(r,error); /* nonzero address transfers backing retention */
-+    error = mg_vm_map(r->vm,m->address+(uint32_t)b->bytes,&r->guard_page,1,MG_VM_READ);
++    error = mg_vm_map(vm,m->address+(uint32_t)b->bytes,&r->guard_page,1,MG_VM_READ);
 +    /* The data PTEs are already visible: retain backing on any guard failure. */
 +    if (error) return poison(r,error);
 +    return MG_OK;
 +}
-+static int unmap(void *p, uint64_t address, size_t bytes)
++static int unmap(void *p, unsigned space, uint64_t address, size_t bytes)
 +{
 +    struct mg_render *r = p;
 +    if (!running(r)) return MG_UNBACKED;
++    /* A closing space still unmaps: that is how it drains. */
++    if (space >= MG_RENDER_SPACES || !r->spaces[space].open) return MG_INVALID;
++    struct mg_vm *vm = r->spaces[space].vm;
 +    int busy = mg_gen8_reap(r->backend);
 +    dcvs_account(r);
 +    if (r->backend->quarantined) return poison(r,busy ? busy : MG_IO);
-+    if (in_flight(r,address,bytes)) return MG_BUSY;
++    if (in_flight(r,vm,address,bytes)) return MG_BUSY;
 +    for (unsigned i = 0; i < MG_RENDER_BUFFERS; i++) {
 +        struct mg_render_mapping *m = &r->mappings[i];
-+        if (m->address != address || m->backing.bytes != bytes) continue;
-+        int error = mg_vm_unmap(r->vm,m->address,m->backing.page_count+1u);
-+        if (error) return r->vm->quarantined ? poison(r,error) : error;
++        if (m->address != address || m->backing.bytes != bytes || m->space != space) continue;
++        int error = mg_vm_unmap(vm,m->address,m->backing.page_count+1u);
++        if (error) return vm->quarantined ? poison(r,error) : error;
 +        r->allocated -= bytes; *m = (struct mg_render_mapping){0};
 +        return MG_OK;
 +    }
 +    return MG_UNBACKED;
 +}
-+bool mg_render_mapped(const struct mg_render *r, const void *cpu, uint64_t gpu,
++bool mg_render_mapped(const struct mg_render *r, unsigned space, const void *cpu, uint64_t gpu,
 +    size_t bytes, unsigned access)
 +{
-+    if (!r || !cpu || !bytes || !access || (access & ~7u) ||
-+        r->quarantined || r->vm->quarantined || gpu > UINT32_MAX) return false;
++    if (!r || !cpu || !bytes || !access || (access & ~7u) || space >= MG_RENDER_SPACES ||
++        !r->spaces[space].open || !r->spaces[space].vm ||
++        r->quarantined || r->spaces[space].vm->quarantined || gpu > UINT32_MAX) return false;
 +    for (unsigned i = 0; i < MG_RENDER_BUFFERS; i++) {
 +        const struct mg_render_mapping *m = &r->mappings[i];
-+        if (!m->address || gpu < m->address || gpu-m->address >= m->backing.bytes ||
++        if (!m->address || m->space != space || gpu < m->address || gpu-m->address >= m->backing.bytes ||
 +            (uintptr_t)cpu < (uintptr_t)m->backing.cpu) continue;
 +        uint64_t offset = gpu-m->address;
 +        if ((uintptr_t)cpu-(uintptr_t)m->backing.cpu != offset ||
@@ -4421,16 +4602,18 @@
 +        unsigned first = (unsigned)(offset/4096), pages = (unsigned)(((offset & 4095)+bytes+4095)/4096);
 +        unsigned permissions = MG_VM_READ | (access & MG_GPU_WRITE ? MG_VM_WRITE : 0) |
 +            (access & MG_GPU_EXEC ? MG_VM_EXEC : 0);
-+        return mg_vm_contains(r->vm,(uint32_t)gpu & ~4095u,m->backing.pages+first,pages,permissions);
++        return mg_vm_contains(r->spaces[space].vm,(uint32_t)gpu & ~4095u,m->backing.pages+first,pages,permissions);
 +    }
 +    return false;
 +}
-+static int submit(void *p, struct mg_gen8_job *job, uint64_t *fence)
++static int submit(void *p, unsigned space, struct mg_gen8_job *job, uint64_t *fence)
 +{
 +    struct mg_render *r = p;
 +    if (!fence) return MG_INVALID;
 +    *fence = 0;
 +    if (!running(r) || !r->backend->registered) return MG_UNBACKED;
++    if (!job || !space_vm(r,space)) return MG_INVALID;
++    job->context = r->spaces[space].context;
 +    (void)mg_gen8_reap(r->backend);
 +    dcvs_account(r);
 +    int error = dcvs_decide(r);
@@ -4495,12 +4678,96 @@
 +        b->last_error,b->last_message_header,b->fault_register,b->fault_value,
 +        b->perf_level,r->dcvs_util,r->dcvs_pin ? "p" : "");
 +    size_t used = n < 0 ? 0 : (size_t)n < bytes ? (size_t)n : bytes - 1;
++    if (b->bad_count && used < bytes-1) {
++        /* Which context (and its process) the firmware said faulted. */
++        const char *owner = "?";
++        unsigned slot = mg_gen8_context_slot((const struct mg_gen8_backend *)b,b->bad_context);
++        for (unsigned s = 0; slot < MG_GEN8_CONTEXTS && s < MG_RENDER_SPACES; s++)
++            if (r->spaces[s].open && r->spaces[s].context == slot) { owner = r->spaces[s].owner; break; }
++        n = snprintf(out+used,bytes-used," BAD c%u(%s) t%u e%u p%u",b->bad_context,owner,
++            b->bad_ts,b->bad_error,b->bad_policy);
++        if (n > 0) used += (size_t)n < bytes-used ? (size_t)n : bytes-used-1;
++    }
++    for (unsigned s = 1; s < MG_RENDER_SPACES && used < bytes-1; s++) {
++        const struct mg_vm *vm = r->spaces[s].vm;
++        if (!r->spaces[s].open || !vm || vm == r->vm || !vm->fault_status) continue;
++        n = snprintf(out+used,bytes-used," F%x@%llx(%s)",vm->fault_status,
++            (unsigned long long)vm->fault_address,r->spaces[s].owner);
++        if (n > 0) used += (size_t)n < bytes-used ? (size_t)n : bytes-used-1;
++    }
 +    if (r->vm->fault_status && used < bytes-1) {
-+        n = snprintf(out+used,bytes-used," F%x@%llx s%x/%x",r->vm->fault_status,
-+            (unsigned long long)r->vm->fault_address,r->vm->fault_syn0,r->vm->fault_syn1);
++        /* The shared bank's live table at fault time names the process. */
++        const char *owner = "?";
++        for (unsigned s = 0; s < MG_RENDER_SPACES; s++) {
++            const struct mg_vm *vm = r->spaces[s].vm;
++            if (r->spaces[s].open && vm && r->vm->fault_ttbr ==
++                (vm->tables.pa | ((uint64_t)vm->domain.asid << 48))) { owner = r->spaces[s].owner; break; }
++        }
++        n = snprintf(out+used,bytes-used," F%x@%llx s%x/%x(%s c%u)",r->vm->fault_status,
++            (unsigned long long)r->vm->fault_address,r->vm->fault_syn0,r->vm->fault_syn1,
++            owner,r->vm->fault_contextidr);
 +        if (n > 0) used += (size_t)n < bytes-used ? (size_t)n : bytes-used-1;
 +    }
 +    return used;
++}
++/* Release a closing space once nothing of it is mapped or in flight. */
++static int finish_close(struct mg_render *r, unsigned space)
++{
++    struct mg_render_space *s = &r->spaces[space];
++    for (unsigned i = 0; i < MG_RENDER_BUFFERS; i++)
++        if (r->mappings[i].address && r->mappings[i].space == space) return MG_BUSY;
++    const struct mg_queue *q = &r->backend->queue;
++    for (uint64_t f = q->completed + 1; f <= q->issued; f++) {
++        const struct mg_gen8_job *job = mg_queue_job(q,f);
++        if (!job || job->context == s->context) return MG_BUSY;
++    }
++    int error = r->space_close(r->context,space,s);
++    if (error) return r->backend->quarantined ? poison(r,error) : error;
++    *s = (struct mg_render_space){0};
++    return MG_OK;
++}
++static int open_space(void *p, const char *owner, unsigned *space)
++{
++    struct mg_render *r = p;
++    if (!space) return MG_INVALID;
++    *space = 0;
++    if (!running(r) || !r->backend->registered) return MG_UNBACKED;
++    if (!r->space_open || !r->space_close) return MG_UNSUPPORTED;
++    (void)mg_gen8_reap(r->backend);
++    dcvs_account(r);
++    for (unsigned i = 1; i < MG_RENDER_SPACES; i++)
++        if (r->spaces[i].closing) (void)finish_close(r,i);
++    if (r->quarantined || r->backend->quarantined) return MG_IO;
++    int error = MG_LIMIT;
++    for (unsigned i = 1; i < MG_RENDER_SPACES; i++) {
++        struct mg_render_space *s = &r->spaces[i];
++        if (s->open) continue;
++        *s = (struct mg_render_space){0};
++        error = r->space_open(r->context,i,s);
++        if (!error && (!s->vm || !s->context || s->context >= MG_GEN8_CONTEXTS)) error = MG_UNBACKED;
++        if (!error) {
++            if (owner) strlcpy(s->owner,owner,sizeof(s->owner));
++            s->open = true;
++            *space = i;
++            return MG_OK;
++        }
++        /* A context the firmware may hold stays allocated by the owner,
++         * which answers MG_BUSY for that slot from then on: try the next. */
++        *s = (struct mg_render_space){0};
++        if (r->backend->quarantined) return poison(r,error);
++        if (error != MG_BUSY) return error;
++    }
++    return error;
++}
++static int close_space(void *p, unsigned space)
++{
++    struct mg_render *r = p;
++    if (!space || space >= MG_RENDER_SPACES || !r->spaces[space].open) return MG_INVALID;
++    r->spaces[space].closing = true;
++    if (!running(r)) return MG_UNBACKED;
++    (void)mg_gen8_reap(r->backend);
++    dcvs_account(r);
++    return finish_close(r,space);
 +}
 +int mg_render_init(struct mg_render *r, struct mg_vm *vm, struct mg_gen8_backend *backend,
 +    void *context, bool (*proof)(void *), uint32_t frequency, uint64_t guard_page)
@@ -4516,7 +4783,8 @@
 +#else
 +    nanoseconds_to_absolutetime(DCVS_WINDOW_NS,&r->dcvs_window);
 +#endif
-+    r->ops = (struct mg_gem_ops){r,ready,map,unmap,submit,wait,parameter,describe};
++    r->spaces[0] = (struct mg_render_space){.vm = vm, .context = 0, .owner = "kernel", .open = true};
++    r->ops = (struct mg_gem_ops){r,ready,open_space,close_space,map,unmap,submit,wait,parameter,describe};
 +    r->initialized = true;
 +    return MG_OK;
 +}
@@ -4538,8 +4806,8 @@
 +        if (m->address && m->backing.cpu == output) out = m;
 +    }
 +    if (!cmd || !out || cmd == out || cmd->backing.bytes < 4096 || out->backing.bytes < 4096 ||
-+        !mg_render_mapped(r,commands,cmd->address,32,MG_GPU_READ | MG_GPU_EXEC) ||
-+        !mg_render_mapped(r,output,out->address,16,MG_GPU_READ | MG_GPU_WRITE)) return MG_UNBACKED;
++        !mg_render_mapped(r,0,commands,cmd->address,32,MG_GPU_READ | MG_GPU_EXEC) ||
++        !mg_render_mapped(r,0,output,out->address,16,MG_GPU_READ | MG_GPU_WRITE)) return MG_UNBACKED;
 +    const uint32_t colors[] = {0xff0000ff,0xff00ff00,0xffff0000,0xffffffff};
 +    memset(output,0,16);
 +    commands[0] = packet7(0x3d,6); /* CP_MEM_WRITE: 64-bit address + four pixels */
@@ -4552,7 +4820,7 @@
 +    job->buffers[1] = (struct mg_gen8_buffer){output,out->address,out->backing.bytes,MG_GPU_READ | MG_GPU_WRITE,false};
 +    job->ibs[0] = (struct mg_gen8_ib){0,0,32};
 +    uint64_t fence = 0;
-+    int error = submit(r,job,&fence); if (error) return error;
++    int error = submit(r,0,job,&fence); if (error) return error;
 +    error = wait(r,fence,MG_QUEUE_MAX_WAIT_US); if (error) return error;
 +    if (memcmp(output,colors,sizeof(colors))) return poison(r,MG_IO);
 +    r->verified = true;
@@ -4560,7 +4828,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_render.h
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,56 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_RENDER_H
 +#define METROID_GPU_RENDER_H
@@ -4573,6 +4841,16 @@
 +struct mg_render_mapping {
 +    struct mg_gem_backing backing;
 +    uint32_t address;
++    unsigned space;
++};
++/* Space 0 is the kernel's: the boot VM and firmware context, also the
++ * fallback for a client the owner could not give its own. */
++#define MG_RENDER_SPACES MG_GEN8_CONTEXTS
++struct mg_render_space {
++    struct mg_vm *vm;  /* the table its buffers are mapped into */
++    unsigned context;  /* backend context slot running its jobs */
++    char owner[24];
++    bool open, closing;
 +};
 +struct mg_render {
 +    struct mg_vm *vm;
@@ -4581,6 +4859,12 @@
 +    struct mg_render_mapping mappings[MG_RENDER_BUFFERS];
 +    void *context;
 +    bool (*running)(void *); /* real scheduler/GX/SQE/AQE/ZAP owner */
++    struct mg_render_space spaces[MG_RENDER_SPACES];
++    /* Owner hooks, optional (absent: every client shares space 0). open
++     * fills vm/context for slot 1..; close releases the firmware context
++     * once the space has no mappings or jobs left, MG_BUSY to retry. */
++    int (*space_open)(void *, unsigned slot, struct mg_render_space *);
++    int (*space_close)(void *, unsigned slot, struct mg_render_space *);
 +    struct mg_gen8_job selftest_job;
 +    size_t allocated;
 +    uint32_t frequency;
@@ -4595,7 +4879,7 @@
 +    void *, bool (*running)(void *), uint32_t frequency, uint64_t guard_page);
 +/* These callbacks validate pinned buffers when binding the Gen8 engine.
 + * CPU/GPU offset identity, lifetime and requested permissions must all agree. */
-+bool mg_render_mapped(const struct mg_render *, const void *, uint64_t, size_t, unsigned);
++bool mg_render_mapped(const struct mg_render *, unsigned space, const void *, uint64_t, size_t, unsigned);
 +/* cmd/output are separate, already mapped 4K kernel-private allocations.
 + * Neither can be mapped to userspace. Completion, CPU visibility and all four
 + * expected GPU writes must agree before ops.ready can become true. */
@@ -5375,7 +5659,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_smmu.c
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,261 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * SMMUv2 stage-1 stream-5 setup. Register ABI: Nothing 031e8669eb19
 + * drivers/iommu/arm/arm-smmu/{arm-smmu.h,arm-smmu.c}, io-pgtable-arm.c.
@@ -5553,6 +5837,8 @@
 +    if (s->cb == UINT32_MAX) return MG_LIMIT;
 +    for (unsigned i = 1; i < 256; i++) if (!asids[i]) { s->asid = i; break; }
 +    if (!s->asid) return MG_LIMIT;
++    asids[0] = asids[s->asid] = true;
++    for (unsigned i = 0; i < 256; i++) if (asids[i]) s->asid_used[i >> 3] |= (uint8_t)(1u << (i & 7));
 +    io->publish(io->context, t->memory, t->used * 4096u);
 +    uint32_t b = s->cb_base + (s->cb << s->page_shift);
 +    int ret;
@@ -5791,7 +6077,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_start.h
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,132 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_START_H
 +#define METROID_GPU_START_H
@@ -5830,6 +6116,9 @@
 +    uint32_t offset, value;
 +    uint32_t lpac_smr;
 +    bool lpac_routed;
++    /* ASIDs any context bank (live or ours) held at attach, bit per ASID:
++     * per-process stream0 spaces pick only from the others. */
++    uint8_t asid_used[32];
 +};
 +/* 4K SMMU granules, 32-bit IOVA, 3-level tables. CPU pages may be 16K.
 + * The caller supplies contiguous, aligned, private table storage and ranges
@@ -5923,7 +6212,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_submit.c
-@@ -0,0 +1,445 @@
+@@ -0,0 +1,576 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Gen8.6.0 HFI submission backend. Wire contracts follow NothingOSS
 + * 031e8669eb198d93e69532b01af973a1c2a82710 graphics-kernel:
@@ -5989,9 +6278,16 @@
 +    if (!b->io.running(b->io.context)) return poison(b, MG_IO);
 +    const struct mg_gen8_config *c = &b->config;
 +    if (!b->io.context_valid(b->io.context,c->page_table,c->context_bank,c->asid) ||
-+        !b->io.gmu_mapped(b->io.context,c->hfi_memory,c->hfi_address,c->hfi_bytes) ||
-+        !b->io.gmu_mapped(b->io.context,c->context_memory,c->context_address,4096))
++        !b->io.gmu_mapped(b->io.context,c->hfi_memory,c->hfi_address,c->hfi_bytes))
 +        return poison(b, MG_UNBACKED);
++    /* Bank state was read once above; each client context costs no MMIO. */
++    for (unsigned i = 0; i < MG_GEN8_CONTEXTS; i++) {
++        const struct mg_gen8_context *x = &b->contexts[i];
++        if (!x->exposed) continue;
++        if (!b->io.gmu_mapped(b->io.context,x->memory,x->address,4096) ||
++            (i && !b->io.space_known(b->io.context,x->space,x->page_table,x->asid)))
++            return poison(b, MG_UNBACKED);
++    }
 +    uint32_t hfi = b->io.read(b->io.context, 0x1f980);
 +    if (hfi == UINT32_MAX || !(hfi & 1)) return register_fault(b,0x1f980,hfi);
 +    uint32_t result = b->io.read(b->io.context, 0x1f81c);
@@ -6006,11 +6302,11 @@
 +    return MG_OK;
 +}
 +
-+static int indices(struct mg_gen8_backend *b, uint32_t *read, uint32_t *write)
++static int indices(const struct mg_gen8_context *x, uint32_t *read, uint32_t *write)
 +{
-+    volatile struct mg_gen8_context_header *h = b->config.context_memory;
++    volatile struct mg_gen8_context_header *h = x->memory;
 +    BARRIER();
-+    if (h->version || h->address != b->config.context_address + sizeof(*h) ||
++    if (h->version || h->address != x->address + sizeof(*h) ||
 +        h->words != CONTEXT_WORDS || h->hw_fence_address || h->hw_fence_bytes ||
 +        h->unused[0] || h->unused[1] || h->unused[2] || h->sync_obj_ts)
 +        return MG_INVALID;
@@ -6021,10 +6317,10 @@
 +    return MG_OK;
 +}
 +
-+static int room(struct mg_gen8_backend *b, unsigned words)
++static int room(const struct mg_gen8_context *x, unsigned words)
 +{
 +    uint32_t r, w;
-+    int ret = indices(b, &r, &w); if (ret) return ret;
++    int ret = indices(x, &r, &w); if (ret) return ret;
 +    uint32_t used = (w + CONTEXT_WORDS - r) % CONTEXT_WORDS;
 +    return CONTEXT_WORDS - used <= ((words + 3u) & ~3u) ? MG_FULL : MG_OK;
 +}
@@ -6054,14 +6350,28 @@
 +            }
 +            if (type != 0) return poison(b, MG_INVALID);
 +            if (id == FIRMWARE_DEBUG && q) continue;
-+            if (id == FIRMWARE_ERROR || id == CONTEXT_BAD) return poison(b, MG_IO);
++            if (id == CONTEXT_BAD) {
++                /* hdr, version, gc{ctxt_id,policy,ts}, lpac{ctxt_id,policy,ts},
++                 * error. KGSL answers with a full GPU reset/replay, which this
++                 * port lacks: record who faulted, then stop like before. */
++                if (!b->bad_count++) {
++                    b->bad_context = words > 2 ? packet[2] : 0;
++                    b->bad_policy = words > 3 ? packet[3] : 0;
++                    b->bad_ts = words > 4 ? packet[4] : 0;
++                    b->bad_error = words > 8 ? packet[8] : 0;
++                }
++                return poison(b, MG_IO);
++            }
++            if (id == FIRMWARE_ERROR) return poison(b, MG_IO);
 +            if (id == RETIRED && !q) {
 +                /* HFI v2.7 hfi_ts_retire_cmd is 60 bytes. A notification
-+                 * is not completion: the GPU's EOP memstore is authoritative. */
-+                if (words != 15 || packet[1] != b->config.context_id || !packet[2] ||
-+                    packet[2] > b->queue.issued || packet[3] > 1)
++                 * is not completion: the GPU's EOP memstore is authoritative.
++                 * Its timestamp is the context's own, not a global fence. */
++                unsigned slot = mg_gen8_context_slot(b, words > 1 ? packet[1] : 0);
++                if (words != 15 || slot == MG_GEN8_CONTEXTS || !packet[2] ||
++                    packet[2] > b->contexts[slot].issued || packet[3] > 1)
 +                    return poison(b, MG_INVALID);
-+                if (packet[2] > b->notified) b->notified = packet[2];
++                b->notified = packet[2];
 +                continue;
 +            }
 +            /* No input/output HW fences, recurring work, perf requests or
@@ -6114,6 +6424,10 @@
 +    struct mg_gen8_job *job = data;
 +    uint32_t packet[8 + 3 * MG_GEN8_MAX_IBS] = {0};
 +    if (fence > UINT32_MAX) return poison(b, MG_LIMIT);
++    if (job->context >= MG_GEN8_CONTEXTS || !b->contexts[job->context].registered)
++        return poison(b, MG_STALE);
++    struct mg_gen8_context *x = &b->contexts[job->context];
++    if (x->issued == UINT32_MAX) return poison(b, MG_LIMIT);
 +    int ret = health(b); if (ret) return ret;
 +    const struct mg_gen8_buffer *drain = NULL;
 +    for (unsigned i = 0; i < job->buffer_count; i++) {
@@ -6134,9 +6448,10 @@
 +    unsigned words = 8 + 3 * job->ib_count;
 +    ret = mg_hfi_message(ISSUE, 0, (++b->issue_sequence) & 4095, words, packet);
 +    if (ret) return poison(b, ret);
-+    packet[1] = b->config.context_id;
++    uint32_t ts = x->issued + 1;
++    packet[1] = x->id;
 +    packet[2] = NOTIFY | (job->end_of_frame ? EOF_FLAG : 0);
-+    packet[3] = (uint32_t)fence; packet[6] = job->ib_count;
++    packet[3] = ts; packet[6] = job->ib_count;
 +    for (unsigned i = 0; i < job->ib_count; i++) {
 +        const struct mg_gen8_ib *ib = &job->ibs[i];
 +        uint64_t address = job->buffers[ib->buffer].gpu + ib->offset;
@@ -6144,24 +6459,29 @@
 +        packet[10+3*i] = ib->bytes; /* hfi_issue_ib.size is BYTES, not dwords. */
 +    }
 +    uint32_t r, w;
-+    ret = indices(b, &r, &w); if (ret) return poison(b, ret);
++    ret = indices(x, &r, &w); if (ret) return poison(b, ret);
 +    unsigned padded = (words + 3u) & ~3u;
 +    if (CONTEXT_WORDS - ((w + CONTEXT_WORDS - r) % CONTEXT_WORDS) <= padded)
 +        return poison(b, MG_FULL);
-+    volatile uint32_t *ring = (volatile uint32_t *)((uint8_t *)b->config.context_memory + 48);
++    b->fence_context[fence % MG_QUEUE_DEPTH] = (uint8_t)job->context;
++    b->fence_ts[fence % MG_QUEUE_DEPTH] = ts;
++    x->issued = ts;
++    volatile uint32_t *ring = (volatile uint32_t *)((uint8_t *)x->memory + 48);
 +    for (unsigned i = 0; i < padded; i++)
 +        ring[(w+i) % CONTEXT_WORDS] = i < words ? packet[i] : 0xfafafafa;
 +    BARRIER();
-+    ((volatile struct mg_gen8_context_header *)b->config.context_memory)->write = (w+padded) % CONTEXT_WORDS;
++    ((volatile struct mg_gen8_context_header *)x->memory)->write = (w+padded) % CONTEXT_WORDS;
 +    BARRIER();
 +    /* Normal GFX priority0, no LPAC/input-sync work: DISPQ_IRQ_BIT(0). */
 +    b->io.write(b->io.context, MG_GEN8_HOST2GMU, 1u << 2);
 +    return MG_OK;
 +}
 +
-+/* As KGSL hwsched: the context's EOP timestamp in GPU memory is the last
-+ * retired submission; SOP is the last started. Both lie in [completed,
-+ * issued] and SOP >= EOP, otherwise the timestamps are not ours. */
++/* As KGSL hwsched: each context's EOP timestamp in GPU memory is its last
++ * retired submission; SOP is its last started. Both lie in [retired,
++ * issued] of that context and SOP >= EOP, otherwise they are not ours.
++ * The global fence completes in order: stop at the first unfinished one,
++ * even if a later fence on another context already finished. */
 +static int progress(void *p, uint64_t *done)
 +{
 +    struct mg_gen8_backend *b = p;
@@ -6170,15 +6490,28 @@
 +     * nothing until they are read. */
 +    if (ret == MG_BUSY) { *done = b->queue.completed; return MG_OK; }
 +    if (ret) return ret;
-+    ret = b->io.sync(b->io.context, MG_GPU_TO_CPU, (const void *)b->config.eop, 4);
-+    if (ret) return poison(b, ret);
-+    BARRIER(); uint32_t eop = *b->config.eop;
-+    ret = b->io.sync(b->io.context, MG_GPU_TO_CPU, (const void *)b->config.sop, 4);
-+    if (ret) return poison(b, ret);
-+    BARRIER(); uint32_t sop = *b->config.sop;
-+    if (eop < b->queue.completed || eop > b->queue.issued ||
-+        sop < eop || sop > b->queue.issued) return poison(b, MG_STALE);
-+    *done = eop;
++    bool seen[MG_GEN8_CONTEXTS] = {0};
++    uint64_t f = b->queue.completed;
++    while (f < b->queue.issued) {
++        unsigned slot = b->fence_context[(f + 1) % MG_QUEUE_DEPTH];
++        if (slot >= MG_GEN8_CONTEXTS || !b->contexts[slot].exposed) return poison(b, MG_STALE);
++        struct mg_gen8_context *x = &b->contexts[slot];
++        if (!seen[slot]) {
++            seen[slot] = true;
++            ret = b->io.sync(b->io.context, MG_GPU_TO_CPU, (const void *)x->eop, 4);
++            if (ret) return poison(b, ret);
++            BARRIER(); uint32_t eop = *x->eop;
++            ret = b->io.sync(b->io.context, MG_GPU_TO_CPU, (const void *)x->sop, 4);
++            if (ret) return poison(b, ret);
++            BARRIER(); uint32_t sop = *x->sop;
++            if (eop < x->retired || eop > x->issued || sop < eop || sop > x->issued)
++                return poison(b, MG_STALE);
++            x->retired = eop;
++        }
++        if (x->retired < b->fence_ts[(f + 1) % MG_QUEUE_DEPTH]) break;
++        f++;
++    }
++    *done = f;
 +    return MG_OK;
 +}
 +static int retire(void *p, void *data)
@@ -6202,7 +6535,7 @@
 +
 +int mg_gen8_init(struct mg_gen8_backend *b, const struct mg_gen8_config *c, const struct mg_gen8_io *io)
 +{
-+    if (!b || !c || !io || !io->running || !io->context_valid || !io->gmu_mapped ||
++    if (!b || !c || !io || !io->running || !io->context_valid || !io->space_known || !io->gmu_mapped ||
 +        !io->mapped || !io->sync || !io->read ||
 +        !io->write || !io->delay || !io->retire) return MG_INVALID;
 +    if (b->bound || b->exposed || b->quarantined) return MG_BUSY;
@@ -6226,13 +6559,17 @@
 +        for (unsigned j = 0; j < i; j++)
 +            if (overlaps((uintptr_t)cpu[i],size[i],(uintptr_t)cpu[j],size[j])) return MG_INVALID;
 +    if (!io->running(io->context)) return MG_UNSUPPORTED;
-+    if (!io->mapped(io->context,(const void *)c->sop,c->sop_address,4,MG_GPU_READ|MG_GPU_WRITE) ||
-+        !io->mapped(io->context,(const void *)c->eop,c->eop_address,4,MG_GPU_READ|MG_GPU_WRITE)) return MG_UNBACKED;
++    if (!io->mapped(io->context,0,(const void *)c->sop,c->sop_address,4,MG_GPU_READ|MG_GPU_WRITE) ||
++        !io->mapped(io->context,0,(const void *)c->eop,c->eop_address,4,MG_GPU_READ|MG_GPU_WRITE)) return MG_UNBACKED;
 +    if (*c->sop || *c->eop) return MG_STALE;
 +    const uint32_t *fresh = c->context_memory;
 +    for (unsigned i = 0; i < 1024; i++) if (fresh[i]) return MG_STALE;
 +    memset(b,0,sizeof(*b));
 +    b->config = *c; b->io = *io;
++    b->contexts[0] = (struct mg_gen8_context){.id = c->context_id, .bank = c->context_bank,
++        .asid = c->asid, .page_table = c->page_table, .memory = c->context_memory,
++        .address = c->context_address, .sop = c->sop, .eop = c->eop,
++        .sop_address = c->sop_address, .eop_address = c->eop_address, .exposed = true};
 +    struct mg_hfi_queue *queues[] = {&b->control,&b->messages,&b->debug};
 +    for (unsigned i = 0; i < 3; i++) {
 +        int ret = mg_hfi_bind(c->hfi_memory,c->hfi_bytes,c->hfi_address,i,queues[i]);
@@ -6265,14 +6602,17 @@
 +    uint32_t ptr[] = {0,c->context_id,(uint32_t)c->sop_address,(uint32_t)(c->sop_address >> 32),
 +        (uint32_t)c->eop_address,(uint32_t)(c->eop_address >> 32),0,0,0,c->context_address};
 +    ret = command(b,POINTERS,ptr,10); if (ret) return poison(b,ret);
-+    b->registered = true;
++    b->registered = b->contexts[0].registered = true;
 +    return MG_OK;
 +}
 +
 +static int validate_job(struct mg_gen8_backend *b, const struct mg_gen8_job *job)
 +{
 +    if (!job || !job->buffer_count || job->buffer_count > MG_GEN8_MAX_BUFFERS ||
-+        !job->ib_count || job->ib_count > MG_GEN8_MAX_IBS) return MG_INVALID;
++        !job->ib_count || job->ib_count > MG_GEN8_MAX_IBS ||
++        job->context >= MG_GEN8_CONTEXTS) return MG_INVALID;
++    const struct mg_gen8_context *x = &b->contexts[job->context];
++    if (!x->registered) return MG_UNBACKED;
 +    size_t total = 0;
 +    for (unsigned i = 0; i < job->buffer_count; i++) {
 +        const struct mg_gen8_buffer *v = &job->buffers[i];
@@ -6283,17 +6623,18 @@
 +        if (v->bytes > MG_GEN8_MAX_JOB_BYTES-total) return MG_LIMIT;
 +        total += v->bytes;
 +        const void *protected[] = {b,job,b->config.context_memory,b->config.hfi_memory,
-+            (const void *)b->config.sop,(const void *)b->config.eop};
-+        const size_t sizes[] = {sizeof(*b),sizeof(*job),4096,b->config.hfi_bytes,4,4};
-+        for (unsigned j = 0; j < 6; j++)
++            (const void *)b->config.sop,(const void *)b->config.eop,x->memory,
++            (const void *)x->sop,(const void *)x->eop};
++        const size_t sizes[] = {sizeof(*b),sizeof(*job),4096,b->config.hfi_bytes,4,4,4096,4,4};
++        for (unsigned j = 0; j < 9; j++)
 +            if (overlaps((uintptr_t)v->cpu,v->bytes,(uintptr_t)protected[j],sizes[j])) return MG_INVALID;
-+        if (overlaps(v->gpu,v->bytes,b->config.sop_address,4) ||
-+            overlaps(v->gpu,v->bytes,b->config.eop_address,4)) return MG_INVALID;
++        if (overlaps(v->gpu,v->bytes,x->sop_address,4) ||
++            overlaps(v->gpu,v->bytes,x->eop_address,4)) return MG_INVALID;
 +        for (unsigned j = 0; j < i; j++)
 +            if (overlaps(v->gpu,v->bytes,job->buffers[j].gpu,job->buffers[j].bytes) ||
 +                overlaps((uintptr_t)v->cpu,v->bytes,(uintptr_t)job->buffers[j].cpu,job->buffers[j].bytes))
 +                return MG_INVALID;
-+        if (!b->io.mapped(b->io.context,v->cpu,v->gpu,v->bytes,v->access)) return MG_UNBACKED;
++        if (!b->io.mapped(b->io.context,x->space,v->cpu,v->gpu,v->bytes,v->access)) return MG_UNBACKED;
 +    }
 +    for (unsigned i = 0; i < job->ib_count; i++) {
 +        const struct mg_gen8_ib *ib = &job->ibs[i];
@@ -6315,7 +6656,7 @@
 +    if (b->queue.issued >= UINT32_MAX) return MG_LIMIT; /* No timestamp reuse/wrap. */
 +    int ret = validate_job(b,job); if (ret) return ret;
 +    ret = service(b); if (ret) return ret;
-+    ret = room(b,8+3*job->ib_count);
++    ret = room(&b->contexts[job->context],8+3*job->ib_count);
 +    if (ret) return ret == MG_FULL ? ret : poison(b,ret);
 +    ret = mg_queue_submit(&b->queue,&b->queue_io,job,fence);
 +    if (b->queue.quarantined) b->quarantined = true;
@@ -6362,16 +6703,95 @@
 +    if (b->quarantined) return MG_IO;
 +    if (!b->registered || b->closed || b->queue.completed != b->queue.issued) return MG_BUSY;
 +    uint32_t r,w;
-+    int ret = indices(b,&r,&w); if (ret) return poison(b,ret);
++    int ret = indices(&b->contexts[0],&r,&w); if (ret) return poison(b,ret);
 +    if (r != w) return MG_BUSY;
-+    uint32_t packet[] = {0,b->config.context_id,(uint32_t)b->queue.completed};
++    uint32_t packet[] = {0,b->config.context_id,b->contexts[0].issued};
 +    ret = command(b,UNREGISTER,packet,3); if (ret) return ret;
-+    b->registered = false; b->closed = true;
++    b->registered = b->contexts[0].registered = false; b->closed = true;
++    return MG_OK;
++}
++
++unsigned mg_gen8_context_slot(const struct mg_gen8_backend *b, uint32_t id)
++{
++    for (unsigned i = 0; b && id && i < MG_GEN8_CONTEXTS; i++)
++        if (b->contexts[i].exposed && b->contexts[i].id == id) return i;
++    return MG_GEN8_CONTEXTS;
++}
++
++int mg_gen8_context_add(struct mg_gen8_backend *b, const struct mg_gen8_context *c, unsigned *slot)
++{
++    if (!b || !b->bound || !c || !slot) return MG_INVALID;
++    if (b->quarantined) return MG_IO;
++    if (!b->registered || b->closed) return MG_UNSUPPORTED;
++    if (c->bank != b->config.context_bank || !c->asid || c->asid > 255 ||
++        !c->page_table || (c->page_table & 4095) || c->page_table >= (1ull << 48) ||
++        !cpu_range(c->memory,MG_GEN8_CONTEXT_BYTES) || ((uintptr_t)c->memory & 4095) ||
++        !gmu_range(c->address,MG_GEN8_CONTEXT_BYTES) ||
++        !cpu_range((const void *)c->sop,4) || !cpu_range((const void *)c->eop,4) ||
++        (((uintptr_t)c->sop | (uintptr_t)c->eop) & 3) || c->sop == c->eop ||
++        !gpu_range(c->sop_address,4) || !gpu_range(c->eop_address,4) ||
++        c->sop_address == c->eop_address) return MG_INVALID;
++    unsigned i;
++    for (i = 1; i < MG_GEN8_CONTEXTS && b->contexts[i].exposed; i++) {}
++    if (i == MG_GEN8_CONTEXTS) return MG_LIMIT;
++    if (overlaps((uintptr_t)c->memory,4096,(uintptr_t)b->config.hfi_memory,b->config.hfi_bytes) ||
++        overlaps(c->address,4096,b->config.hfi_address,b->config.hfi_bytes)) return MG_INVALID;
++    for (unsigned j = 0; j < MG_GEN8_CONTEXTS; j++) {
++        const struct mg_gen8_context *o = &b->contexts[j];
++        if (!o->exposed) continue;
++        if (overlaps((uintptr_t)c->memory,4096,(uintptr_t)o->memory,4096) ||
++            overlaps(c->address,4096,o->address,4096) ||
++            overlaps(c->sop_address,4,o->sop_address,4) || overlaps(c->sop_address,4,o->eop_address,4) ||
++            overlaps(c->eop_address,4,o->sop_address,4) || overlaps(c->eop_address,4,o->eop_address,4))
++            return MG_INVALID;
++    }
++    if (!b->io.space_known(b->io.context,c->space,c->page_table,c->asid) ||
++        !b->io.gmu_mapped(b->io.context,c->memory,c->address,4096) ||
++        !b->io.mapped(b->io.context,0,(const void *)c->sop,c->sop_address,4,MG_GPU_READ|MG_GPU_WRITE) ||
++        !b->io.mapped(b->io.context,0,(const void *)c->eop,c->eop_address,4,MG_GPU_READ|MG_GPU_WRITE))
++        return MG_UNBACKED;
++    if (*c->sop || *c->eop) return MG_STALE;
++    const uint32_t *fresh = c->memory;
++    for (unsigned j = 0; j < 1024; j++) if (fresh[j]) return MG_STALE;
++    struct mg_gen8_context *x = &b->contexts[i];
++    *x = *c;
++    x->id = i + 1; x->issued = x->retired = 0; x->registered = false;
++    volatile struct mg_gen8_context_header *h = x->memory;
++    h->address = x->address + sizeof(*h); h->words = CONTEXT_WORDS;
++    BARRIER();
++    /* From here firmware may hold it: the slot stays exposed on failure. */
++    x->exposed = true;
++    uint64_t ttbr = x->page_table | ((uint64_t)x->asid << 48);
++    uint32_t reg[] = {0,x->id,NOTIFY,(uint32_t)ttbr,(uint32_t)(ttbr >> 32),x->id,x->bank};
++    int ret = command(b,REGISTER,reg,7); if (ret) return ret;
++    uint32_t ptr[] = {0,x->id,(uint32_t)x->sop_address,(uint32_t)(x->sop_address >> 32),
++        (uint32_t)x->eop_address,(uint32_t)(x->eop_address >> 32),0,0,0,x->address};
++    ret = command(b,POINTERS,ptr,10); if (ret) return poison(b,ret);
++    x->registered = true;
++    *slot = i;
++    return MG_OK;
++}
++
++int mg_gen8_context_remove(struct mg_gen8_backend *b, unsigned slot)
++{
++    if (!b || !b->bound || !slot || slot >= MG_GEN8_CONTEXTS) return MG_INVALID;
++    if (b->quarantined) return MG_IO;
++    struct mg_gen8_context *x = &b->contexts[slot];
++    if (!x->registered) return MG_INVALID;
++    for (uint64_t f = b->queue.completed + 1; f <= b->queue.issued; f++)
++        if (b->fence_context[f % MG_QUEUE_DEPTH] == slot) return MG_BUSY;
++    if (x->retired != x->issued) return MG_BUSY;
++    uint32_t r,w;
++    int ret = indices(x,&r,&w); if (ret) return poison(b,ret);
++    if (r != w) return MG_BUSY;
++    uint32_t packet[] = {0,x->id,x->issued};
++    ret = command(b,UNREGISTER,packet,3); if (ret) return ret;
++    x->registered = x->exposed = false;
 +    return MG_OK;
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_submit.h
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,160 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_SUBMIT_H
 +#define METROID_GPU_SUBMIT_H
@@ -6392,6 +6812,7 @@
 +struct mg_gen8_ib { unsigned buffer; uint32_t offset, bytes; };
 +struct mg_gen8_job {
 +    unsigned buffer_count, ib_count;
++    unsigned context; /* backend context slot that runs it; 0 is the kernel's */
 +    bool end_of_frame;
 +    /* Called by the owner's retire() once the job completed, or never if the
 +     * backend quarantines (the job then stays pinned with its DMA). */
@@ -6444,16 +6865,45 @@
 +    void *context;
 +    bool (*running)(void *);
 +    bool (*context_valid)(void *, uint64_t page_table, uint32_t bank, uint32_t asid);
++    /* No MMIO: whether this page table/ASID is one of the owner's live spaces. */
++    bool (*space_known)(void *, unsigned space, uint64_t page_table, uint32_t asid);
 +    bool (*gmu_mapped)(void *, const void *cpu, uint32_t gmu, size_t);
-+    bool (*mapped)(void *, const void *cpu, uint64_t gpu, size_t, unsigned access);
++    /* space selects the address space the GPU address is looked up in. */
++    bool (*mapped)(void *, unsigned space, const void *cpu, uint64_t gpu, size_t, unsigned access);
 +    int (*sync)(void *, enum mg_gpu_sync, const void *, size_t);
 +    uint32_t (*read)(void *, uint32_t gpu_register);
 +    void (*write)(void *, uint32_t gpu_register, uint32_t value);
 +    void (*delay)(void *, unsigned microseconds);
 +    void (*retire)(void *, struct mg_gen8_job *);
 +};
++/* One firmware context (KGSL drawctxt): its own 4K GMU queue, SOP/EOP
++ * timestamps in the GPU kernel region every space shares, and the page
++ * table the CP switches CB0 to before running its work. Slot 0 is the
++ * kernel's (config); others belong to GPU clients. */
++#define MG_GEN8_CONTEXTS 16u
++struct mg_gen8_context {
++    uint32_t id, bank, asid;
++    uint64_t page_table;
++    unsigned space;
++    void *memory;
++    uint32_t address;
++    volatile uint32_t *sop, *eop;
++    uint64_t sop_address, eop_address;
++    uint32_t issued, retired; /* this context's own timestamps */
++    bool registered, exposed;
++};
 +struct mg_gen8_backend {
 +    struct mg_gen8_config config;
++    struct mg_gen8_context contexts[MG_GEN8_CONTEXTS];
++    /* Global fence f ran on context fence_context[f % depth] as its own
++     * timestamp fence_ts[f % depth]. Fences stay one in-order sequence:
++     * f completes only once every earlier fence has, on any context. */
++    uint8_t fence_context[MG_QUEUE_DEPTH];
++    uint32_t fence_ts[MG_QUEUE_DEPTH];
++    /* Decoded F2H CONTEXT_BAD (KGSL hfi_context_bad_cmd): which context and
++     * timestamp faulted, the GMU error code (600 CP_HW_ERROR, 601 HW hang,
++     * 603 long IB, 604 opcode, 605 protected register, 608 CP HW fault...). */
++    uint32_t bad_context, bad_policy, bad_ts, bad_error, bad_count;
 +    struct mg_gen8_io io;
 +    struct mg_hfi_queue control, messages, debug;
 +    struct mg_queue queue;
@@ -6488,6 +6938,15 @@
 + * reset recovery: a lost ACK/GMU fault quarantines until reboot/drained DMA.
 + */
 +int mg_gen8_context_close(struct mg_gen8_backend *);
++/* Register a client context in a free slot (1..MG_GEN8_CONTEXTS-1), id slot+1.
++ * c->memory (4K, GMU-mapped) and both timestamps must be zero; a reused
++ * slot's previous registration must have been removed. *slot on success. */
++int mg_gen8_context_add(struct mg_gen8_backend *, const struct mg_gen8_context *c, unsigned *slot);
++/* UNREGISTER a client context once all of its jobs retired. MG_BUSY while
++ * any are in flight: keep its space, queue and timestamps until it succeeds. */
++int mg_gen8_context_remove(struct mg_gen8_backend *, unsigned slot);
++/* Slot whose firmware id is id, or MG_GEN8_CONTEXTS. */
++unsigned mg_gen8_context_slot(const struct mg_gen8_backend *, uint32_t id);
 +/* Blocking GX frequency vote through the control queue (GMU table index,
 + * 1..perf_levels). A lost or rejected ACK quarantines like any command. */
 +int mg_gen8_perf_vote(struct mg_gen8_backend *, unsigned level);
@@ -6495,7 +6954,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_vm.c
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,301 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_vm.h"
 +#ifdef MG_HOST_TEST
@@ -6542,6 +7001,22 @@
 +    v->quarantined = true;
 +    return error;
 +}
++/* The CP may rewrite TTBR0 between the two halves: the ASID (high half)
++ * differs between spaces, so equal high halves around the low read give
++ * one consistent value. */
++int mg_vm_ttbr(const struct mg_vm *v, uint64_t *ttbr)
++{
++    const struct mg_smmu_io *io = &v->io;
++    const struct mg_smmu_domain *s = &v->domain;
++    uint32_t b = s->cb_base + (s->cb << s->page_shift);
++    for (unsigned tries = 0; tries < 4; tries++) {
++        uint32_t hi = io->read(io->context,b + 0x24), lo = io->read(io->context,b + 0x20);
++        uint32_t again = io->read(io->context,b + 0x24);
++        if (hi == UINT32_MAX || lo == UINT32_MAX || again == UINT32_MAX) return MG_IO;
++        if (hi == again) { *ttbr = (uint64_t)hi << 32 | lo; return MG_OK; }
++    }
++    return MG_STALE;
++}
 +/* Verify that nobody replaced this domain before touching the live tables.
 + * Never infer idleness or DMA drain from a reset/disabled context alone. */
 +int mg_vm_validate(struct mg_vm *v)
@@ -6551,13 +7026,14 @@
 +    const struct mg_smmu_io *io = &v->io;
 +    const struct mg_smmu_domain *s = &v->domain;
 +    uint32_t b = s->cb_base + (s->cb << s->page_shift);
-+    uint64_t ttbr = v->tables.pa | ((uint64_t)s->asid << 48);
++    uint64_t own = v->tables.pa | ((uint64_t)s->asid << 48), ttbr = 0;
++    int error = mg_vm_ttbr(v,&ttbr);
++    if (error) return poison(v,error);
 +    uint32_t ctl = io->read(io->context,b);
 +    if (ctl == UINT32_MAX || (ctl & 0x1e7u) != 0x127u ||
 +        io->read(io->context,0x800 + s->smr*4) != (BIT(31) | s->stream) ||
 +        io->read(io->context,0xc00 + s->smr*4) != s->cb ||
-+        io->read(io->context,b + 0x20) != (uint32_t)ttbr ||
-+        io->read(io->context,b + 0x24) != (uint32_t)(ttbr >> 32) ||
++        (ttbr != own && (!v->ttbr_known || !v->ttbr_known(v->context,ttbr))) ||
 +        (s->lpac_routed && (io->read(io->context,0x800 + s->lpac_smr*4) != (BIT(31) | 1u) ||
 +            io->read(io->context,0xc00 + s->lpac_smr*4) != s->cb))) return poison(v,MG_STALE);
 +    uint32_t fsr = io->read(io->context,b + 0x58);
@@ -6569,6 +7045,8 @@
 +            v->fault_address |= (uint64_t)io->read(io->context,b + 0x64) << 32;
 +            v->fault_syn0 = io->read(io->context,b + 0x68);
 +            v->fault_syn1 = io->read(io->context,b + 0x6c);
++            v->fault_ttbr = ttbr;
++            v->fault_contextidr = io->read(io->context,b + 0x34);
 +        }
 +        return poison(v,MG_IO);
 +    }
@@ -6662,11 +7140,39 @@
 +    for (unsigned i = 0; i < t->used; i++) if (!visited[i]) return poison(v,MG_INVALID);
 +    return MG_OK;
 +}
++int mg_vm_space(struct mg_vm *v, const struct mg_vm *parent, void *cpu,
++    uint64_t pa, size_t bytes, uint32_t asid)
++{
++    if (!v || !parent || v == parent || !parent->initialized || !parent->domain.attached ||
++        parent->quarantined || parent->space || parent->domain.stream != 0 ||
++        !cpu || !pa || (((uintptr_t)cpu | pa | bytes) & 4095) ||
++        bytes < 2 * MG_VM_PAGE || bytes > MG_PT_LIMIT_PAGES * MG_VM_PAGE ||
++        pa >= (1ull << 48) || bytes > (1ull << 48) - pa ||
++        !asid || asid > 255 || asid == parent->domain.asid ||
++        (parent->domain.asid_used[asid >> 3] & (1u << (asid & 7))) ||
++        (pa < parent->tables.pa + parent->tables.bytes && parent->tables.pa < pa + bytes))
++        return MG_INVALID;
++    if (v->initialized && (!v->space || v->quarantined || v->mapped_pages ||
++        v->tables.memory != cpu || v->tables.pa != pa)) return MG_BUSY;
++    if (!parent->powered(parent->context)) return MG_UNBACKED;
++    const uint64_t *proot = parent->tables.memory;
++    memset(cpu,0,bytes);
++    uint64_t *root = cpu;
++    root[2] = proot[2]; root[3] = proot[3];
++    *v = (struct mg_vm){.tables = {cpu,pa,bytes,1,true}, .domain = parent->domain,
++        .io = parent->io, .context = parent->context, .powered = parent->powered,
++        .idle = parent->idle, .ttbr_known = parent->ttbr_known,
++        .initialized = true, .exposed = true, .space = true};
++    v->domain.asid = asid;
++    /* Old entries of a reused asid go too; publish ends in a device barrier. */
++    return invalidate(v);
++}
 +int mg_vm_map(struct mg_vm *v, uint32_t va, const uint64_t *pages,
 +    unsigned count, unsigned access)
 +{
 +    if (!v || !extent(va,count,MG_VM_MAX_PAGES) || !pages || !(access & MG_VM_READ) ||
 +        access & ~(MG_VM_READ | MG_VM_WRITE | MG_VM_EXEC | MG_VM_PRIV | MG_VM_CACHED)) return MG_INVALID;
++    if (v->space && (uint64_t)va + (uint64_t)count * MG_VM_PAGE > MG_VM_SPACE_VA_END) return MG_INVALID;
 +    int error = owned(v); if (error) return error;
 +    static const unsigned bits[] = {32,36,40,42,44,48};
 +    if (v->domain.ips >= sizeof(bits)/sizeof(bits[0])) return poison(v,MG_INVALID);
@@ -6723,6 +7229,7 @@
 +{
 +    /* One extra page permits atomic teardown of a maximum-size BO + guard. */
 +    if (!v || !extent(va,count,MG_VM_MAX_PAGES+1u)) return MG_INVALID;
++    if (v->space && (uint64_t)va + (uint64_t)count * MG_VM_PAGE > MG_VM_SPACE_VA_END) return MG_INVALID;
 +    int error = owned(v); if (error) return error;
 +    for (unsigned i = 0; i < count; i++) {
 +        uint64_t *entry = pte(v,va + i * MG_VM_PAGE);
@@ -6751,7 +7258,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_vm.h
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,78 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_VM_H
 +#define METROID_GPU_VM_H
@@ -6777,14 +7284,26 @@
 +    void *context;
 +    bool (*powered)(void *); /* prove SMMU access is safe before MMIO */
 +    bool (*idle)(void *); /* all jobs fenced, or firmware awaiting new allocation */
++    /* Stream0 only: with per-process spaces the CP rewrites the shared bank's
++     * TTBR0 through its SMMU aperture on every context switch. A TTBR other
++     * than this domain's own is accepted only if the owner recognises it. */
++    bool (*ttbr_known)(void *, uint64_t ttbr);
 +    unsigned mapped_pages;
 +    /* First context fault, captured before quarantine. Never cleared merely
 +     * to make a failed submission appear healthy. FAR is a GPU VA. */
 +    uint32_t fault_status, fault_syn0, fault_syn1;
 +    uint64_t fault_address;
++    /* Bank TTBR0/CONTEXTIDR when the fault was seen: the bank is shared by
++     * every stream0 space, so these say whose table was live. */
++    uint64_t fault_ttbr;
++    uint32_t fault_contextidr;
 +    int error;
-+    bool initialized, exposed, quarantined;
++    /* space: a per-process stream0 table sharing the attached bank. Root
++     * slots 2..3 (GPU VA 2-4G: kernel timestamps/firmware buffers) link the
++     * parent's own tables; this space never maps or unmaps there. */
++    bool initialized, exposed, quarantined, space;
 +};
++#define MG_VM_SPACE_VA_END 0x80000000u
 +int mg_vm_init(struct mg_vm *, void *cpu, uint64_t pa, size_t bytes,
 +    const struct mg_smmu_io *, void *, bool (*powered)(void *), bool (*idle)(void *));
 +int mg_vm_attach(struct mg_vm *, unsigned stream);
@@ -6795,6 +7314,15 @@
 +int mg_vm_adopt(struct mg_vm *, const struct mg_page_tables *,
 +    const struct mg_smmu_domain *, const struct mg_smmu_io *, void *,
 +    bool (*powered)(void *), bool (*idle)(void *));
++/* Make v a per-process space of the attached stream0 parent: fresh tables
++ * in [cpu,pa,bytes) with the parent's root[2..3] links, the parent's bank,
++ * routes and callbacks, and its own asid (which must not be live anywhere).
++ * Reinitialising an existing space requires no mappings and that the caller
++ * already unregistered every firmware context using it. Invalidates asid. */
++int mg_vm_space(struct mg_vm *v, const struct mg_vm *parent, void *cpu,
++    uint64_t pa, size_t bytes, uint32_t asid);
++/* Live TTBR0 of the bank, read consistently while the CP may switch it. */
++int mg_vm_ttbr(const struct mg_vm *, uint64_t *ttbr);
 +/* Mappings must avoid IOVA zero. pages[] contains page-aligned, pinned host
 + * physical addresses. It is host metadata, never read by the device.
 + * On an error after exposed becomes true, retain backing even if map failed.
