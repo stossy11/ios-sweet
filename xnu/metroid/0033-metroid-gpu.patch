@@ -1349,7 +1349,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu.h
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,140 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Metroid Adreno825 / Gen8.6.0 driver foundation.
 + * Wire formats follow Nothing's public KGSL source at 031e8669eb19.
@@ -1362,6 +1362,10 @@
 +#include <stdbool.h>
 +
 +#define MG_CHIP_ID 0x44030000u
++/* GPU DCVS levels in the GMU performance table (1..MG_GPU_LEVELS; 0 is off),
++ * and room for the whole hfi_table_cmd GPU_PERF packet. */
++#define MG_GPU_LEVELS 8u
++#define MG_GPU_PERF_WORDS 64u
 +#define MG_GPU_PA 0x03d00000ull
 +#define MG_GPUCC_PA 0x03d90000ull
 +#define MG_GPUCC_SIZE 0x9800u
@@ -1488,7 +1492,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_accel.c
-@@ -0,0 +1,382 @@
+@@ -0,0 +1,391 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_accel.h"
 +#ifdef MG_HOST_TEST
@@ -1805,6 +1809,11 @@
 +    a->attempted = true; a->live = live; a->io = *io; a->images = *images;
 +    if (!powered(a)) return poison(a,MG_UNBACKED);
 +    error = io->tables(io->context,a->performance,a->bandwidth); if (error) return poison(a,error);
++    /* The table's own counts give its length; the scheduler rechecks them. */
++    unsigned gx = a->performance[3], cx = 5 + gx*3;
++    if (gx < 2 || gx > MG_GPU_LEVELS+1 || a->performance[4] != 3 || cx+2 > MG_GPU_PERF_WORDS ||
++        a->performance[cx] > 4 || cx+2+a->performance[cx]*2 > MG_GPU_PERF_WORDS) return poison(a,MG_INVALID);
++    unsigned perf_words = cx+2+a->performance[cx]*2;
 +    trace(a,"attach GPU stream0 and extend GMU mappings");
 +    error = live->io.memory.allocate(live->io.memory.context,MG_GPU_PT_PAGES*4096,&a->table);
 +    if (error) return poison(a,error);
@@ -1832,14 +1841,16 @@
 +    publish(a,a->sqe->memory.cpu,a->sqe->memory.bytes); publish(a,a->aqe->memory.cpu,a->aqe->memory.bytes);
 +    a->stage = MG_ACCEL_BUFFERS;
 +    const struct mg_sched_config config = {hfi_pointer(a),MG_HFI_BYTES,live->memory.config.hfi,
-+        0x20070001,{a->performance,17},{a->bandwidth,160}};
++        0x20070001,{a->performance,perf_words},{a->bandwidth,160}};
 +    const struct mg_sched_io scheduler_io = {a,domains,read_reg,write_reg,delay,firmware_allocation,boot_gpu};
 +    trace(a,"start HFI scheduler");
 +    error = mg_scheduler_boot(&a->scheduler,&scheduler_io,&config); if (error) return poison(a,error);
 +    a->stage = MG_ACCEL_SCHEDULER;
 +    error = allocate(a,4096,&a->guard); if (error) return poison(a,error);
 +    publish(a,a->guard->memory.cpu,a->guard->memory.bytes);
-+    error = mg_render_init(&a->render,&a->gpu,&a->backend,a,running,264000000,a->guard->memory.pa);
++    /* MSM_PARAM_MAX_FREQ: the top level of the table the GMU now holds. */
++    uint32_t max_khz = a->performance[5+(gx-1)*3+2];
++    error = mg_render_init(&a->render,&a->gpu,&a->backend,a,running,max_khz*1000u,a->guard->memory.pa);
 +    if (error) return poison(a,error);
 +    uint32_t *timestamps = a->timestamps->memory.cpu;
 +    const struct mg_gen8_config submission = {.chip_id=MG_CHIP_ID,.hfi_version=0x20070001,
@@ -1850,6 +1861,8 @@
 +    const struct mg_gen8_io submission_io = {a,running,context_valid,gmu_mapped,mapped,sync_memory,
 +        read_reg,write_reg,delay,retire};
 +    error = mg_gen8_init(&a->backend,&submission,&submission_io); if (error) return poison(a,error);
++    /* boot_gpu's acknowledged vote was table level 1. */
++    a->backend.perf_levels = gx-1; a->backend.perf_level = 1;
 +    /* HFI control sequence is shared across scheduler/bootstrap/context traffic. */
 +    a->backend.control_sequence = a->scheduler.sequence;
 +    trace(a,"register GPU context");
@@ -1927,7 +1940,7 @@
 +    struct mg_zap_status zap;
 +    struct mg_gen8_backend backend;
 +    struct mg_render render;
-+    uint32_t performance[17], bandwidth[160];
++    uint32_t performance[MG_GPU_PERF_WORDS], bandwidth[160];
 +    enum mg_accel_stage stage;
 +    int error;
 +    bool attempted, quarantined;
@@ -3049,7 +3062,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_platform.c
-@@ -0,0 +1,368 @@
+@@ -0,0 +1,373 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * XNU adapter for the retained GMU owner. No inherited bandwidth assumption.
 + * Register sequences: Nothing 031e8669, gpucc-tuna.c/adreno_gen8.c.
@@ -3369,6 +3382,11 @@
 +            platform.accelerator.secure_stage,platform.accelerator.secure.domain.cb,
 +            (long long)platform.accelerator.secure_result.status,
 +            (unsigned long long)platform.accelerator.secure_result.value);
++        /* metroidgpufreq=N holds GMU level N (1=264MHz .. top); 0/absent is DCVS. */
++        unsigned freq = 0;
++        if (!error && PE_parse_boot_argn("metroidgpufreq",&freq,sizeof(freq)) &&
++            freq <= platform.accelerator.backend.perf_levels)
++            platform.accelerator.render.dcvs_pin = freq;
 +        if (!error) error = metroid_gpu_gem_install(&platform.accelerator.render.ops);
 +        if (error) {
 +            platform.accelerator.error = error; platform.accelerator.quarantined = true;
@@ -4227,7 +4245,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_render.c
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,288 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_render.h"
 +#ifdef MG_HOST_TEST
@@ -4239,6 +4257,13 @@
 +#include <mach/mach_time.h>
 +#define VA_FIRST 0x10000000u
 +#define VA_END 0x50000000u
++#define DCVS_WINDOW_NS 32000000ull
++#define DCVS_UP 70u   /* percent busy: one level up */
++#define DCVS_JUMP 90u /* percent busy: straight to the top level */
++#define DCVS_DOWN 30u /* percent busy: one level down */
++#ifndef MG_HOST_TEST
++extern void nanoseconds_to_absolutetime(uint64_t, uint64_t *);
++#endif
 +static bool running(struct mg_render *r)
 +{
 +    return r->initialized && !r->quarantined && !r->vm->quarantined &&
@@ -4259,6 +4284,37 @@
 +                return true;
 +    }
 +    return false;
++}
++/* Busy is "a job was in flight": the interval since the last event counts
++ * when the queue held work then. Completions are only seen when reaped, so
++ * this errs towards busy, i.e. towards a higher clock. */
++static void dcvs_account(struct mg_render *r)
++{
++    uint64_t now = mach_absolute_time();
++    const struct mg_queue *q = &r->backend->queue;
++    if (!r->dcvs_start) r->dcvs_start = now;
++    if (r->dcvs_last && now > r->dcvs_last && q->completed < q->issued)
++        r->dcvs_busy += now - r->dcvs_last;
++    r->dcvs_last = now;
++}
++/* Called before a submission, with the backend idle on the control queue. */
++static int dcvs_decide(struct mg_render *r)
++{
++    struct mg_gen8_backend *b = r->backend;
++    unsigned top = b->perf_levels, level = b->perf_level;
++    if (!top || !level || !r->dcvs_window) return MG_OK;
++    if (r->dcvs_pin) return r->dcvs_pin == level ? MG_OK : mg_gen8_perf_vote(b,r->dcvs_pin);
++    uint64_t span = r->dcvs_last - r->dcvs_start;
++    if (span < r->dcvs_window) return MG_OK;
++    unsigned util = (unsigned)(r->dcvs_busy >= span ? 100 : r->dcvs_busy * 100 / span);
++    r->dcvs_util = util; r->dcvs_start = r->dcvs_last; r->dcvs_busy = 0;
++    unsigned next = level;
++    if (util >= DCVS_JUMP) next = top;
++    else if (util >= DCVS_UP && level < top) next = level + 1;
++    else if (util < DCVS_DOWN && level > 1) next = level - 1;
++    if (next == level) return MG_OK;
++    r->dcvs_votes++;
++    return mg_gen8_perf_vote(b,next);
 +}
 +static int map(void *p, const struct mg_gem_backing *b, uint64_t *address)
 +{
@@ -4313,6 +4369,7 @@
 +    struct mg_render *r = p;
 +    if (!running(r)) return MG_UNBACKED;
 +    int busy = mg_gen8_reap(r->backend);
++    dcvs_account(r);
 +    if (r->backend->quarantined) return poison(r,busy ? busy : MG_IO);
 +    if (in_flight(r,address,bytes)) return MG_BUSY;
 +    for (unsigned i = 0; i < MG_RENDER_BUFFERS; i++) {
@@ -4350,8 +4407,12 @@
 +    if (!fence) return MG_INVALID;
 +    *fence = 0;
 +    if (!running(r) || !r->backend->registered) return MG_UNBACKED;
++    (void)mg_gen8_reap(r->backend);
++    dcvs_account(r);
++    int error = dcvs_decide(r);
++    if (error) return r->backend->quarantined ? poison(r,error) : error;
 +    /* Every buffer's pages are verified by validate_job via io.mapped. */
-+    int error = mg_gen8_submit(r->backend,job,fence);
++    error = mg_gen8_submit(r->backend,job,fence);
 +    if (!*fence && (error == MG_BUSY || error == MG_FULL)) {
 +        /* Queue or ring full: wait for the oldest job, then retry once. */
 +        const struct mg_queue *q = &r->backend->queue;
@@ -4361,6 +4422,7 @@
 +            else if (!r->backend->quarantined) error = waited;
 +        }
 +    }
++    dcvs_account(r);
 +    if (r->backend->quarantined) return poison(r,error ? error : MG_IO);
 +    return error;
 +}
@@ -4369,7 +4431,9 @@
 +    struct mg_render *r = p;
 +    if (!running(r)) return MG_UNBACKED;
 +    if (!fence || fence > r->backend->queue.issued) return MG_INVALID;
++    dcvs_account(r);
 +    int error = mg_gen8_wait(r->backend,fence,us);
++    dcvs_account(r);
 +    if (r->backend->quarantined) return poison(r,error ? error : MG_IO);
 +    return error;
 +}
@@ -4401,10 +4465,11 @@
 +    const struct mg_render *r = p;
 +    const volatile struct mg_gen8_backend *b = r->backend;
 +    if (!out || !bytes) return 0;
-+    int n = snprintf(out,bytes,"Q%llu/%llu n%u%s e%d h%x r%x=%x",
++    int n = snprintf(out,bytes,"Q%llu/%llu n%u%s e%d h%x r%x=%x G%u/%u%%%s",
 +        (unsigned long long)b->queue.completed,(unsigned long long)b->queue.issued,
 +        b->notified,b->quarantined ? " DEAD" : r->quarantined || r->vm->quarantined ? " RDEAD" : "",
-+        b->last_error,b->last_message_header,b->fault_register,b->fault_value);
++        b->last_error,b->last_message_header,b->fault_register,b->fault_value,
++        b->perf_level,r->dcvs_util,r->dcvs_pin ? "p" : "");
 +    size_t used = n < 0 ? 0 : (size_t)n < bytes ? (size_t)n : bytes - 1;
 +    if (r->vm->fault_status && used < bytes-1) {
 +        n = snprintf(out+used,bytes-used," F%x@%llx s%x/%x",r->vm->fault_status,
@@ -4421,6 +4486,12 @@
 +    if (r->initialized) return MG_BUSY;
 +    r->vm = vm; r->backend = backend; r->context = context;
 +    r->running = proof; r->frequency = frequency; r->guard_page = guard_page;
++#ifdef MG_HOST_TEST
++    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
++    r->dcvs_window = DCVS_WINDOW_NS * tb.denom / tb.numer;
++#else
++    nanoseconds_to_absolutetime(DCVS_WINDOW_NS,&r->dcvs_window);
++#endif
 +    r->ops = (struct mg_gem_ops){r,ready,map,unmap,submit,wait,parameter,describe};
 +    r->initialized = true;
 +    return MG_OK;
@@ -4465,7 +4536,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_render.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,40 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_RENDER_H
 +#define METROID_GPU_RENDER_H
@@ -4490,6 +4561,10 @@
 +    size_t allocated;
 +    uint32_t frequency;
 +    uint64_t guard_page; /* retained private zero page, GPU read-only */
++    /* GPU DCVS: in-flight time per window decides the next GMU level.
++     * dcvs_pin 0 is automatic, 1..perf_levels holds that level (boot-arg). */
++    uint64_t dcvs_window, dcvs_start, dcvs_last, dcvs_busy;
++    unsigned dcvs_pin, dcvs_votes, dcvs_util;
 +    bool initialized, verified, quarantined;
 +};
 +int mg_render_init(struct mg_render *, struct mg_vm *, struct mg_gen8_backend *,
@@ -4504,7 +4579,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_rpmh.h
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,352 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Included ONLY at the end of metroid_touch_power.h by overlay 0033.
 + * Reuses its sole apps-DRV2 owner, lock, geometry and timeout quarantine.
@@ -4518,6 +4593,9 @@
 +int metroid_gpu_rpmh_fabric_enable(void);
 +bool metroid_gpu_rpmh_fabric_ready(void);
 +static bool mg_fabric_held;
++#ifndef MG_GPU_LEVELS
++#define MG_GPU_LEVELS 8u
++#endif
 +
 +static int
 +mg_arc_details(const char *name, uint32_t *address, uint32_t *level, uint32_t *voltage)
@@ -4730,10 +4808,76 @@
 +    return ready;
 +}
 +
-+/* Fixed low-frequency bring-up OPP, at the highest declared ARC corners.
-+ * GMU gets its own votes; the CPU fabric owner stays retained independently.
-+ * No inferred DDR unit conversion, ACV policy, bin-dependent frequency or
-+ * voltage enum: all ARC indexes/levels and BCM addresses come from command DB.
++/* Every corner (vlvl) an ARC resource declares, index order. Index 0 is
++ * always the off level 0. Same command-DB walk and checks as mg_arc_details. */
++static int mg_arc_values(const char *name, uint16_t *vals, unsigned *count)
++{
++    uint32_t key[2] = {0,0};
++    for (unsigned i = 0; i < 8 && name[i]; i++)
++        key[i/4] |= (uint32_t)(uint8_t)name[i] << (8 * (i%4));
++    unsigned matches = 0;
++    for (unsigned i = 0; i < 8; i++) {
++        uint32_t h = 8 + 16 * i;
++        unsigned slave = rh_db16(h);
++        if (!slave) break;
++        uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++        uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++        unsigned n = rh_db16(h + 6);
++        if (slave < 3 || slave > 5 || (entries & 3) ||
++            !rh_range(entries, n * RH_DB_ENTRY) || !rh_range(aux, 0)) return EINVAL;
++        for (unsigned j = 0; j < n; j++) {
++            uint32_t e = entries + j * RH_DB_ENTRY;
++            if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) continue;
++            uint32_t start = aux + rh_db16(e + 22);
++            unsigned bytes = rh_db16(e + 20);
++            if (slave != 3 || !bytes || bytes > 32 || (bytes & 1) || (start & 1) ||
++                !rh_range(start, bytes)) return EINVAL;
++            unsigned used = 0, last = 0;
++            for (unsigned k = 0; k < bytes / 2; k++) {
++                unsigned value = rh_db16(start + k * 2);
++                if (k && !value) break; /* trailing padding */
++                if ((k && value <= last) || value > 1024) return EINVAL;
++                vals[used++] = (uint16_t)value; last = value;
++            }
++            if (vals[0]) return EINVAL;
++            *count = used;
++            if (++matches != 1) return EINVAL;
++        }
++    }
++    return matches == 1 ? 0 : ENODEV;
++}
++/* First index whose corner is >= vlvl, as adreno_rpmh_setup_volt_dependency_tbl. */
++static int mg_arc_index(const uint16_t *vals, unsigned count, unsigned vlvl, bool clamp)
++{
++    for (unsigned i = 0; i < count; i++) if (vals[i] >= vlvl) return (int)i;
++    return clamp ? (int)count - 1 : -1;
++}
++
++/* Gen8.6 A825 GPU power levels common to every tuna speed bin (bins 0, 0xd8
++ * and 0xf2 of graphics-devicetree tuna-gpu-pwrlevels.dtsi at NothingOSS
++ * 031e8669 declare identical 264..937 MHz levels and corners). The faster
++ * bin-specific TURBO_Lx levels need the speed-bin fuse and are omitted.
++ * Ascending, as the GMU table wants. kHz and RPMh vlvl corners. */
++static const struct { uint32_t khz; uint16_t vlvl; } mg_gpu_levels[MG_GPU_LEVELS] = {
++    {264000, 56},  /* LOW_SVS_D1 */
++    {362000, 64},  /* LOW_SVS */
++    {510000, 128}, /* SVS */
++    {644000, 192}, /* SVS_L1 */
++    {688000, 224}, /* SVS_L2 */
++    {763000, 256}, /* NOM */
++    {873000, 320}, /* NOM_L1 */
++    {937000, 384}, /* TURBO */
++};
++
++/* GPU DCVS table as KGSL gen8 build_dcvs_table/setup_gx_arc_votes: level 0
++ * is off, levels 1..MG_GPU_LEVELS are mg_gpu_levels. Each GX vote is the
++ * first gfx.lvl corner covering the level plus its gmxc (or mx) secondary;
++ * the dependency vote carries the MX index and no CX dependency (0xff), as
++ * the dtsi declares no qcom,cx-level. The boot vote stays at level 1, so the
++ * PLL starts where the old fixed table ran; the CX/MX retained votes from
++ * metroid_gpu_rpmh_enable still cover the higher corners.
++ * No inferred DDR unit conversion or ACV policy: bandwidth stays one fixed
++ * level. All ARC indexes/levels and BCM addresses come from command DB.
 + */
 +int metroid_gpu_rpmh_scheduler_tables(uint32_t *perf, uint32_t *bw)
 +{
@@ -4741,6 +4885,8 @@
 +    if (__atomic_exchange_n(&rh_lock,1,__ATOMIC_ACQUIRE)) return EBUSY;
 +    int error = EIO;
 +    uint32_t address[4], index[4], voltage[4];
++    uint16_t gfx[16], mx[16], gmxc[16];
++    unsigned gfx_n = 0, mx_n = 0, gmxc_n = 0;
 +    if (rh_poisoned || !mg_fabric_held) goto out;
 +    const char *names[] = {"gfx.lvl","mx.lvl","cx.lvl","gmxc.lvl"};
 +    for (unsigned i = 0; i < 4; i++) {
@@ -4748,12 +4894,27 @@
 +        if (i == 3 && error == ENODEV) { index[3] = index[1]; voltage[3] = voltage[1]; error = 0; }
 +        if (error) goto out;
 +    }
-+    /* hfi_table_cmd version0/typeGPU_PERF, two GX OPPs and two CX OPPs. */
-+    uint32_t p[] = {15,0,1,2,3,0,UINT32_MAX,0,
-+        (voltage[0] << 16) | (index[3] << 8) | index[0],
-+        0xffffc0ffu | (index[1] << 8),264000,
-+        2,2,0,0,(voltage[2] << 16) | (index[1] << 8) | index[2],500000};
-+    for (unsigned i = 0; i < sizeof(p)/sizeof(p[0]); i++) perf[i] = p[i];
++    error = mg_arc_values("gfx.lvl",gfx,&gfx_n); if (error) goto out;
++    error = mg_arc_values("mx.lvl",mx,&mx_n); if (error) goto out;
++    error = mg_arc_values("gmxc.lvl",gmxc,&gmxc_n);
++    if (error == ENODEV) { for (unsigned i = 0; i < mx_n; i++) gmxc[i] = mx[i]; gmxc_n = mx_n; error = 0; }
++    if (error) goto out;
++    /* hfi_table_cmd version0/typeGPU_PERF: GX levels of 3 words, then CX. */
++    unsigned w = 0;
++    perf[w++] = 15; perf[w++] = 0; perf[w++] = 1;
++    perf[w++] = MG_GPU_LEVELS + 1; perf[w++] = 3;
++    perf[w++] = 0; perf[w++] = UINT32_MAX; perf[w++] = 0;
++    for (unsigned i = 0; i < MG_GPU_LEVELS; i++) {
++        int k = mg_arc_index(gfx,gfx_n,mg_gpu_levels[i].vlvl,false);
++        if (k < 0) { error = EINVAL; goto out; }
++        int j = mg_arc_index(gmxc,gmxc_n,gfx[k],true);
++        int m = mg_arc_index(mx,mx_n,mg_gpu_levels[i].vlvl,true);
++        perf[w++] = ((uint32_t)gfx[k] << 16) | ((uint32_t)j << 8) | (uint32_t)k;
++        perf[w++] = 0xffffc000u | ((uint32_t)m << 8) | 0xffu;
++        perf[w++] = mg_gpu_levels[i].khz;
++    }
++    uint32_t cx[] = {2,2,0,0,(voltage[2] << 16) | (index[1] << 8) | index[2],500000};
++    for (unsigned i = 0; i < sizeof(cx)/sizeof(cx[0]); i++) perf[w++] = cx[i];
 +    for (unsigned i = 0; i < 160; i++) bw[i] = 0;
 +    bw[0] = 3; bw[1] = 2; bw[2] = 1; bw[3] = 3; bw[4] = 1; bw[5] = 7;
 +    error = mg_bcm_address("CN0",&bw[6]); if (error) goto out;
@@ -5713,7 +5874,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_submit.c
-@@ -0,0 +1,428 @@
+@@ -0,0 +1,445 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * Gen8.6.0 HFI submission backend. Wire contracts follow NothingOSS
 + * 031e8669eb198d93e69532b01af973a1c2a82710 graphics-kernel:
@@ -5737,6 +5898,7 @@
 +#define RETIRED 133u
 +#define POINTERS 134u
 +#define CONTEXT_BAD 150u
++#define PERF_VOTE 30u /* H2F_MSG_GX_BW_PERF_VOTE */
 +#define FIRMWARE_ERROR 100u
 +#define FIRMWARE_DEBUG 101u
 +#define CONTEXT_WORDS ((MG_GEN8_CONTEXT_BYTES - sizeof(struct mg_gen8_context_header)) / 4u)
@@ -6129,6 +6291,22 @@
 +    return ret;
 +}
 +
++int mg_gen8_perf_vote(struct mg_gen8_backend *b, unsigned level)
++{
++    if (!b || !b->bound) return MG_INVALID;
++    if (b->quarantined) return MG_IO;
++    if (!b->registered || b->closed) return MG_UNSUPPORTED;
++    /* Never level 0 (GPU off/XO): KGSL gen8_hwsched_dcvs_set refuses it too. */
++    if (!level || level > b->perf_levels) return MG_INVALID;
++    if (level == b->perf_level) return MG_OK;
++    /* hfi_gx_bw_perf_vote_cmd: DCVS_ACK_BLOCK, GMU table index, and
++     * INVALID_BW_VOTE (index 0xff, AB 0xffff) so the bandwidth vote stays. */
++    uint32_t packet[] = {0,1,level,0xffff00ffu};
++    int ret = command(b,PERF_VOTE,packet,4); if (ret) return ret;
++    b->perf_level = level;
++    return MG_OK;
++}
++
 +int mg_gen8_context_close(struct mg_gen8_backend *b)
 +{
 +    if (!b || !b->bound) return MG_INVALID;
@@ -6144,7 +6322,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_submit.h
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,121 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_SUBMIT_H
 +#define METROID_GPU_SUBMIT_H
@@ -6235,6 +6413,9 @@
 +    uint32_t waiting_header, ack_value;
 +    uint32_t fault_register, fault_value, last_message_header;
 +    int last_error;
++    /* GMU performance table levels 1..perf_levels; perf_level is the last
++     * acknowledged vote (0 until the owner records the boot vote). */
++    unsigned perf_levels, perf_level;
 +    bool bound, exposed, registered, closed, quarantined, ack_received;
 +};
 +
@@ -6258,6 +6439,9 @@
 + * reset recovery: a lost ACK/GMU fault quarantines until reboot/drained DMA.
 + */
 +int mg_gen8_context_close(struct mg_gen8_backend *);
++/* Blocking GX frequency vote through the control queue (GMU table index,
++ * 1..perf_levels). A lost or rejected ACK quarantines like any command. */
++int mg_gen8_perf_vote(struct mg_gen8_backend *, unsigned level);
 +
 +#endif
 --- /dev/null
