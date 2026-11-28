@@ -334,7 +334,7 @@
 +#endif
 --- /dev/null
 +++ b/iokit/Kernel/MetroidGEM.cpp
-@@ -0,0 +1,762 @@
+@@ -0,0 +1,764 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * HakiOS/MSM DRM 1.7 wire interface for the Metroid Gen8 backend.
 + * ABI reference: HakiOS62e09f85 BoardGPU.cpp and Linux uapi/drm/msm_drm.h.
@@ -679,8 +679,10 @@
 +    b.cpu = reinterpret_cast<void *>(mapping->getVirtualAddress());
 +    b.bytes = bytes; b.page_count = count; b.flags = flags;
 +    b.handle = (++generation << GEM_INDEX_BITS) | (index+1);
++    /* GEM_NEW memory is write-combined; an IOSurface's default map() is cached. */
 +    mg_gem_backing backing = {b.cpu,pages,count,bytes,
-+        static_cast<unsigned>(MG_GPU_READ | MG_GPU_EXEC | (flags & GEM_READONLY ? 0 : MG_GPU_WRITE))};
++        static_cast<unsigned>(MG_GPU_READ | MG_GPU_EXEC | (flags & GEM_READONLY ? 0 : MG_GPU_WRITE)),
++        s != nullptr};
 +    int error = ops.map(ops.context,&backing,&b.address);
 +    if (error && !b.address) {
 +        mapping->release(); IODelete(pages,uint64_t,count); memory->complete();
@@ -1492,7 +1494,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_accel.c
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,399 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_accel.h"
 +#ifdef MG_HOST_TEST
@@ -1798,7 +1800,7 @@
 +    const struct mg_accel_io *io, const struct mg_accel_images *images)
 +{
 +    if (!a || !live || !io || !images || !io->powered || !io->sync || !io->tables ||
-+        !io->zap_reserved || !io->zap_pa || !io->zap_bytes || !io->pas ||
++        !io->zap_reserved || !io->zap_pa || !io->zap_bytes || !io->pas || !io->aperture ||
 +        !images->sqe || !images->aqe || images->sqe_bytes < 8 || images->aqe_bytes < 8 ||
 +        images->sqe_bytes > 1024*1024 || images->aqe_bytes > 1024*1024 ||
 +        ((images->sqe_bytes | images->aqe_bytes) & 3)) return MG_INVALID;
@@ -1823,6 +1825,14 @@
 +    if (!error) error = mg_smmu_route_lpac(&a->gpu.io,&a->gpu.domain);
 +    if (!error) error = mg_vm_adopt(&a->gmu,&live->memory.tables,&live->domain,&live->io.smmu,a,powered,idle);
 +    if (error) return poison(a,error);
++    /* The CP switches tables in CB0 through its SMMU aperture, which TZ opens
++     * per bank: KGSL kgsl_set_smmu_aperture, upstream adreno_hw_init(0),
++     * Adreno830 S3. Before the SQE ever runs. */
++    if (a->gpu.domain.cb != 0) return poison(a,MG_UNSUPPORTED);
++    trace(a,"open CP SMMU aperture for GPU CB0");
++    a->aperture_result = io->aperture(io->context,a->gpu.domain.cb);
++    if (a->aperture_result.status) return poison(a,MG_IO);
++    if (a->aperture_result.value) trace(a,"CP SMMU aperture SCM unavailable; skipped");
 +    a->stage = MG_ACCEL_DOMAINS;
 +    trace(a,"allocate SQE/AQE/context buffers");
 +    struct mg_accel_block **blocks[] = {&a->sqe,&a->aqe,&a->restore,&a->metadata,&a->context,&a->timestamps,&a->commands,&a->output};
@@ -1872,7 +1882,7 @@
 +    for (unsigned i = 0; i < 2; i++) {
 +        struct mg_accel_block *b = proof[i];
 +        const struct mg_gem_backing backing = {b->memory.cpu,b->pages,(unsigned)(b->memory.bytes/4096),b->memory.bytes,
-+            MG_GPU_READ | (i ? MG_GPU_WRITE : MG_GPU_EXEC)};
++            MG_GPU_READ | (i ? MG_GPU_WRITE : MG_GPU_EXEC),false}; /* write-combined DMA */
 +        uint64_t address = 0;
 +        error = a->render.ops.map(a->render.ops.context,&backing,&address); if (error) return poison(a,error);
 +        /* Renderer owns these VAs. Leave kernel block GPU field zero so its
@@ -1886,7 +1896,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_accel.h
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,69 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_ACCEL_H
 +#define METROID_GPU_ACCEL_H
@@ -1910,8 +1920,13 @@
 +    /* control_pa=0 queries MP.ASSIGN availability. Otherwise the pinned
 +     * control page holds the typed HLOS->CP_PIXEL assignment request. */
 +    struct mg_scm_result (*secure)(void *, uint64_t control_pa);
++    /* MP CP_SMMU_APERTURE for the GPU's context bank (aperture register 0).
++     * Status 0 and value 0: set. Status 0 and value 1: TZ does not offer the
++     * call, nothing was sent (upstream adreno_hw_init then skips it too). */
++    struct mg_scm_result (*aperture)(void *, unsigned context_bank);
 +};
 +struct mg_scm_result mg_scm_secure_native(void *, uint64_t control_pa);
++struct mg_scm_result mg_scm_aperture_native(void *, unsigned context_bank);
 +#define MG_ACCEL_BLOCKS 96u
 +struct mg_accel_block {
 +    struct mg_memory_block memory, page_storage;
@@ -1934,7 +1949,7 @@
 +    struct mg_accel_block *commands, *output, *guard;
 +    struct mg_accel_block *secure_tables, *secure_control;
 +    unsigned secure_stage;
-+    struct mg_scm_result secure_result;
++    struct mg_scm_result secure_result, aperture_result;
 +    struct mg_scheduler scheduler;
 +    struct mg_hardware hardware;
 +    struct mg_zap_status zap;
@@ -2083,7 +2098,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_gem.h
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,52 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_GEM_H
 +#define METROID_GPU_GEM_H
@@ -2101,6 +2116,10 @@
 +    unsigned page_count;
 +    size_t bytes;
 +    unsigned access;
++    /* The CPU maps it write-back (IOSurface pixels): the GPU mapping is then
++     * IO-coherent cacheable, as KGSL's IOCOHERENT buffers. Otherwise the CPU
++     * maps it write-combined and the GPU maps it Normal-NC, as KGSL's default. */
++    bool cached;
 +};
 +struct mg_gem_ops {
 +    void *context;
@@ -3062,7 +3081,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_platform.c
-@@ -0,0 +1,373 @@
+@@ -0,0 +1,378 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * XNU adapter for the retained GMU owner. No inherited bandwidth assumption.
 + * Register sequences: Nothing 031e8669, gpucc-tuna.c/adreno_gen8.c.
@@ -3376,8 +3395,13 @@
 +    if (images && platform.live.stage == MG_LIVE_HFI) {
 +        void *zap = metroid_gpu_zap_reserved_map(0x94e9a000,0x2000);
 +        const struct mg_accel_io accelerator_io = {NULL,accelerator_powered,synchronize,
-+            scheduler_tables,zap,0x94e9a000,0x2000,mg_scm_pas_native,mg_scm_secure_native};
++            scheduler_tables,zap,0x94e9a000,0x2000,mg_scm_pas_native,mg_scm_secure_native,
++            mg_scm_aperture_native};
 +        int error = zap ? mg_accel_boot(&platform.accelerator,&platform.live,&accelerator_io,images) : MG_UNBACKED;
++        printf("METROID GPU: banks GPU=%u GMU=%u aperture SCM=%lld/%llu\n",
++            platform.accelerator.gpu.domain.cb,platform.accelerator.gmu.domain.cb,
++            (long long)platform.accelerator.aperture_result.status,
++            (unsigned long long)platform.accelerator.aperture_result.value);
 +        printf("METROID GPU: secure stage=%u CB=%u SCM=%lld/%#llx\n",
 +            platform.accelerator.secure_stage,platform.accelerator.secure.domain.cb,
 +            (long long)platform.accelerator.secure_result.status,
@@ -4353,7 +4377,7 @@
 +    struct mg_render_mapping *m = &r->mappings[slot];
 +    m->backing = *b; m->address = (uint32_t)va;
 +    unsigned access = MG_VM_READ | (b->access & MG_GPU_WRITE ? MG_VM_WRITE : 0) |
-+        (b->access & MG_GPU_EXEC ? MG_VM_EXEC : 0);
++        (b->access & MG_GPU_EXEC ? MG_VM_EXEC : 0) | (b->cached ? MG_VM_CACHED : 0);
 +    int error = mg_vm_map(r->vm,m->address,b->pages,b->page_count,access);
 +    if (error && !r->vm->quarantined) { *m = (struct mg_render_mapping){0}; return error; }
 +    r->allocated += b->bytes;
@@ -5261,7 +5285,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_scm.c
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,87 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * SCM SMC64 transport for one-argument GPU/availability calls.
 + * ABI: Nothing 031e8669eb19 drivers/firmware/qcom_scm{-smc.c,.c,.h}.
@@ -5324,6 +5348,20 @@
 +    if (command == 5 && !pa && !bytes) return invoke(0x42000205,1,13,0,0,0);
 +    return (struct mg_scm_result){.status = -1};
 +}
++/* MP CP_SMMU_APERTURE_ID (svc 0x0c, cmd 0x1b), QCOM_SCM_ARGS(4): Nothing
++ * qcom_scm_kgsl_set_smmu_aperture / upstream qcom_scm_set_gpu_smmu_aperture.
++ * Only aperture register 0 (the GPU, not LPAC) and a real context bank. */
++struct mg_scm_result mg_scm_aperture_native(void *unused, unsigned context_bank)
++{
++    (void)unused;
++    if (context_bank > 255) return (struct mg_scm_result){.status = -1};
++    struct mg_scm_result available = invoke(0x42000601,1,0x02000c1b,0,0,0);
++    if (available.status) return available;
++    if (!available.value) return (struct mg_scm_result){0,1};
++    struct mg_scm_result result = invoke(0x42000c1b,4,0xffff0000u | (context_bank & 255),
++        0xffffffffu,0xffffffffu,0xffffffffu);
++    return (struct mg_scm_result){result.status,0};
++}
 +/* MP.ASSIGN uses seven arguments: x2=mem-list, x3=16, x4=source-list,
 + * x5 points to args[3..9]. No general SCM gateway or reclaim operation. */
 +struct mg_scm_result mg_scm_secure_native(void *unused, uint64_t pa)
@@ -5337,7 +5375,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_smmu.c
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,259 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 + * SMMUv2 stage-1 stream-5 setup. Register ABI: Nothing 031e8669eb19
 + * drivers/iommu/arm/arm-smmu/{arm-smmu.h,arm-smmu.c}, io-pgtable-arm.c.
@@ -5400,8 +5438,10 @@
 +             * even with descriptor PXN=0. Setting AP_UNPRIV (bit6) here
 +             * faults CM3's first external fetch at 0x4000 (FSR408).
 +             * GPU user mappings use the separate VM permission builder.
-+             * Normal WB, inner-shareable, AF, nG; data remains PXN+UXN. */
-+            last[c] = pa | 3 | (3u << 8) | BIT(10) | BIT(11) |
++             * Normal-NC (MAIR index 0), outer-shareable, AF, nG, as vendor
++             * gen8_gmu iommu_map without IOMMU_CACHE: the CPU maps this
++             * memory write-combined. Data remains PXN+UXN. */
++            last[c] = pa | 3 | (2u << 8) | BIT(10) | BIT(11) |
 +                (r[i].executable ? 0 : (3ull << 53));
 +        }
 +    }
@@ -5500,7 +5540,13 @@
 +        if (tcr2 == UINT32_MAX) return MG_IO;
 +        if ((ctl & 1) && (tcr2 & BIT(4))) return MG_UNSUPPORTED;
 +        asids[(hi0 >> 16) & 255] = asids[(hi1 >> 16) & 255] = true;
-+        if (!referenced[i] && !(ctl & 1) && s->cb == UINT32_MAX) {
++        /* The GPU (stream0, with LPAC SID1 routed into it) owns CB0, the bank
++         * the CP reprograms through its SCM-opened SMMU aperture: Nothing
++         * qcom_adreno_smmu_alloc_context_bank (GPU CB0/1, others from CB2),
++         * upstream (GPU CB0, others from CB1), Adreno830 (GPU CB0, GMU CB2).
++         * Every other stream starts at CB2 so it never takes the GPU's. */
++        bool usable = !referenced[i] && !(ctl & 1) && s->cb == UINT32_MAX;
++        if (usable && (stream == 0 ? i == 0 : i >= 2)) {
 +            s->cb = i; old_asid = hi0 >> 16;
 +        }
 +    }
@@ -5527,8 +5573,11 @@
 +        (ret = check(io,s,b + 0x24,(uint32_t)(ttbr >> 32),UINT32_MAX)) ||
 +        (ret = check(io,s,b + 0x28,0,UINT32_MAX)) ||
 +        (ret = check(io,s,b + 0x2c,0,UINT32_MAX))) goto fail;
-+    SET(b + 0x38, 0xff, UINT32_MAX);
-+    SET(b + 0x3c, 0, UINT32_MAX);
++    /* Vendor qcom-io-pgtable-arm.c MAIRs: 0 Normal-NC, 1 WB RWA, 2 Device,
++     * 3 inner-NC/outer-WB, 4 inner-NC/outer-WB no-WA, 5 WB/outer no-WA.
++     * PTEs default to index 0; only IO-coherent mappings use index 1. */
++    SET(b + 0x38, 0xf404ff44u, UINT32_MAX);
++    SET(b + 0x3c, 0x0000efe4u, UINT32_MAX);
 +    uint32_t fsr = rd(io,s,b + 0x58);
 +    if (fsr == UINT32_MAX) { ret = MG_IO; goto fail; }
 +    io->write(io->context,b + 0x58,fsr & 0xc00001feu); /* W1C */
@@ -6446,7 +6495,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_vm.c
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,253 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#include "metroid_gpu_vm.h"
 +#ifdef MG_HOST_TEST
@@ -6477,10 +6526,14 @@
 +    uint64_t *leaf = child(v,middle[(va >> 21) & 511]);
 +    return leaf ? &leaf[(va >> 12) & 511] : NULL;
 +}
++/* As Nothing qcom-io-pgtable-arm.c arm_lpae_prot_to_pte with the MAIR the
++ * SMMU attach programs: Normal-NC (index 0) outer-shareable by default,
++ * write-back (index 1) inner-shareable only for MG_VM_CACHED (IOMMU_CACHE). */
 +static uint64_t descriptor(uint64_t pa, unsigned access)
 +{
-+    return pa | 3 | (access & MG_VM_PRIV ? 0 : BIT(6)) |
-+        (access & MG_VM_WRITE ? 0 : BIT(7)) | (3u << 8) | BIT(10) | BIT(11) |
++    bool cached = (access & MG_VM_CACHED) != 0;
++    return pa | 3 | (cached ? 1u << 2 : 0) | (access & MG_VM_PRIV ? 0 : BIT(6)) |
++        (access & MG_VM_WRITE ? 0 : BIT(7)) | ((cached ? 3u : 2u) << 8) | BIT(10) | BIT(11) |
 +        (access & MG_VM_EXEC ? 0 : (3ull << 53));
 +}
 +static int poison(struct mg_vm *v, int error)
@@ -6613,7 +6666,7 @@
 +    unsigned count, unsigned access)
 +{
 +    if (!v || !extent(va,count,MG_VM_MAX_PAGES) || !pages || !(access & MG_VM_READ) ||
-+        access & ~(MG_VM_READ | MG_VM_WRITE | MG_VM_EXEC | MG_VM_PRIV)) return MG_INVALID;
++        access & ~(MG_VM_READ | MG_VM_WRITE | MG_VM_EXEC | MG_VM_PRIV | MG_VM_CACHED)) return MG_INVALID;
 +    int error = owned(v); if (error) return error;
 +    static const unsigned bits[] = {32,36,40,42,44,48};
 +    if (v->domain.ips >= sizeof(bits)/sizeof(bits[0])) return poison(v,MG_INVALID);
@@ -6698,7 +6751,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/metroid_gpu_vm.h
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,57 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef METROID_GPU_VM_H
 +#define METROID_GPU_VM_H
@@ -6708,6 +6761,7 @@
 +#define MG_VM_WRITE 2u
 +#define MG_VM_EXEC 4u
 +#define MG_VM_PRIV 8u
++#define MG_VM_CACHED 16u /* MAIR index 1 (WB), inner-shareable */
 +#define MG_VM_MAX_PAGES 16384u
 +
 +/* Independent 32-bit IOVA spaces, backed by XNU's wired 16K pages split
